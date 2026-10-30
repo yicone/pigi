@@ -11,7 +11,7 @@ pigi 不经过任何服务器:邮件直接从你的电脑同步到 Gmail。Googl
 ## 准备
 
 - 一个 Google 账号(用来建项目,可以和收信的账号不同)
-- pigi 的 Bundle ID。本 fork 是 `com.github.yicone.pigi`；如果改过 `project.yml` 里的 `PRODUCT_BUNDLE_IDENTIFIER`，请填改后的值
+- pigi 的 Bundle ID。本 fork 是 `one.yic.pigi`；如果改过 `project.yml` 里的 `PRODUCT_BUNDLE_IDENTIFIER`，请填改后的值
 
 ## 第 1 步:新建项目
 
@@ -39,7 +39,7 @@ pigi 不经过任何服务器:邮件直接从你的电脑同步到 Gmail。Googl
 
 1. **API 和服务 › 凭据 › 创建凭据 › OAuth 客户端 ID**。
 2. 应用类型选 **iOS**(没有客户端密钥,正是 pigi 需要的)。
-3. 名称随意;**Bundle ID** 填 `com.github.yicone.pigi`(须与正在运行的 pigi 一致)。
+3. 名称随意;**Bundle ID** 填 `one.yic.pigi`(须与正在运行的 pigi 一致)。
 4. **创建**,复制弹窗里的 **客户端 ID**。
 
 ## 第 5 步:粘贴到 pigi

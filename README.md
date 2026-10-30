@@ -3,7 +3,7 @@
 <h1 align="center">pigi</h1>
 <p align="center">多个邮箱,一个窗口,一个快捷键。<br>开源的 macOS 原生邮件客户端 · Gmail API + IMAP · 无服务器</p>
 
-<p align="center">这是 <a href="https://github.com/xiezhaoye/pigi">xiezhaoye/pigi</a> 的自维护 fork（<a href="https://github.com/yicone/pigi">yicone/pigi</a>）。Bundle ID 为 <code>com.github.yicone.pigi</code>。在线更新已关闭，不会访问上游下载站。</p>
+<p align="center">这是 <a href="https://github.com/xiezhaoye/pigi">xiezhaoye/pigi</a> 的自维护 fork（<a href="https://github.com/yicone/pigi">yicone/pigi</a>）。Bundle ID 为 <code>one.yic.pigi</code>。在线更新已关闭，不会访问上游下载站。</p>
 
 <p align="center"><a href="https://github.com/xiezhaoye/pigi">上游仓库</a> · <a href="docs/gmail-api.md">Gmail 接入教程</a> · <a href="docs/architecture.md">架构</a></p>
 
@@ -43,7 +43,7 @@ xcodebuild -project Pigi.xcodeproj -scheme Pigi -configuration Debug -derivedDat
 open build/Build/Products/Debug/pigi.app
 ```
 
-本 fork 的 `PRODUCT_BUNDLE_IDENTIFIER` 是 `com.github.yicone.pigi`。Gmail 的 OAuth 客户端 Bundle ID 必须与它一致；如果改了前者，后者一起改。
+本 fork 的 `PRODUCT_BUNDLE_IDENTIFIER` 是 `one.yic.pigi`。Gmail 的 OAuth 客户端 Bundle ID 必须与它一致；如果改了前者，后者一起改。
 
 ## 常见问题
 

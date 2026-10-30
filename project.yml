@@ -1,6 +1,6 @@
 name: Pigi
 options:
-  bundleIdPrefix: site.xiezhaoye
+  bundleIdPrefix: com.github.yicone
   deploymentTarget:
     macOS: "15.0"
   createIntermediateGroups: true
@@ -17,7 +17,7 @@ targets:
       - Pigi
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: site.xiezhaoye.pigi
+        PRODUCT_BUNDLE_IDENTIFIER: com.github.yicone.pigi
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_NAME: pigi
         PRODUCT_MODULE_NAME: Pigi

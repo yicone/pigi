@@ -20,7 +20,7 @@ struct UpdateInfo: Decodable, Equatable {
     let file: String?
 }
 
-/// Checks the download site for a newer build, downloads it and swaps it in for the running app.
+/// Checks an optional download host for a newer build. This fork leaves the host unset, so checks and installs never contact a server.
 @Observable @MainActor
 final class Updater {
     enum Phase: Equatable {
@@ -31,9 +31,11 @@ final class Updater {
         case downloading
         case installing
         case failed(String)
+        /// No update host is configured, so nothing is checked or downloaded.
+        case disabled
     }
 
-    private(set) var phase: Phase = .idle
+    private(set) var phase: Phase = Updater.downloadHost == nil ? .disabled : .idle
     private(set) var lastChecked: Date?
 
     var available: UpdateInfo? { if case .available(let info) = phase { return info } else { return nil } }
@@ -44,10 +46,11 @@ final class Updater {
         }
     }
 
-    static let downloadHost = "https://pigi-dl.xiezhaoye.site"
+    /// `nil` closes online updates. Set a host owned by this fork to turn them back on.
+    static let downloadHost: String? = nil
 
     private func request(_ path: String) throws -> URLRequest {
-        guard let url = URL(string: Self.downloadHost + path) else { throw UpdateError.notConfigured }
+        guard let host = Self.downloadHost, let url = URL(string: host + path) else { throw UpdateError.notConfigured }
         var request = URLRequest(url: url)
         request.timeoutInterval = 20
         return request
@@ -55,6 +58,10 @@ final class Updater {
 
     func check() async {
         guard !isBusy else { return }
+        guard Self.downloadHost != nil else {
+            phase = .disabled
+            return
+        }
         phase = .checking
         do {
             let (data, response) = try await URLSession.shared.data(for: request("/latest.json"))
@@ -70,6 +77,10 @@ final class Updater {
     }
 
     func install() async {
+        guard Self.downloadHost != nil else {
+            phase = .disabled
+            return
+        }
         guard let info = available else { return }
         do {
             phase = .downloading

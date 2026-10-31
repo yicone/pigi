@@ -3,7 +3,8 @@ import Security
 
 /// Minimal generic-password wrapper for refresh tokens and IMAP passwords.
 enum Keychain {
-    private static let service = "site.xiezhaoye.pigi"
+    /// Matches `PRODUCT_BUNDLE_IDENTIFIER` so this fork does not share the upstream app's keychain items.
+    private static let service = Bundle.main.bundleIdentifier ?? "one.yic.pigi"
 
     static func get(_ key: String) -> String? {
         let query: [String: Any] = [

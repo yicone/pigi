@@ -363,7 +363,7 @@ private struct AboutPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            PageHeader(title: "关于", note: "版本信息和在线更新。更新包从 pigi-dl.xiezhaoye.site 下载。")
+            PageHeader(title: "关于", note: "版本信息。此 fork 已关闭在线更新。")
             HStack(spacing: 16) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
@@ -383,15 +383,17 @@ private struct AboutPage: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 10) {
-                    if let info = updater.available {
-                        Button("更新到 \(info.version)") { Task { await updater.install() } }
-                            .buttonStyle(.borderedProminent)
+                if updater.phase != .disabled {
+                    HStack(spacing: 10) {
+                        if let info = updater.available {
+                            Button("更新到 \(info.version)") { Task { await updater.install() } }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(updater.isBusy)
+                        }
+                        Button("检查更新") { Task { await updater.check() } }
                             .disabled(updater.isBusy)
+                        if updater.isBusy { ProgressView().controlSize(.small) }
                     }
-                    Button("检查更新") { Task { await updater.check() } }
-                        .disabled(updater.isBusy)
-                    if updater.isBusy { ProgressView().controlSize(.small) }
                 }
             }
             Spacer()
@@ -408,6 +410,7 @@ private struct AboutPage: View {
         case .downloading: Text("正在下载…").foregroundStyle(.secondary)
         case .installing: Text("正在安装,稍后自动重启…").foregroundStyle(.secondary)
         case .failed(let message): Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+        case .disabled: Text("在线更新已关闭").foregroundStyle(.secondary)
         }
     }
 }

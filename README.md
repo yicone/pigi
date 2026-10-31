@@ -3,7 +3,9 @@
 <h1 align="center">pigi</h1>
 <p align="center">多个邮箱,一个窗口,一个快捷键。<br>开源的 macOS 原生邮件客户端 · Gmail API + IMAP · 无服务器</p>
 
-<p align="center"><a href="https://pigi.xiezhaoye.site/">官网与下载</a> · <a href="docs/gmail-api.md">Gmail 接入教程</a> · <a href="docs/architecture.md">架构</a></p>
+<p align="center">这是 <a href="https://github.com/xiezhaoye/pigi">xiezhaoye/pigi</a> 的自维护 fork（<a href="https://github.com/yicone/pigi">yicone/pigi</a>）。Bundle ID 为 <code>one.yic.pigi</code>。在线更新已关闭，不会访问上游下载站。</p>
+
+<p align="center"><a href="https://github.com/xiezhaoye/pigi">上游仓库</a> · <a href="docs/gmail-api.md">Gmail 接入教程</a> · <a href="docs/architecture.md">架构</a></p>
 
 ![pigi 多账号汇总](landing/assets/multi-account.png)
 
@@ -23,7 +25,7 @@
 
 ## 安装
 
-从[官网](https://pigi.xiezhaoye.site/)下载 zip,拖进「应用程序」。安装包未经公证,首次打开请在「系统设置 → 隐私与安全性」点「仍要打开」。
+此 fork 不发布安装包，请从源码构建。上游官网的安装包不是这个 fork。自己编译的应用未经公证，首次打开请在「系统设置 → 隐私与安全性」点「仍要打开」。
 
 要求:macOS 15+,Apple Silicon。
 
@@ -41,7 +43,7 @@ xcodebuild -project Pigi.xcodeproj -scheme Pigi -configuration Debug -derivedDat
 open build/Build/Products/Debug/pigi.app
 ```
 
-自己构建时,请在 `project.yml` 里把 `PRODUCT_BUNDLE_IDENTIFIER` 改成你自己的,Gmail 的 OAuth 客户端 Bundle ID 也要与之一致。
+本 fork 的 `PRODUCT_BUNDLE_IDENTIFIER` 是 `one.yic.pigi`。Gmail 的 OAuth 客户端 Bundle ID 必须与它一致；如果改了前者，后者一起改。
 
 ## 常见问题
 

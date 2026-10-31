@@ -1,5 +1,8 @@
 import AppKit
 import SwiftUI
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 struct SettingsView: View {
     private enum Page: String, CaseIterable, Identifiable {

@@ -1,9 +1,10 @@
 import Foundation
 import Network
 
-struct ImapError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
+public struct ImapError: LocalizedError {
+    public let message: String
+    public var errorDescription: String? { message }
+    public init(message: String) { self.message = message }
 }
 
 /// One untagged server line; literals ({n} blocks) are pulled out and kept in order.

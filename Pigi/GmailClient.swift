@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 /// What the app still asks Google for directly: the account's profile picture.
 /// Mail itself goes through the in-app LocalEngine.
@@ -27,29 +30,5 @@ actor GmailClient {
               let fresh = try? await GmailAuth.refresh(refresh) else { return nil }
         token = fresh
         return fresh.accessToken
-    }
-}
-
-/// Which Gmail accounts are signed in. Emails live in UserDefaults, refresh
-/// tokens in the Keychain.
-enum GmailStore {
-    private static let defaultsKey = "gmailAccounts"
-
-    static func keychainKey(_ email: String) -> String { "gmail-refresh-\(email)" }
-
-    static var emails: [String] {
-        UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
-    }
-
-    static func add(_ email: String, refreshToken: String) {
-        Keychain.set(keychainKey(email), refreshToken)
-        var list = emails
-        if !list.contains(email) { list.append(email) }
-        UserDefaults.standard.set(list, forKey: defaultsKey)
-    }
-
-    static func remove(_ email: String) {
-        Keychain.set(keychainKey(email), "")
-        UserDefaults.standard.set(emails.filter { $0 != email }, forKey: defaultsKey)
     }
 }

@@ -44,7 +44,7 @@ FTS 使用 Pigi 原生 `trigram` 索引，通常至少需要三个连续字符�
 
 - SQLite URI `mode=ro` 对应 `SQLITE_OPEN_READONLY`，再设 `PRAGMA query_only=ON`；库不存在时失败，不创建数据库。不会调用 Pigi 的建表/迁移/写入逻辑，不标记已读。
 - 不使用 `immutable=1`，以便看到 App 当前提交的 WAL 数据。不执行 checkpoint，也不改 journal_mode。SQLite 自身可能创建/更新 WAL 的 `-shm` 协调文件；这是只读 SQLite 的并发机制，不能将其解释为整个目录零文件写入保证。严格文件系统零写入时应由操作者准备一致的离线快照，不能在运行中的 WAL 库上单独复制主文件。
-- **schema 未版本化**：当前 App 没有稳定的邮件 schema/API 版本契约；按 `Pigi/Engine/LocalEngine.swift` 的 messages 列与 fts 列检查兼容性，只读失败，不自动迁移。结构检查不保证语义兼容，fork/upstream 更新需重新核对。`messages.rowid = fts.rowid` 是当前实现细节。
+- **schema 未版本化**：当前 App 没有稳定的邮件 schema/API 版本契约；按 `Sources/PigiCore/Engine/LocalEngine.swift` 的 messages 列与 fts 列检查兼容性，只读失败，不自动迁移。结构检查不保证语义兼容，fork/upstream 更新需重新核对。`messages.rowid = fts.rowid` 是当前实现细节。
 - 当前 App 只在首次插入邮件时写 FTS；后续更新可能让 FTS 正文/搜索结果滞后，缺失或未同步邮件也无法从本地恢复。本原型不会修复或回填。读取正文不保证与服务器最新正文一致。
 - 默认路径按任务指定；App 沙箱/其他运行用户可能采用不同位置，应由操作者传入正确 `--db`。错误统一提示检查路径、schema、FTS5，避免泄漏本机信息。
 

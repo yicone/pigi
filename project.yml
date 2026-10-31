@@ -4,6 +4,9 @@ options:
   deploymentTarget:
     macOS: "15.0"
   createIntermediateGroups: true
+packages:
+  PigiCore:
+    path: .
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -15,6 +18,9 @@ targets:
     platform: macOS
     sources:
       - Pigi
+    dependencies:
+      - package: PigiCore
+        product: PigiCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: site.xiezhaoye.pigi

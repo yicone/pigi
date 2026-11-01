@@ -4,6 +4,9 @@ options:
   deploymentTarget:
     macOS: "15.0"
   createIntermediateGroups: true
+packages:
+  PigiCore:
+    path: .
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -15,6 +18,9 @@ targets:
     platform: macOS
     sources:
       - Pigi
+    dependencies:
+      - package: PigiCore
+        product: PigiCore
     preBuildScripts:
       - name: Build universal Proton helper
         script: bash "$SRCROOT/tools/build-proton-helper.sh" "$DERIVED_FILE_DIR/proton-helper"

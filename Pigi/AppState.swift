@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 import Observation
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 @MainActor
 @Observable

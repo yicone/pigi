@@ -13,11 +13,14 @@ for source in "$SOURCE_DIR/"*.swift; do
         *) SOURCES+=("$source") ;;
     esac
 done
+while IFS= read -r source; do
+    SOURCES+=("$source")
+done < <(find "$ROOT/Sources/PigiCore" -name '*.swift' | sort)
 
 xcrun swiftc -swift-version 5 -O -parse-as-library \
     -target "$(uname -m)-apple-macosx15.0" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-    "${SOURCES[@]}" "$ROOT/Pigi/Engine/"*.swift -lsqlite3 -lz "$ROOT/Tests/PanelLayoutRegression.swift" \
+    "${SOURCES[@]}" -lsqlite3 -lz "$ROOT/Tests/PanelLayoutRegression.swift" \
     -o "$TEST_BUILD/pigi-panel-regression"
 
 for scope in all account; do

@@ -12,7 +12,7 @@ import unittest
 from pigi_mail import MailError, MailReader, MCPServer
 
 SCRIPT = Path(__file__).with_name("pigi_mail.py")
-ENGINE = SCRIPT.parents[2] / "Pigi/Engine/LocalEngine.swift"
+ENGINE = SCRIPT.parents[2] / "Sources/PigiCore/Engine/LocalEngine.swift"
 
 
 class ReaderTests(unittest.TestCase):

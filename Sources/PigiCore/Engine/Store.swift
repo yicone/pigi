@@ -13,9 +13,10 @@ enum SQLValue {
     var blob: Data? { if case .blob(let v) = self { v } else { nil } }
 }
 
-struct SQLError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
+public struct SQLError: LocalizedError {
+    public let message: String
+    public var errorDescription: String? { message }
+    public init(message: String) { self.message = message }
 }
 
 typealias SQLRow = [String: SQLValue]

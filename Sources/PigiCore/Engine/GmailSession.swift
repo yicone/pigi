@@ -1,13 +1,18 @@
 import Foundation
 
-struct GmailFailure: LocalizedError {
-    let status: Int
-    let detail: String
-    var errorDescription: String? { "Gmail \(status) \(detail.prefix(200))" }
+public struct GmailFailure: LocalizedError {
+    public let status: Int
+    public let detail: String
+    public var errorDescription: String? { "Gmail \(status) \(detail.prefix(200))" }
+    public init(status: Int, detail: String) {
+        self.status = status
+        self.detail = detail
+    }
 }
 
-struct GmailRevoked: LocalizedError {
-    var errorDescription: String? { "授权已失效,请在 邮箱管理 里删除后重新添加这个邮箱" }
+public struct GmailRevoked: LocalizedError {
+    public init() {}
+    public var errorDescription: String? { "授权已失效,请在 邮箱管理 里删除后重新添加这个邮箱" }
 }
 
 /// Authorized calls to the Gmail REST API for one mailbox, with retry on quota errors and token refresh.

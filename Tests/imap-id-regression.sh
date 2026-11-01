@@ -5,7 +5,7 @@ TEST_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/pigi-imap-id-regression.XXXXXX")"
 trap 'rm -rf "$TEST_BUILD"' EXIT
 xcrun swiftc -swift-version 5 -D DEBUG -parse-as-library \
     -target "$(uname -m)-apple-macosx15.0" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-    "$ROOT/Pigi/Engine/ImapConnection.swift" "$ROOT/Tests/ImapIDRegression.swift" \
+    "$ROOT/Sources/PigiCore/Engine/ImapConnection.swift" "$ROOT/Tests/ImapIDRegression.swift" \
     -o "$TEST_BUILD/imap-id-regression"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
     -keyout "$TEST_BUILD/key.pem" -out "$TEST_BUILD/cert.pem" 2>/dev/null

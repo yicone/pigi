@@ -1,5 +1,8 @@
 import AppKit
 import SwiftUI
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 private final class TransparentPigiDockIcon: NSView {
     let artwork: NSImage

@@ -16,6 +16,8 @@ enum ProtonHelperError: String, Error, Codable {
     case notAuthenticated = "not_authenticated"
     case alreadyAuthenticated = "already_authenticated"
     case cleanupFailed = "cleanup_failed"
+    case notFound = "not_found"
+    case cursorExpired = "cursor_expired"
     case unavailable, transport, protocolViolation = "protocol_violation"
 }
 
@@ -100,6 +102,14 @@ final class ProtonHelperClient: @unchecked Sendable {
         return try await perform {
             _ = try self.start()
             return try self.exchange("decrypt", Params(id: id))
+        }
+    }
+
+    func syncRequest<P: Encodable, R: Decodable>(_ method: String, _ params: P) async throws -> R {
+        try await perform {
+            let info = try self.start()
+            guard info.methods.contains(method) else { throw ProtonHelperError.unsupportedVersion }
+            return try self.exchange(method, params)
         }
     }
 

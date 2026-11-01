@@ -53,6 +53,7 @@ struct ArchiveItem {
     let seq: Int
     let code: String?
     let unsubKind: String?
+    var labels: String? = nil
 
     var mail: Mail {
         let name = (fromName?.isEmpty == false ? fromName : fromEmail) ?? ""
@@ -71,7 +72,8 @@ struct ArchiveItem {
             bodyLoaded: false,
             isHTML: false,
             code: code,
-            unsubKind: unsubKind
+            unsubKind: unsubKind,
+            labels: labels.flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) }
         )
     }
 }
@@ -115,6 +117,11 @@ struct ArchiveClient {
     func addIMAP(email: String, password: String, host: String, port: Int) async throws {
         try await engine.addIMAP(email: email, password: password, host: host, port: port)
     }
+
+    func addProton(username: String, password: String, mailboxPassword: String, otp: String) async throws {
+        try await engine.addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+    }
+    func protonLabels(_ email: String) async throws -> [ProtonLabel] { try await engine.protonLabels(email) }
 
     func deleteAccount(_ email: String) async throws { try await engine.deleteAccount(email) }
 

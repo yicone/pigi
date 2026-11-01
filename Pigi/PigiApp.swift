@@ -25,6 +25,23 @@ struct PigiApp: App {
     @AppStorage("appearanceMode") private var appearance: AppAppearance = .system
 
     init() {
+        // Offline packaging smoke test: launch the embedded helper through the
+        // same Swift client used by the account integration. No mail or login.
+        if CommandLine.arguments.contains("--proton-helper-selftest") {
+            Task.detached {
+                do {
+                    let client = try ProtonHelperClient.bundled()
+                    _ = try await client.negotiate()
+                    try await client.logout()
+                    print("Proton helper handshake and logout passed.")
+                    exit(0)
+                } catch {
+                    print("Proton helper self-test failed.")
+                    exit(1)
+                }
+            }
+            dispatchMain()
+        }
         (AppAppearance(rawValue: UserDefaults.standard.string(forKey: "appearanceMode") ?? "") ?? .system).apply()
         let appState = AppState()
         _state = State(initialValue: appState)

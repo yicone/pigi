@@ -139,6 +139,19 @@ final class ImapConnection {
         }
         let caps = try await command("CAPABILITY")
         capabilities = Set(caps.flatMap { $0.line.uppercased().split(separator: " ").map(String.init) })
+        // NetEase/Coremail requires client identification before mailbox commands.
+        // Keep it here so probes, sync and flag changes all identify each new session.
+        if capabilities.contains("ID") {
+            try await identify()
+        }
+    }
+
+    private func identify() async throws {
+        // Release builds set this from VERSION via release.sh. Standalone tools
+        // have no app bundle version; do not claim a fabricated version for them.
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let fields = ["name", "pigi", "version", version, "vendor", "pigi"]
+        try await command("ID (\(fields.map(Self.quote).joined(separator: " ")))")
     }
 
     func logout() async {

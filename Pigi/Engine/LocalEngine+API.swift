@@ -1,14 +1,14 @@
 import Foundation
 
 extension LocalEngine {
-    private static let listColumns = "account,id,date,subject,from_name,from_email,snippet,unread,starred,status,seq,code,unsub_kind"
+    private static let listColumns = "account,id,date,subject,from_name,from_email,snippet,unread,starred,status,seq,code,unsub_kind,labels"
 
     private func item(_ r: SQLRow) -> ArchiveItem {
         ArchiveItem(
             account: r["account"]?.text ?? "", id: r["id"]?.text ?? "", date: r["date"]?.int ?? 0,
             subject: r["subject"]?.text, fromName: r["from_name"]?.text, fromEmail: r["from_email"]?.text,
             snippet: r["snippet"]?.text, unread: r["unread"]?.int ?? 0, starred: r["starred"]?.int ?? 0,
-            status: r["status"]?.text ?? "inbox", seq: r["seq"]?.int ?? 0, code: r["code"]?.text, unsubKind: r["unsub_kind"]?.text)
+            status: r["status"]?.text ?? "inbox", seq: r["seq"]?.int ?? 0, code: r["code"]?.text, unsubKind: r["unsub_kind"]?.text, labels: r["labels"]?.text)
     }
 
     // MARK: reading
@@ -45,14 +45,14 @@ extension LocalEngine {
         var rows: [SQLRow]
         if trimmed.count < 3 {
             rows = try db().query(
-                "SELECT \(Self.listColumns) FROM messages WHERE (subject LIKE ? OR from_email LIKE ?)"
+                "SELECT \(Self.listColumns) FROM messages WHERE status!='deleted' AND (subject LIKE ? OR from_email LIKE ?)"
                 + (account != nil ? " AND account=?" : "") + " ORDER BY date DESC LIMIT 50",
                 [.text("%\(trimmed)%"), .text("%\(trimmed)%")] + (account.map { [.text($0)] } ?? []))
         } else {
             let query = trimmed.split(whereSeparator: \.isWhitespace).map { "\"" + $0.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }.joined(separator: " AND ")
             let columns = Self.listColumns.split(separator: ",").map { "m." + $0 }.joined(separator: ",")
             rows = try db().query(
-                "SELECT \(columns) FROM fts JOIN messages m ON m.rowid=fts.rowid WHERE fts MATCH ?"
+                "SELECT \(columns) FROM fts JOIN messages m ON m.rowid=fts.rowid WHERE fts MATCH ? AND m.status!='deleted'"
                 + (account != nil ? " AND m.account=?" : "") + " ORDER BY m.date DESC LIMIT 50",
                 [.text(query)] + (account.map { [.text($0)] } ?? []))
         }
@@ -118,28 +118,39 @@ extension LocalEngine {
         trigger(address)
     }
 
-    func deleteAccount(_ email: String) throws {
+    func deleteAccount(_ email: String) async throws {
+        let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
+        proton?.deactivate()
+        Keychain.set(ProtonSession.key(email), "")
         let s = try db()
         try s.transaction {
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
             try s.run("DELETE FROM attachments WHERE account=?", [.text(email)])
             try s.run("DELETE FROM messages WHERE account=?", [.text(email)])
             try s.run("DELETE FROM muted WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM account_labels WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM proton_snapshot WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
         Keychain.set("imap-\(email)", "")
         sessions[email] = nil
         due[email] = nil
         announce()
+        try? await proton?.client.logout()
     }
 
     // MARK: actions
 
     private func kind(_ email: String) -> String { (try? account(email)?["kind"]?.text) ?? "gmail" }
 
+    private func requireWritable(_ email: String) throws {
+        if kind(email) == "proton" { throw ArchiveClient.Failure(message: "Proton 邮箱为只读，不改变已读、星标或文件夹") }
+    }
+
     /// Changes labels (Gmail vocabulary) on the server, then records the result locally.
     func modify(account: String, ids: [String], add: [String], remove: [String], trash: Bool = false) async throws {
         guard !ids.isEmpty, try self.account(account) != nil else { throw ArchiveClient.Failure(message: "未知的邮箱") }
+        try requireWritable(account)
         var results: [String: [String]] = [:]
         if kind(account) == "imap" {
             results = try await imapApply(account, ids: ids, add: add, remove: remove, trash: trash)
@@ -163,6 +174,7 @@ extension LocalEngine {
     }
 
     func unsubscribe(account: String, id: String) async throws -> ArchiveClient.UnsubscribeResult {
+        try requireWritable(account)
         guard let row = try db().query("SELECT unsub_kind,unsub FROM messages WHERE account=? AND id=?", [.text(account), .text(id)]).first,
               let json = row["unsub"]?.text, let info = try? JSONDecoder().decode(Detect.Unsub.self, from: Data(json.utf8)) else {
             throw ArchiveClient.Failure(message: "这封邮件没有退订信息")
@@ -184,6 +196,7 @@ extension LocalEngine {
     }
 
     func mute(account: String, sender: String, id: String) async throws {
+        try requireWritable(account)
         guard !sender.isEmpty else { return }
         try db().run("INSERT OR IGNORE INTO muted VALUES(?,?)", [.text(account), .text(sender.lowercased())])
         if !id.isEmpty { try await modify(account: account, ids: [id], add: [], remove: ["INBOX"]) }

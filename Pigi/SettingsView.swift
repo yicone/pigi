@@ -421,6 +421,7 @@ private struct AboutPage: View {
 private struct AccountsPage: View {
     @Environment(AppState.self) private var state
     @State private var adding = false
+    @State private var addingProton = false
     @State private var removing: Account?
     @State private var failure: String?
     @State private var status: [String: ArchiveAccount] = [:]
@@ -435,6 +436,7 @@ private struct AccountsPage: View {
                 Spacer(minLength: 12)
                 Menu {
                     Button("Gmail(登录授权)") { Task { await state.addGmailAccount() } }
+                    Button("Proton（只读）…") { addingProton = true }
                     Button("其他邮箱(IMAP)…") { adding = true }
                 } label: {
                     Label("添加邮箱", systemImage: "plus")
@@ -463,6 +465,7 @@ private struct AccountsPage: View {
         }
         .padding(EdgeInsets(top: 32, leading: 32, bottom: 24, trailing: 32))
         .sheet(isPresented: $adding) { AddIMAPSheet() }
+        .sheet(isPresented: $addingProton) { AddProtonSheet() }
         .task {
             while !Task.isCancelled {
                 if let list = try? await ArchiveClient().accounts() {
@@ -516,6 +519,9 @@ private struct AccountsPage: View {
                 .padding(.horizontal, 6).padding(.vertical, 1)
                 .background(Color.primary.opacity(0.07), in: Capsule())
             Spacer()
+            if account.kind == .proton {
+                Button("重新登录") { addingProton = true }.font(.system(size: 11.5))
+            }
             syncState(status[account.id])
             Toggle("", isOn: shown).labelsHidden().toggleStyle(.switch).controlSize(.small)
                 .help(shown.wrappedValue ? "在窗口和面板中显示" : "已隐藏,仍在后台同步")

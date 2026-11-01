@@ -21,6 +21,27 @@ targets:
     dependencies:
       - package: PigiCore
         product: PigiCore
+    preBuildScripts:
+      - name: Build universal Proton helper
+        script: bash "$SRCROOT/tools/build-proton-helper.sh" "$DERIVED_FILE_DIR/proton-helper"
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
+    postBuildScripts:
+      - name: Embed and sign Proton helper
+        script: |
+          set -euo pipefail
+          HELPER="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/pigi-proton-helper"
+          mkdir -p "$(dirname "$HELPER")"
+          cp "$DERIVED_FILE_DIR/proton-helper/pigi-proton-helper" "$HELPER"
+          IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+          if [ "$IDENTITY" = "-" ]; then
+            codesign --force --sign - --options runtime "$HELPER"
+          else
+            codesign --force --sign "$IDENTITY" --options runtime --timestamp "$HELPER"
+          fi
+          codesign --verify --strict "$HELPER"
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: one.yic.pigi
@@ -35,3 +56,4 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_ENTITLEMENTS: Pigi/Pigi.entitlements
         ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO

@@ -19,11 +19,18 @@ struct ProtonSyncMetadata: Codable, Sendable {
     }
 }
 
-struct ProtonLabel: Codable, Identifiable, Sendable, Equatable {
-    let id: String
-    let name: String
-    let parent: String
-    let type: Int
+public struct ProtonLabel: Codable, Identifiable, Sendable, Equatable {
+    public let id: String
+    public let name: String
+    public let parent: String
+    public let type: Int
+
+    public init(id: String, name: String, parent: String, type: Int) {
+        self.id = id
+        self.name = name
+        self.parent = parent
+        self.type = type
+    }
 }
 struct ProtonEventPage: Codable, Sendable {
     struct Change: Codable, Sendable { let id: String; let deleted: Bool }
@@ -157,7 +164,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
 }
 
 extension ProtonHelperError: LocalizedError {
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .credentials, .notAuthenticated: "Proton 会话失效，请重新登录"
         case .humanVerificationRequired: "Proton 需要人机验证，请稍后重试"

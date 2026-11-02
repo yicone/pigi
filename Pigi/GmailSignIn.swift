@@ -2,51 +2,12 @@ import AppKit
 import AuthenticationServices
 import CryptoKit
 import Foundation
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
-/// Google OAuth for an installed app: system browser sign-in with PKCE.
-/// The client is of type "iOS", so there is no client secret and the redirect
-/// is the reversed client id used as a custom URL scheme.
-enum GmailAuth {
-    /// The OAuth client ID the user created in their own Google Cloud project (see docs/gmail-api.md).
-    static var clientID: String {
-        get { UserDefaults.standard.string(forKey: "gmailClientID") ?? "" }
-        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "gmailClientID") }
-    }
-    static var isConfigured: Bool { clientID.hasSuffix(".apps.googleusercontent.com") }
-    static let scopes = [
-        "https://www.googleapis.com/auth/gmail.modify",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-        "openid",
-    ]
-
-    private static var redirectScheme: String {
-        "com.googleusercontent.apps." + clientID.replacingOccurrences(of: ".apps.googleusercontent.com", with: "")
-    }
-    private static var redirectURI: String { "\(redirectScheme):/oauth2redirect" }
-
-    struct Token {
-        let accessToken: String
-        let refreshToken: String?
-        let expiresAt: Date
-    }
-
-    enum AuthError: LocalizedError {
-        case cancelled
-        case denied(String)
-        case badResponse(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .cancelled: "已取消登录"
-            case .denied(let reason): "Google 拒绝了请求:\(reason)"
-            case .badResponse(let detail): "Google 返回了意外的内容:\(detail)"
-            }
-        }
-    }
-
-    // MARK: - Sign in
-
+extension GmailAuth {
+    /// System browser sign-in with PKCE. Token refresh stays in PigiCore.
     @MainActor
     static func signIn() async throws -> (email: String, token: Token) {
         guard isConfigured else { throw AuthError.badResponse("请先在 设置 › 邮箱管理 里填入你自己的 Google OAuth 客户端 ID") }
@@ -89,56 +50,6 @@ enum GmailAuth {
         ])
         let email = try await userEmail(accessToken: token.accessToken)
         return (email, token)
-    }
-
-    // MARK: - Refresh
-
-    static func refresh(_ refreshToken: String) async throws -> Token {
-        try await tokenRequest([
-            "client_id": clientID,
-            "refresh_token": refreshToken,
-            "grant_type": "refresh_token",
-        ])
-    }
-
-    private static func tokenRequest(_ form: [String: String]) async throws -> Token {
-        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = form
-            .map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? "")" }
-            .joined(separator: "&")
-            .data(using: .utf8)
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        struct Response: Decodable {
-            let access_token: String?
-            let refresh_token: String?
-            let expires_in: Double?
-            let error: String?
-            let error_description: String?
-        }
-        let response = try JSONDecoder().decode(Response.self, from: data)
-        if let error = response.error {
-            throw AuthError.denied([error, response.error_description].compactMap { $0 }.joined(separator: ": "))
-        }
-        guard let access = response.access_token else { throw AuthError.badResponse("没有 access_token") }
-        return Token(
-            accessToken: access,
-            refreshToken: response.refresh_token,
-            expiresAt: Date().addingTimeInterval((response.expires_in ?? 3600) - 60)
-        )
-    }
-
-    private static func userEmail(accessToken: String) async throws -> String {
-        var request = URLRequest(url: URL(string: "https://www.googleapis.com/oauth2/v3/userinfo")!)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, _) = try await URLSession.shared.data(for: request)
-        struct Info: Decodable { let email: String? }
-        guard let email = try JSONDecoder().decode(Info.self, from: data).email else {
-            throw AuthError.badResponse("没有取到邮箱地址")
-        }
-        return email.lowercased()
     }
 
     private static func randomString(byteCount: Int) -> String {
@@ -189,13 +100,4 @@ private extension Data {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
-}
-
-private extension CharacterSet {
-    /// Everything except the characters that are special inside a form value.
-    static let urlQueryValueAllowed: CharacterSet = {
-        var set = CharacterSet.alphanumerics
-        set.insert(charactersIn: "-._~")
-        return set
-    }()
 }

@@ -1,9 +1,10 @@
 import Foundation
 
-/// The mail engine that runs inside the app: syncs Gmail (REST API) and IMAP mailboxes into a local
-/// SQLite database with full-text search, and applies read / star / archive / delete back to the server.
-actor LocalEngine {
-    static let shared = LocalEngine()
+/// The mail engine that runs inside the app: syncs Gmail (REST API), IMAP, and read-only Proton
+/// mailboxes into a local SQLite database with full-text search. Gmail and IMAP can apply read /
+/// star / archive / delete back to the server. Proton never mutates remote state.
+public actor LocalEngine {
+    public static let shared = LocalEngine()
 
     var store: Store?
     var sessions: [String: GmailSession] = [:]
@@ -72,7 +73,7 @@ actor LocalEngine {
 
     // MARK: lifecycle
 
-    func start() {
+    public func start() {
         guard loop == nil else { return }
         try? ensureGmailAccounts()
         loop = Task { await runLoop() }

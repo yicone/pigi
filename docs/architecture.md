@@ -1,17 +1,18 @@
 # 架构
 
-pigi 没有服务器。App 内的 `LocalEngine`(Swift actor)负责同步,界面通过 `ArchiveClient` 门面与引擎交互。
+pigi 没有服务器。同步在 SwiftPM library `PigiCore` 的 `LocalEngine`(Swift actor)里完成,App 通过本地包依赖使用它。界面通过 `ArchiveClient` 门面与引擎交互。Gmail 的系统浏览器登录留在 App 里;令牌刷新在 library。
 
 ```
 SwiftUI 界面 ── AppState ── ArchiveClient ── LocalEngine ─┬─ GmailSession (REST, OAuth PKCE, history 增量)
                                                           ├─ ImapConnection (Network.framework TLS)
+                                                          ├─ ProtonSession (只读 helper IPC, 事件游标)
                                                           └─ Store (系统 SQLite3, WAL, FTS5 trigram)
 ```
 
 ## 数据
 
 - 数据库:`~/Library/Application Support/pigi/mail.db`;列表头缓存:`.../pigi/mail-headers.json`。
-- 表:`accounts`、`messages`(含 `seq` 变更序号)、`attachments`、`muted`、FTS5 虚表。
+- 表:`accounts`、`messages`(含 `seq` 变更序号)、`attachments`、`account_labels`、`proton_snapshot`、`muted`、FTS5 虚表。
 - 变更流:每次写入递增 `seq`;界面用 `changes(after:)` 增量拉取,`events()` 推送唤醒。
 - 状态:`inbox / archived / trash / spam / deleted`;标签沿用 Gmail 词汇 `INBOX / UNREAD / STARRED / TRASH / SPAM`。
 
@@ -38,10 +39,11 @@ SwiftUI 界面 ── AppState ── ArchiveClient ── LocalEngine ─┬─
 ## 目录
 
 ```
-Pigi/            App 源码(界面、AppState、更新)
-Pigi/Engine/     同步引擎:Store、MIME、Detect、Imap、Gmail
-landing/         官网(Cloudflare Workers Static Assets)
-docs/            文档
+Package.swift        PigiCore SwiftPM library
+Sources/PigiCore/    同步引擎、钥匙串、Gmail token refresh
+Pigi/                App 源码(界面、AppState、更新、AppKit 交互登录)
+landing/             官网(Cloudflare Workers Static Assets)
+docs/                文档
 ```
 
 ## 界面与刷新（0.1.1）

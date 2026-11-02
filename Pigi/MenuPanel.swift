@@ -101,15 +101,20 @@ struct MenuPanel: View {
         ZStack(alignment: .topLeading) {
             Color.black.opacity(0.001).onTapGesture { model.picking = false }
             pickerMenu
-                .padding(.leading, 14)
-                .padding(.top, 58)
-                .transition(.scale(scale: 0.96, anchor: .topLeading).combined(with: .opacity))
         }
     }
 
     private var pickerMenu: some View {
         ScrollView {
-            pickerMenuRows.padding(8)
+            VStack(alignment: .leading, spacing: 2) {
+                pickerAllRow
+                ForEach(state.sidebarGroups.filter { !$0.accounts.isEmpty }) { entry in
+                    ForEach(entry.accounts) { account in
+                        pickerAccountRow(account)
+                    }
+                }
+            }
+            .padding(8)
         }
         .scrollIndicators(.never)
         .frame(width: 262)
@@ -118,25 +123,25 @@ struct MenuPanel: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.08)))
         .shadow(color: .black.opacity(0.18), radius: 14, y: 4)
+        .padding(.leading, 14)
+        .padding(.top, 58)
+        .transition(.scale(scale: 0.96, anchor: .topLeading).combined(with: .opacity))
     }
 
-    private var pickerMenuRows: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 0) {
-                pickerRow(title: "全部邮件", subtitle: nil, count: state.unreadCount(.all), selected: model.scope == .all,
-                          icon: AnyView(icon(for: .all, size: 28))) { pick(.all) }
-                MailRefreshButton().padding(.trailing, 6)
-            }
-            ForEach(state.sidebarGroups.filter { !$0.accounts.isEmpty }) { entry in
-                ForEach(entry.accounts) { account in
-                    let alias = state.accountAliases[account.id]
-                    pickerRow(title: alias ?? account.email, subtitle: alias == nil ? nil : account.email,
-                              count: state.unreadCount(.account(account.id)),
-                              selected: model.scope == .account(account.id),
-                              icon: AnyView(icon(for: .account(account.id), size: 28))) { pick(.account(account.id)) }
-                }
-            }
+    private var pickerAllRow: some View {
+        HStack(spacing: 0) {
+            pickerRow(title: "全部邮件", subtitle: nil, count: state.unreadCount(.all), selected: model.scope == .all,
+                      icon: AnyView(icon(for: .all, size: 28))) { pick(.all) }
+            MailRefreshButton().padding(.trailing, 6)
         }
+    }
+
+    private func pickerAccountRow(_ account: Account) -> some View {
+        let alias = state.accountAliases[account.id]
+        return pickerRow(title: alias ?? account.email, subtitle: alias == nil ? nil : account.email,
+                         count: state.unreadCount(.account(account.id)),
+                         selected: model.scope == .account(account.id),
+                         icon: AnyView(icon(for: .account(account.id), size: 28))) { pick(.account(account.id)) }
     }
 
     private func pickerRow(title: String, subtitle: String?, count: Int, selected: Bool, icon: AnyView,

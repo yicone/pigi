@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 struct MailListView: View {
     @Environment(AppState.self) private var state

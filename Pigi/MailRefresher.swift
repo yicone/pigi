@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 /// /poke only queues work. Watch the local engine account status while pulling changes,
 /// so a refresh never reports success after merely reading the old archive.

@@ -78,17 +78,17 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
 
     init(client: ProtonHelperClient, email: String) { self.client = client; self.email = email }
 
-    static func signIn(username: String, password: String, mailboxPassword: String, otp: String) async throws -> ProtonSession {
+    static func signIn(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws -> ProtonSession {
         let client = try ProtonHelperClient.bundled()
         do {
-            try await client.login(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+            try await client.loginInteractively(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
             let secret: Secret = try await client.syncRequest("session", Empty())
             guard secret.email.contains("@") else { throw ProtonHelperError.protocolViolation }
             let session = ProtonSession(client: client, email: secret.email.lowercased())
             session.initialSecret = secret
             return session
         } catch {
-            try? await client.logout()
+            do { try await client.logout() } catch { throw ProtonHelperError.cleanupFailed }
             throw error
         }
     }
@@ -166,8 +166,13 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
 extension ProtonHelperError: LocalizedError {
     public var errorDescription: String? {
         switch self {
-        case .credentials, .notAuthenticated: "Proton 会话失效，请重新登录"
-        case .humanVerificationRequired: "Proton 需要人机验证，请稍后重试"
+        case .invalidParams: "验证未完成或输入格式不正确，请重试"
+        case .credentials: "账号、密码或验证码不正确，请检查后重试"
+        case .notAuthenticated: "Proton 会话失效，请重新登录"
+        case .cleanupFailed: "临时登录会话清理未完成，请稍后重试"
+        case .humanVerificationRequired: "此验证方式暂不支持，请重新开始登录"
+        case .loginExpired: "验证已超时，请重新开始登录"
+        case .unsupportedFactor: "当前仅支持 TOTP，请使用支持的验证方式"
         case .secondFactorRequired: "请输入当前的两步验证码"
         case .key: "Proton 密钥解锁失败，请检查独立邮箱密码或钥匙串权限"
         case .network, .timeout, .rateLimited: "Proton 网络暂不可用或请求受限，请稍后重试"

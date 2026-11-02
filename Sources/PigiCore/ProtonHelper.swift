@@ -12,6 +12,8 @@ public enum ProtonHelperError: String, Error, Codable {
     case network, timeout, credentials, key, upstream
     case humanVerificationRequired = "human_verification_required"
     case secondFactorRequired = "second_factor_required"
+    case loginExpired = "login_expired"
+    case unsupportedFactor = "unsupported_factor"
     case rateLimited = "rate_limited"
     case notAuthenticated = "not_authenticated"
     case alreadyAuthenticated = "already_authenticated"
@@ -44,6 +46,18 @@ struct ProtonMessageBody: Decodable, Sendable {
     let mimeType: String
     enum CodingKeys: String, CodingKey { case body; case mimeType = "mime_type" }
 }
+
+public struct ProtonLoginChallenge: Decodable, Sendable {
+    public let stage: String
+    public let webURL: String?
+    public let challenge: String?
+    public var failure: ProtonHelperError?
+    enum CodingKeys: String, CodingKey { case stage, challenge; case webURL = "web_url" }
+    public init(stage: String, webURL: String? = nil, challenge: String? = nil) {
+        self.stage = stage; self.webURL = webURL; self.challenge = challenge
+    }
+}
+public typealias ProtonLoginInteraction = @MainActor @Sendable (ProtonLoginChallenge) async throws -> String
 
 /// Each instance owns one account session in a private child. Blocking pipe IO
 /// runs on a dedicated queue, never the UI or Swift cooperative executor.
@@ -87,6 +101,43 @@ public final class ProtonHelperClient: @unchecked Sendable {
             return try self.exchange("login", Params(username: username, password: password, mailbox_password: mailboxPassword, otp: otp))
         }
         guard result.authenticated else { throw ProtonHelperError.protocolViolation }
+    }
+
+    func loginInteractively(username: String, password: String, mailboxPassword: String, otp: String,
+                            interaction: ProtonLoginInteraction?) async throws {
+        struct Begin: Encodable { let username: String; let password: String }
+        struct Continue: Encodable { let response: String }
+        var step: ProtonLoginChallenge = try await syncRequest("begin_login", Begin(username: username, password: password))
+        var initialOTP = otp, initialMailbox = mailboxPassword
+        let deadline = Date().addingTimeInterval(300)
+        while step.stage != "ready" {
+            try Task.checkCancellation()
+            guard Date() < deadline else { throw ProtonHelperError.loginExpired }
+            switch step.stage {
+            case "captcha":
+                guard let raw = step.webURL, let challenge = step.challenge,
+                      ProtonVerificationPolicy.url(raw, challenge: challenge) != nil else { throw ProtonHelperError.protocolViolation }
+            case "totp", "mailbox": break
+            default: throw ProtonHelperError.protocolViolation
+            }
+            var answer: String
+            if step.stage == "totp", !initialOTP.isEmpty { answer = initialOTP; initialOTP = "" }
+            else if step.stage == "mailbox", !initialMailbox.isEmpty { answer = initialMailbox; initialMailbox = "" }
+            else if let interaction { answer = try await interaction(step) }
+            else { throw step.stage == "captcha" ? ProtonHelperError.humanVerificationRequired : ProtonHelperError.secondFactorRequired }
+            if step.stage == "captcha", !ProtonVerificationPolicy.result(answer, challenge: step.challenge ?? "") {
+                throw ProtonHelperError.invalidParams
+            }
+            do {
+                step = try await syncRequest("continue_login", Continue(response: answer))
+            } catch let error as ProtonHelperError where interaction != nil && ["totp", "mailbox"].contains(step.stage)
+                        && [.credentials, .key, .network, .timeout, .invalidParams].contains(error) {
+                // Keep the provisional helper for a corrected code/password.
+                step.failure = error
+            }
+            answer = ""
+        }
+        try Task.checkCancellation()
     }
 
     func list(page: Int = 0, limit: Int = 50) async throws -> [ProtonMessageMetadata] {

@@ -1,12 +1,14 @@
 import Foundation
 
-/// The mail engine that runs inside the app: syncs Gmail (REST API) and IMAP mailboxes into a local
-/// SQLite database with full-text search, and applies read / star / archive / delete back to the server.
+/// The mail engine that runs inside the app: syncs Gmail (REST API), IMAP, and read-only Proton
+/// mailboxes into a local SQLite database with full-text search. Gmail and IMAP can apply read /
+/// star / archive / delete back to the server. Proton never mutates remote state.
 public actor LocalEngine {
     public static let shared = LocalEngine()
 
     var store: Store?
     var sessions: [String: GmailSession] = [:]
+    var protonSessions: [String: any ProtonSyncRemote] = [:]
     var due: [String: Date] = [:]
     var running: Set<String> = []
     var dirty: Set<String> = []
@@ -42,6 +44,8 @@ public actor LocalEngine {
           account TEXT, msg_id TEXT, part_id TEXT, filename TEXT, mime TEXT, size INTEGER, att_id TEXT,
           PRIMARY KEY(account, msg_id, part_id))
         """,
+        "CREATE TABLE IF NOT EXISTS account_labels(account TEXT, id TEXT, name TEXT, parent TEXT, type INTEGER, PRIMARY KEY(account,id))",
+        "CREATE TABLE IF NOT EXISTS proton_snapshot(account TEXT, id TEXT, PRIMARY KEY(account,id))",
         "CREATE TABLE IF NOT EXISTS muted(account TEXT, sender TEXT, PRIMARY KEY(account, sender))",
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(subject, sender, body, tokenize='trigram')",
     ]
@@ -99,7 +103,12 @@ public actor LocalEngine {
         dirty.remove(email)
         let before = (try? currentSeq()) ?? 0
         let kind = (try? account(email)?["kind"]?.text) ?? "gmail"
-        let delay = kind == "imap" ? await syncIMAP(email) : await syncGmail(email)
+        let delay: Double
+        switch kind {
+        case "proton": delay = await syncProton(email)
+        case "imap": delay = await syncIMAP(email)
+        default: delay = await syncGmail(email)
+        }
         due[email] = dirty.contains(email) ? .distantPast : Date().addingTimeInterval(delay)
         running.remove(email)
         if (try? currentSeq()) != before { announce() }
@@ -178,7 +187,10 @@ public actor LocalEngine {
                 .int(d.attachments.isEmpty ? 0 : 1), .int(d.size), compress(d.html), .int(seq),
                 .opt(code), .opt(unsub?.kind), .opt(unsubJSON),
             ]
-            if existing != nil {
+            if let existing {
+                try s.run("DELETE FROM fts WHERE rowid=?", [existing["rowid"] ?? .null])
+                try s.run("INSERT INTO fts(rowid,subject,sender,body) VALUES(?,?,?,?)",
+                          [existing["rowid"] ?? .null, .text(d.subject), .text("\(d.name) \(d.address)"), .text(d.text)])
                 try s.run("""
                     UPDATE messages SET thread_id=?,date=?,subject=?,from_name=?,from_email=?,to_addr=?,snippet=?,labels=?,
                     unread=?,starred=?,status=?,has_att=?,size=?,html=?,seq=?,code=?,unsub_kind=?,unsub=? WHERE account=? AND id=?

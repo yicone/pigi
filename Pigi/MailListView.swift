@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(PigiCore)
+import PigiCore
+#endif
 
 struct MailListView: View {
     @Environment(AppState.self) private var state
@@ -85,6 +88,23 @@ struct MailListView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
+            if case .account(let email) = state.scope, state.isReadOnly(email) {
+                Menu {
+                    Button("收件箱") { state.selectedProtonLabel = nil }
+                    Button("所有邮件") { state.selectedProtonLabel = "ALL" }
+                    Button("星标") { state.selectedProtonLabel = "STARRED" }
+                    Button("归档") { state.selectedProtonLabel = "ARCHIVE" }
+                    Button("已发送") { state.selectedProtonLabel = "SENT" }
+                    Button("草稿") { state.selectedProtonLabel = "DRAFT" }
+                    Button("垃圾箱") { state.selectedProtonLabel = "TRASH" }
+                    Button("垃圾邮件") { state.selectedProtonLabel = "SPAM" }
+                    Divider()
+                    ForEach(state.protonLabels[email] ?? []) { label in
+                        Button(label.name) { state.selectedProtonLabel = "proton:" + label.id }
+                    }
+                } label: { Text(state.protonLabelTitle(email)) }
+                .help("当前：" + (state.selectedProtonLabel ?? "收件箱"))
+            }
             MailRefreshButton()
         }
         .padding(.horizontal, 14)
@@ -179,11 +199,13 @@ struct MailRow: View {
         .onHover { hovering = $0 }
         .animation(.spring(response: 0.3, dampingFraction: 0.75), value: hovering)
         .contextMenu {
+            if !state.isReadOnly(mail.accountID) {
             Button("归档") { state.archive(mail.id) }
             Button(mail.isStarred ? "取消星标" : "加星标") { state.toggleStar(mail.id) }
             Button("删除") { state.delete(mail.id) }
             Divider()
             Button(mail.isUnread ? "标为已读" : "标为未读") { state.toggleUnread(mail.id) }
+            } else { Text("Proton 邮箱为只读") }
         }
     }
 

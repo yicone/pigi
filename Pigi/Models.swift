@@ -3,6 +3,7 @@ import Foundation
 enum AccountKind: String, CaseIterable, Identifiable {
     case gmail
     case imap
+    case proton
 
     var id: String { rawValue }
 
@@ -10,6 +11,7 @@ enum AccountKind: String, CaseIterable, Identifiable {
         switch self {
         case .gmail: "Gmail"
         case .imap: "IMAP"
+        case .proton: "Proton（只读）"
         }
     }
 }
@@ -45,6 +47,7 @@ struct Mail: Identifiable, Hashable, Codable {
     var code: String? = nil
     /// How the mail can be unsubscribed from: one_click, link or mailto; nil when it cannot.
     var unsubKind: String? = nil
+    var labels: [String]? = nil
 }
 
 /// What the sidebar has selected: every mailbox merged, or a single one.

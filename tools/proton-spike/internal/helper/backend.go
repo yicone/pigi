@@ -32,9 +32,11 @@ func (t identifiedTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 }
 
 type ProtonBackend struct {
-	manager *proton.Manager
-	client  *proton.Client
-	rings   map[string]*crypto.KeyRing
+	manager    *proton.Manager
+	client     *proton.Client
+	rings      map[string]*crypto.KeyRing
+	session    savedSession
+	persistent bool
 }
 
 func NewBackend() *ProtonBackend {
@@ -60,6 +62,8 @@ func classify(err error, fallback string) *Fault {
 			return fail("human_verification_required")
 		case api.Code == proton.PasswordWrong, api.Code == proton.UsernameInvalid, api.Status == 401:
 			return fail("credentials")
+		case api.Status == 404:
+			return fail("not_found")
 		case api.Status == 429:
 			return fail("rate_limited")
 		case api.Status >= 500:
@@ -126,11 +130,13 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 			pass = []byte(p.Mailbox)
 			defer clear(pass)
 		}
-		rings, err := unlock(ctx, client, pass)
+		rings, salted, err := unlockSession(ctx, client, pass)
 		if err != nil {
 			return nil, classify(err, "key")
 		}
 		b.rings = rings
+		b.session = savedSession{UID: auth.UID, Access: auth.AccessToken, Refresh: auth.RefreshToken, Salted: salted}
+		b.trackAuth()
 		ok = true
 		return map[string]bool{"authenticated": true}, nil
 	case "list":
@@ -163,7 +169,7 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 		var p struct {
 			ID string `json:"id"`
 		}
-		if !Decode(raw, &p) || p.ID == "" || len(p.ID) > 1024 {
+		if !Decode(raw, &p) || !validID(p.ID) {
 			return nil, fail("invalid_params")
 		}
 		if b.client == nil || b.rings == nil {
@@ -186,6 +192,8 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 			return nil, fail("key")
 		}
 		return map[string]string{"body": string(plain), "mime_type": string(msg.MIMEType)}, nil
+	case "snapshot", "events", "labels", "latest", "metadata", "session", "resume":
+		return b.syncCall(ctx, method, raw)
 	case "logout":
 		var p struct{}
 		if !Decode(raw, &p) {
@@ -201,6 +209,9 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 }
 
 func (b *ProtonBackend) logout() *Fault {
+	clear(b.session.Salted)
+	b.session = savedSession{}
+	b.persistent = false
 	for _, ring := range b.rings {
 		ring.ClearPrivateParams()
 	}
@@ -219,7 +230,17 @@ func (b *ProtonBackend) logout() *Fault {
 }
 
 func (b *ProtonBackend) Close() *Fault {
-	fault := b.logout()
+	var fault *Fault
+	if !b.persistent {
+		fault = b.logout()
+	} else {
+		for _, ring := range b.rings {
+			ring.ClearPrivateParams()
+		}
+		b.rings = nil
+		clear(b.session.Salted)
+		b.session = savedSession{}
+	}
 	if b.client != nil {
 		b.client.Close()
 		b.client = nil
@@ -228,18 +249,18 @@ func (b *ProtonBackend) Close() *Fault {
 	return fault
 }
 
-func unlock(ctx context.Context, c *proton.Client, pass []byte) (map[string]*crypto.KeyRing, error) {
+func unlockSession(ctx context.Context, c *proton.Client, pass []byte) (map[string]*crypto.KeyRing, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	addresses, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var primary string
 	for _, key := range user.Keys {
@@ -249,13 +270,13 @@ func unlock(ctx context.Context, c *proton.Client, pass []byte) (map[string]*cry
 		}
 	}
 	if primary == "" {
-		return nil, errors.New("missing_primary_key")
+		return nil, nil, errors.New("missing_primary_key")
 	}
 	salted, err := salts.SaltForKey(pass, primary)
 	if err != nil || len(salted) == 0 {
-		return nil, errors.New("key_derivation_failed")
+		return nil, nil, errors.New("key_derivation_failed")
 	}
-	defer clear(salted)
+	// The derived unlock secret is exported only over the private pipe for Keychain storage.
 	userKR, rings, err := proton.Unlock(user, addresses, salted, async.NoopPanicHandler{})
 	if userKR != nil {
 		userKR.ClearPrivateParams()
@@ -264,7 +285,8 @@ func unlock(ctx context.Context, c *proton.Client, pass []byte) (map[string]*cry
 		for _, ring := range rings {
 			ring.ClearPrivateParams()
 		}
-		return nil, err
+		clear(salted)
+		return nil, nil, err
 	}
-	return rings, nil
+	return rings, salted, nil
 }

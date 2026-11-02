@@ -8,6 +8,7 @@ struct AccountGroup: Identifiable, Codable, Hashable {
 
     static let gmailID = "group-gmail"
     static let imapID = "group-imap"
+    static let protonID = "group-proton"
 
     static var defaults: [AccountGroup] {
         [
@@ -49,12 +50,15 @@ extension AppState {
     private func normalizedGroups() -> ([AccountGroup], [String: Account]) {
         let byID = Dictionary(allAccounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var result = groups
+        if allAccounts.contains(where: { $0.kind == .proton }), !result.contains(where: { $0.id == AccountGroup.protonID }) {
+            result.append(AccountGroup(id: AccountGroup.protonID, name: "Proton", accountIDs: []))
+        }
         var seen = Set<String>()
         for index in result.indices {
             result[index].accountIDs = result[index].accountIDs.filter { byID[$0] != nil && seen.insert($0).inserted }
         }
         for account in allAccounts where !seen.contains(account.id) {
-            let target = account.kind == .gmail ? AccountGroup.gmailID : AccountGroup.imapID
+            let target = account.kind == .proton ? AccountGroup.protonID : (account.kind == .gmail ? AccountGroup.gmailID : AccountGroup.imapID)
             let index = result.firstIndex { $0.id == target } ?? 0
             result[index].accountIDs.append(account.id)
         }

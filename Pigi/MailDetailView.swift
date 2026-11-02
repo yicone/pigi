@@ -33,11 +33,13 @@ struct MailDetailContent: View {
         VStack(spacing: 0) {
             head(mail)
                     .contextMenu {
+                        if !state.isReadOnly(mail.accountID) {
                         Button("归档") { state.archive(mail.id) }
                         Button(mail.isStarred ? "取消星标" : "加星标") { state.toggleStar(mail.id) }
                         Button("删除") { state.delete(mail.id) }
                         Divider()
                         Button(mail.isUnread ? "标为已读" : "标为未读") { state.toggleUnread(mail.id) }
+                        } else { Text("Proton 邮箱为只读") }
                         Button(allowRemoteContent ? "屏蔽远程图片" : "加载远程图片") { remoteOverride = !allowRemoteContent }
                     }
                 // A thin light-grey rule that stops short of both edges.

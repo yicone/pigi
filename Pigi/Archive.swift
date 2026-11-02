@@ -49,7 +49,8 @@ extension ArchiveItem {
             bodyLoaded: false,
             isHTML: false,
             code: code,
-            unsubKind: unsubKind
+            unsubKind: unsubKind,
+            labels: labels.flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) }
         )
     }
 }

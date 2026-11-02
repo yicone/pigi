@@ -1,0 +1,295 @@
+import AppKit
+import SwiftUI
+
+enum MailCache {
+    static func load() -> [Mail] { [] }
+    static func save(_ mails: [Mail]) {}
+    static func clear() {}
+}
+enum Keychain {
+    private static var values: [String: String] = [:]
+    private static let lock = NSLock()
+    static func get(_ key: String) -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
+    @discardableResult static func set(_ key: String, _ value: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        values[key] = value.isEmpty ? nil : value
+        return true
+    }
+}
+@MainActor enum MainWindow { static func show() {} }
+
+actor FixtureProton: ProtonSyncRemote {
+    var snapshotPages = ["": ["one", "two"], "two": [String]()]
+    var rows: [String: ProtonSyncMetadata] = [:]
+    var bodies: [String: ProtonMessageBody] = [:]
+    var pages: [String: ProtonEventPage] = [:]
+    var failing: String?
+    var latestID = "c0"
+    func latest() async throws -> String { latestID }
+    func labels() async throws -> [ProtonLabel] { [ProtonLabel(id: "custom", name: "Work", parent: "parent", type: 3)] }
+    func snapshot(after: String) async throws -> [String] { snapshotPages[after] ?? [] }
+    func metadata(id: String) async throws -> ProtonSyncMetadata {
+        guard let row = rows[id] else { throw ProtonHelperError.notFound }
+        return row
+    }
+    func decrypt(id: String) async throws -> ProtonMessageBody {
+        if id == failing { throw ProtonHelperError.key }
+        guard let body = bodies[id] else { throw ProtonHelperError.notFound }
+        return body
+    }
+    func events(cursor: String) async throws -> ProtonEventPage {
+        pages[cursor] ?? ProtonEventPage(cursor: cursor, more: false, reset: false, changes: [])
+    }
+    func put(_ id: String, unread: Bool = true, labels: [String] = ["0", "5", "custom"], text: String = "fixture plaintext", html: Bool = false) {
+        rows[id] = ProtonSyncMetadata(id: id, subject: "Fixture \(id)", time: Int(Date().timeIntervalSince1970), unread: unread,
+                                     sender_name: "Fixture sender", sender_email: "sender@example.test", labels: labels, size: 42)
+        bodies[id] = ProtonMessageBody(body: text, mimeType: html ? "text/html" : "text/plain")
+    }
+    func mimeBody(_ id: String, body: String) { bodies[id] = ProtonMessageBody(body: body, mimeType: "multipart/mixed") }
+    func failure(_ id: String?) { failing = id }
+    func event(_ cursor: String, next: String, changes: [(String, Bool)], reset: Bool = false, more: Bool = false) {
+        pages[cursor] = ProtonEventPage(cursor: next, more: more, reset: reset, changes: changes.map { .init(id: $0.0, deleted: $0.1) })
+    }
+    func rescan(_ ids: [String], latest: String) { snapshotPages = ["": ids, ids.last ?? "last": []]; latestID = latest }
+}
+
+extension LocalEngine {
+    func fixture(_ email: String, remote: any ProtonSyncRemote) throws {
+        if store == nil {
+            store = try Store(path: ":memory:")
+            for statement in Self.schema { try store!.run(statement) }
+        }
+        try db().run("INSERT OR IGNORE INTO accounts(email,kind) VALUES(?,'proton')", [.text(email)])
+        protonSessions[email] = remote
+    }
+    func inspect(_ sql: String) throws -> [SQLRow] { try db().query(sql) }
+    func cursor(_ email: String) throws -> String? { try account(email)?["history_id"]?.text }
+    func offset(_ email: String) throws -> String? { try account(email)?["page_token"]?.text }
+    func sequence() throws -> Int { try currentSeq() }
+}
+
+@main @MainActor struct ProtonSyncRegression {
+    static func main() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 40) { fputs("FAIL: Proton sync timeout\n", stderr); _exit(124) }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        UserDefaults.standard.setVolatileDomain([
+            "gmailAccounts": [String](), "imapAccounts": [String](), "protonAccounts": ["fixture@example.test"],
+            "hiddenAccounts": [String](), "sidebarGroups": Data(),
+        ], forName: UserDefaults.argumentDomain)
+        Task { @MainActor in
+            do { try await run(); exit(0) }
+            catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+        }
+        app.run()
+    }
+    static func run() async throws {
+        let email = "fixture@example.test", other = "other@example.test"
+        let engine = LocalEngine(), remote = FixtureProton()
+        await remote.put("one")
+        await remote.put("two", text: "<p>HTML fixture</p>", html: true)
+        try await engine.fixture(email, remote: remote)
+        try await engine.pullProton(email, remote: remote)
+        let initialCursor = try await engine.cursor(email), initialOffset = try await engine.offset(email)
+        precondition(initialCursor == "c0" && initialOffset == "two")
+        let plain = try await engine.body(account: email, id: "one"), html = try await engine.body(account: email, id: "two")
+        precondition(plain.text == "fixture plaintext" && html.html == "<p>HTML fixture</p>")
+        let labels = try await engine.protonLabels(email)
+        precondition(labels.first?.name == "Work" && labels.first?.parent == "parent" && labels.first?.type == 3)
+        let initialRows = try await engine.inspect("SELECT * FROM messages")
+        precondition(initialRows.count == 2 && initialRows.allSatisfy { $0["unread"]?.int == 1 })
+        precondition(initialRows.allSatisfy { $0["labels"]?.text?.contains("proton:custom") == true })
+        print("PASS: snapshot, label/folder mapping, local plaintext/HTML and unread preservation")
+
+        try await engine.pullProton(email, remote: remote)
+        let seq = try await engine.sequence()
+        try await engine.pullProton(email, remote: remote)
+        let repeated = try await engine.sequence()
+        precondition(seq == repeated)
+        print("PASS: repeated empty incremental polls are idempotent")
+
+        await remote.put("one", unread: false, labels: ["6", "5", "10"], text: "replacement searchable body")
+        await remote.put("three")
+        await remote.event("c0", next: "c1", changes: [("one", false), ("three", false), ("two", true)])
+        await remote.failure("three")
+        do { try await engine.pullProton(email, remote: remote); fatalError("decrypt failure swallowed") }
+        catch ProtonHelperError.key {}
+        let failedCursor = try await engine.cursor(email)
+        precondition(failedCursor == "c0")
+        await remote.failure(nil)
+        try await engine.pullProton(email, remote: remote)
+        let updatedCursor = try await engine.cursor(email)
+        precondition(updatedCursor == "c1")
+        let rows = try await engine.inspect("SELECT * FROM messages ORDER BY id")
+        precondition(rows.count == 3 && rows.first?["unread"]?.int == 0 && rows.first?["starred"]?.int == 1)
+        precondition(rows.first?["status"]?.text == "archived" && rows.last?["status"]?.text == "deleted")
+        let updatedBody = try await engine.body(account: email, id: "one")
+        precondition(updatedBody.text == "replacement searchable body")
+        let hits = try await engine.search("replacement", account: email)
+        precondition(hits.count == 1)
+        let fts = try await engine.inspect("SELECT count(*) AS n FROM fts")
+        precondition(fts.first?["n"]?.int == 3)
+        print("PASS: cursor stays on failure; replay updates body/FTS/flags and deletion without duplicates")
+
+        let otherRemote = FixtureProton()
+        await otherRemote.put("one", text: "isolated account")
+        await otherRemote.rescan(["one"], latest: "o0")
+        try await engine.fixture(other, remote: otherRemote)
+        try await engine.pullProton(other, remote: otherRemote)
+        let otherBody = try await engine.body(account: other, id: "one")
+        precondition(otherBody.text == "isolated account")
+        print("PASS: identical remote IDs remain isolated across accounts")
+
+        await remote.event("c1", next: "expired", changes: [], reset: true)
+        await remote.rescan(["three"], latest: "fresh")
+        try await engine.pullProton(email, remote: remote)
+        try await engine.pullProton(email, remote: remote)
+        try await engine.pullProton(email, remote: remote)
+        let fresh = try await engine.cursor(email)
+        precondition(fresh == "fresh")
+        let rescanned = try await engine.inspect("SELECT id,status FROM messages WHERE account='fixture@example.test' ORDER BY id")
+        precondition(rescanned.first?["status"]?.text == "deleted")
+        let preservedOther = try await engine.body(account: other, id: "one")
+        precondition(preservedOther.text == "isolated account")
+        let deletedHits = try await engine.search("replacement", account: email)
+        precondition(deletedHits.isEmpty)
+        print("PASS: expired event reset rebuilds snapshot and reconciles vanished mail per account")
+
+        for operation in 0..<3 {
+            do {
+                switch operation {
+                case 0: try await engine.modify(account: email, ids: ["three"], add: [], remove: ["UNREAD"])
+                case 1: _ = try await engine.unsubscribe(account: email, id: "three")
+                default: try await engine.mute(account: email, sender: "sender@example.test", id: "three")
+                }
+                fatalError("Proton write allowed")
+            } catch let error as ArchiveClient.Failure { precondition(error.message.contains("只读")) }
+        }
+        let muted = try await engine.inspect("SELECT count(*) AS n FROM muted")
+        precondition(muted.first?["n"]?.int == 0)
+        print("PASS: engine rejects modify, unsubscribe and mute before side effects")
+
+        let state = AppState()
+        var mail = fixtureMail()
+        state.mails = [mail]
+        state.open(mail)
+        state.toggleUnread(mail.id)
+        state.toggleStar(mail.id)
+        state.archive(mail.id)
+        state.delete(mail.id)
+        state.markAllRead()
+        precondition(state.mails.count == 1 && state.mails[0].isUnread && !state.mails[0].isStarred)
+        precondition(state.accounts(of: .proton).count == 1 && state.sidebarGroups.contains { $0.id == AccountGroup.protonID })
+        state.select(.account(email))
+        state.selectedProtonLabel = "proton:custom"
+        precondition(state.visibleMails.count == 1)
+        state.selectedProtonLabel = "SPAM"
+        precondition(state.visibleMails.isEmpty)
+        mail.labels = ["SPAM"]
+        state.mails = [mail]
+        precondition(state.visibleMails.count == 1)
+        precondition(state.unreadTotal == 0 && state.unreadCount(.account(email)) == 0)
+        state.select(.all)
+        precondition(state.visibleMails.isEmpty)
+        print("PASS: Proton UI open/actions preserve state; account group and label filtering work")
+
+        // Remove a live account; a stale in-flight task must not resurrect it.
+        try await engine.deleteAccount(email)
+        do { try await engine.pullProton(email, remote: remote); fatalError("deleted account resumed") }
+        catch is CancellationError {}
+        let remaining = try await engine.accounts()
+        precondition(remaining.map(\.email) == [other])
+        print("PASS: removal clears local labels/mail and stale sync cannot resurrect account")
+        let mimeEngine = LocalEngine(), mimeRemote = FixtureProton()
+        await mimeRemote.put("one")
+        await mimeRemote.put("two")
+        await mimeRemote.mimeBody("one", body: """
+        Content-Type: multipart/alternative; boundary="fixture-boundary"
+
+        --fixture-boundary
+        Content-Type: text/plain; charset=utf-8
+        Content-Transfer-Encoding: base64
+
+        c3ludGhldGljIE1JTUUgdGV4dA==
+        --fixture-boundary
+        Content-Type: text/html; charset=utf-8
+
+        <p>synthetic MIME HTML</p>
+        --fixture-boundary--
+        """)
+        try await mimeEngine.fixture(email, remote: mimeRemote)
+        try await mimeEngine.pullProton(email, remote: mimeRemote)
+        let mimeBody = try await mimeEngine.body(account: email, id: "one")
+        precondition(mimeBody.text == "synthetic MIME text" && mimeBody.html == "<p>synthetic MIME HTML</p>")
+        print("PASS: decrypted PGP/MIME maps decoded plaintext and HTML through the existing MIME parser")
+        try await sessionPersistence()
+        if CommandLine.arguments.count > 1 { try renderEvidence(state, to: URL(fileURLWithPath: CommandLine.arguments[1])) }
+    }
+    static func sessionPersistence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-fixture-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("helper")
+        let source = """
+        #!/usr/bin/python3
+        import json,sys
+        for line in sys.stdin:
+            r=json.loads(line)
+            if r['method']=='hello':
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session']}
+            elif r['method']=='session':
+                result={'uid':'synthetic-uid','access':'synthetic-access','refresh':'synthetic-refresh','salted':'c3ludGhldGlj','email':'fixture@example.test'}
+            else:
+                result={'logged_out':True}
+            print(json.dumps({'version':1,'id':r['id'],'result':result}),flush=True)
+        """
+        try source.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let client = ProtonHelperClient(executable: executable)
+        let session = ProtonSession(client: client, email: "fixture@example.test")
+        try await session.saveSecret()
+        let key = ProtonSession.key("fixture@example.test")
+        precondition(Keychain.get(key)?.contains("synthetic-refresh") == true)
+        session.deactivate()
+        Keychain.set(key, "new session")
+        try await session.saveSecret()
+        precondition(Keychain.get(key) == "new session")
+        Keychain.set(key, "")
+        try await session.saveSecret()
+        precondition(Keychain.get(key) == nil)
+        let mismatch = ProtonSession(client: client, email: "other@example.test")
+        do { try await mismatch.saveSecret(); fatalError("cross-account session persisted") }
+        catch ProtonHelperError.credentials {}
+        try await client.logout()
+        print("PASS: pipe session export persists only to the fixture Keychain; deactivated sessions cannot overwrite or resurrect secrets")
+    }
+
+    static func renderEvidence(_ state: AppState, to directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        func capture<V: View>(_ view: V, _ name: String, width: CGFloat, height: CGFloat) throws {
+            let hosting = NSHostingView(rootView: view.frame(width: width, height: height).background(Color.white).foregroundStyle(Color.black).environment(\.colorScheme, .light))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: [.borderless], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.appearance = NSAppearance(named: .aqua)
+            window.contentView = hosting
+            hosting.frame = window.contentView!.bounds
+            hosting.layoutSubtreeIfNeeded()
+            guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else { fatalError("no bitmap") }
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { fatalError("no PNG") }
+            try data.write(to: directory.appendingPathComponent(name))
+            window.close()
+        }
+        try capture(AddProtonSheet().environment(state), "proton-login.png", width: 460, height: 360)
+        state.mails = [fixtureMail()]
+        state.select(.account("fixture@example.test"))
+        try capture(MailListView().environment(state), "proton-inbox.png", width: 480, height: 500)
+        print("PASS: synthetic Proton login and inbox UI rendered")
+    }
+
+    static func fixtureMail() -> Mail {
+        Mail(id: "fixture@example.test#three", accountID: "fixture@example.test", remoteID: "three", senderName: "Fixture", senderEmail: "sender@example.test",
+             subject: "Fixture", snippet: "", body: "", date: Date(), isUnread: true, isStarred: false, bodyLoaded: true, isHTML: false,
+             labels: ["INBOX", "ALL", "proton:custom"])
+    }
+}

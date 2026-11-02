@@ -12,6 +12,9 @@ final class AppState {
     private(set) var gmailAccounts: [Account] = GmailStore.emails.map(AppState.gmailAccount)
     /// Mailboxes the engine pulls over IMAP; the engine is the source of truth, this is the last list it gave.
     private(set) var imapAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "imapAccounts") ?? []).map(AppState.imapAccount)
+    private(set) var protonAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "protonAccounts") ?? []).map(AppState.protonAccount)
+    private(set) var protonLabels: [String: [ProtonLabel]] = [:]
+    var selectedProtonLabel: String? = nil
     /// Mailboxes switched off in 邮箱管理: still pulled and kept by the engine, just not shown in the window or the panel.
     var hiddenAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenAccounts") ?? []) {
         didSet { UserDefaults.standard.set(Array(hiddenAccounts).sorted(), forKey: "hiddenAccounts") }
@@ -73,9 +76,9 @@ final class AppState {
 
     // MARK: - Derived
 
-    /// Every mailbox the engine syncs: Gmail and IMAP.
+    /// Every mailbox the engine syncs, including read-only Proton accounts.
     private var syncedAccountIDs: Set<String> {
-        Set(gmailAccounts.map(\.id)).union(imapAccounts.map(\.id))
+        Set(gmailAccounts.map(\.id)).union(imapAccounts.map(\.id)).union(protonAccounts.map(\.id))
     }
 
     /// Every mailbox the app knows, shown or not.
@@ -85,7 +88,7 @@ final class AppState {
             account.avatarURL = avatarURLs[account.id]
             return account
         }
-        return gmail + imapAccounts
+        return gmail + imapAccounts + protonAccounts
     }
 
     /// The mailboxes switched on, which is what the sidebar, the picker and "all mail" show.
@@ -112,6 +115,12 @@ final class AppState {
                 case .account(let id): mail.accountID == id
                 }
             }
+            .filter { mail in
+                guard isReadOnly(mail.accountID), query.isEmpty else { return true }
+                let label: String
+                if case .account = scope { label = selectedProtonLabel ?? "INBOX" } else { label = "INBOX" }
+                return mail.labels?.contains(label) == true
+            }
             .filter { readFilter == .all || $0.isUnread || stay.contains($0.id) }
             .filter {
                 query.isEmpty
@@ -137,7 +146,11 @@ final class AppState {
     }
 
     /// Unread mails across every mailbox, for the menu bar.
-    var unreadTotal: Int { mails.filter { $0.isUnread && !hiddenAccounts.contains($0.accountID) }.count }
+    var unreadTotal: Int {
+        mails.filter { $0.isUnread && !hiddenAccounts.contains($0.accountID) && isInboxMail($0) }.count
+    }
+
+    private func isInboxMail(_ mail: Mail) -> Bool { !isReadOnly(mail.accountID) || mail.labels?.contains("INBOX") == true }
 
     var selectedMail: Mail? {
         guard let id = selectedMailID else { return nil }
@@ -150,12 +163,24 @@ final class AppState {
 
     func unreadCount(_ scope: Scope) -> Int {
         mails.filter { mail in
-            guard mail.isUnread else { return false }
+            guard mail.isUnread, isInboxMail(mail) else { return false }
             switch scope {
             case .all: return !hiddenAccounts.contains(mail.accountID)
             case .account(let id): return mail.accountID == id
             }
         }.count
+    }
+
+    func protonLabelTitle(_ email: String) -> String {
+        let label = selectedProtonLabel ?? "INBOX"
+        let names = ["INBOX": "收件箱", "ALL": "所有邮件", "STARRED": "星标", "ARCHIVE": "归档", "SENT": "已发送", "DRAFT": "草稿", "TRASH": "垃圾箱", "SPAM": "垃圾邮件"]
+        return names[label] ?? protonLabels[email]?.first { "proton:" + $0.id == label }?.name ?? "文件夹 / 标签"
+    }
+
+    func isReadOnly(_ email: String) -> Bool { protonAccounts.contains { $0.id == email } }
+
+    private static func protonAccount(_ email: String) -> Account {
+        Account(id: email, name: email.split(separator: "@").first.map(String.init) ?? email, kind: .proton)
     }
 
     private static func imapAccount(_ email: String) -> Account {
@@ -177,6 +202,7 @@ final class AppState {
 
     func select(_ scope: Scope) {
         self.scope = scope
+        selectedProtonLabel = nil
         selectedMailID = nil
         stayVisible = []
     }
@@ -280,6 +306,16 @@ final class AppState {
             imapAccounts = emails.map(Self.imapAccount)
             UserDefaults.standard.set(emails, forKey: "imapAccounts")
         }
+        let protonEmails = list.filter { $0.kind == "proton" }.map(\.email)
+        protonAccounts = protonEmails.map(Self.protonAccount)
+        UserDefaults.standard.set(protonEmails, forKey: "protonAccounts")
+        for email in protonEmails { protonLabels[email] = try? await ArchiveClient().protonLabels(email) }
+    }
+
+    func addProtonAccount(username: String, password: String, mailboxPassword: String, otp: String) async throws {
+        try await ArchiveClient().addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+        await refreshServerAccounts()
+        await syncFromArchive(full: true)
     }
 
     /// Adds a mailbox the engine reads over IMAP. Throws with the engine's reason when the login fails.
@@ -296,6 +332,9 @@ final class AppState {
         if account.kind == .gmail {
             removeGmailAccount(id)
         } else {
+            protonAccounts.removeAll { $0.id == id }
+            protonLabels[id] = nil
+            UserDefaults.standard.set(protonAccounts.map(\.id), forKey: "protonAccounts")
             imapAccounts.removeAll { $0.id == id }
             UserDefaults.standard.set(imapAccounts.map(\.id), forKey: "imapAccounts")
             mails.removeAll { $0.accountID == id }
@@ -416,14 +455,24 @@ final class AppState {
         var touched = 0
         for item in items {
             var mail = item.mail
-            if item.status != "inbox" {
-                if byID[mail.id] != nil, !searchHits.contains(mail.id) { removed.insert(mail.id); touched += 1 }
+            if item.status != "inbox" && (!isReadOnly(item.account) || item.status == "deleted") {
+                if item.status == "deleted" && isReadOnly(item.account) {
+                    removed.insert(mail.id)
+                    searchHits.remove(mail.id)
+                    touched += 1
+                } else if byID[mail.id] != nil, !searchHits.contains(mail.id) { removed.insert(mail.id); touched += 1 }
                 continue
             }
             if let change = readChanges[mail.id], change.confirmedAt == nil { mail.isUnread = !change.value }
             if let change = starChanges[mail.id], change.confirmedAt == nil { mail.isStarred = change.value }
-            if let index = byID[mail.id] {
-                if mails[index].isUnread != mail.isUnread || mails[index].isStarred != mail.isStarred
+            if let index = byID[mail.id], index >= 0 {
+                if isReadOnly(item.account) {
+                    // Invalidate a cached decrypted body when an event replaces it.
+                    let wasLoaded = mails[index].bodyLoaded
+                    mails[index] = mail
+                    if wasLoaded { Task { await self.loadBody(mail.id) } }
+                    touched += 1
+                } else if mails[index].isUnread != mail.isUnread || mails[index].isStarred != mail.isStarred
                     || mails[index].code != mail.code || mails[index].unsubKind != mail.unsubKind {
                     mails[index].isUnread = mail.isUnread
                     mails[index].isStarred = mail.isStarred
@@ -433,7 +482,7 @@ final class AppState {
                 }
             } else {
                 added.append(mail)
-                if mail.isUnread { freshMails.append(mail) }
+                if mail.isUnread && item.status == "inbox" { freshMails.append(mail) }
                 byID[mail.id] = -1
                 touched += 1
             }
@@ -499,7 +548,7 @@ final class AppState {
     // MARK: - Actions
 
     func toggleStar(_ id: String) {
-        guard let mail = mail(id) else { return }
+        guard let mail = mail(id), !isReadOnly(mail.accountID) else { return }
         let starred = !mail.isStarred
         update(id) { $0.isStarred = starred }
         starChanges[id] = LocalChange(value: starred)
@@ -518,7 +567,7 @@ final class AppState {
     }
 
     private func setRead(_ id: String, _ read: Bool) {
-        guard let mail = mail(id) else { return }
+        guard let mail = mail(id), !isReadOnly(mail.accountID) else { return }
         update(id) { $0.isUnread = !read }
         readChanges[id] = LocalChange(value: read)
         sendToBackend(mail, failure: "标记已读失败") {
@@ -529,11 +578,11 @@ final class AppState {
         }
     }
 
-    var unreadVisibleCount: Int { visibleMails.filter(\.isUnread).count }
+    var unreadVisibleCount: Int { visibleMails.filter { $0.isUnread && !isReadOnly($0.accountID) }.count }
 
     /// Marks everything unread in the current list as read; Gmail mails go up one call per mailbox.
     func markAllRead(ids: Set<String>? = nil) {
-        let targets = (ids.map { selected in mails.filter { selected.contains($0.id) } } ?? visibleMails).filter(\.isUnread)
+        let targets = (ids.map { selected in mails.filter { selected.contains($0.id) } } ?? visibleMails).filter { $0.isUnread && !isReadOnly($0.accountID) }
         guard !targets.isEmpty else { return }
         let gmail = targets
         for mail in gmail {
@@ -567,7 +616,7 @@ final class AppState {
     var markAllReadIDs: Set<String>?
 
     func confirmMarkAllRead(_ list: [Mail]) {
-        let ids = Set(list.filter(\.isUnread).map(\.id))
+        let ids = Set(list.filter { $0.isUnread && !isReadOnly($0.accountID) }.map(\.id))
         markAllReadIDs = ids.isEmpty ? nil : ids
     }
 
@@ -589,6 +638,7 @@ final class AppState {
 
     /// One-click mails are unsubscribed by the engine; others open the page. Either way the user already chose.
     func unsubscribe(_ mail: Mail) {
+        guard !isReadOnly(mail.accountID) else { return }
         Task {
             do {
                 switch try await ArchiveClient().unsubscribe(account: mail.accountID, id: mail.remoteID) {
@@ -607,6 +657,7 @@ final class AppState {
     }
 
     func muteSender(_ mail: Mail) {
+        guard !isReadOnly(mail.accountID) else { return }
         Task {
             do {
                 try await ArchiveClient().mute(account: mail.accountID, sender: mail.senderEmail, id: mail.remoteID)
@@ -619,7 +670,7 @@ final class AppState {
     }
 
     func archive(_ id: String) {
-        guard let mail = mail(id) else { return }
+        guard let mail = mail(id), !isReadOnly(mail.accountID) else { return }
         remove(id)
         sendToBackend(mail, failure: "归档失败") {
             try await $0.modify(account: mail.accountID, id: mail.remoteID, add: [], remove: ["INBOX"])
@@ -630,7 +681,7 @@ final class AppState {
 
     /// Delete moves to the trash rather than erasing the mail.
     func delete(_ id: String) {
-        guard let mail = mail(id) else { return }
+        guard let mail = mail(id), !isReadOnly(mail.accountID) else { return }
         remove(id)
         sendToBackend(mail, failure: "删除失败") {
             try await $0.trash(account: mail.accountID, id: mail.remoteID)

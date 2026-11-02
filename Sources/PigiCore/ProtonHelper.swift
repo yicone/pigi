@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 
 /// Stable wire codes only; no API error messages, credentials or mail content.
-enum ProtonHelperError: String, Error, Codable {
+public enum ProtonHelperError: String, Error, Codable {
     case invalidRequest = "invalid_request"
     case invalidParams = "invalid_params"
     case unsupportedVersion = "unsupported_version"
@@ -16,10 +16,12 @@ enum ProtonHelperError: String, Error, Codable {
     case notAuthenticated = "not_authenticated"
     case alreadyAuthenticated = "already_authenticated"
     case cleanupFailed = "cleanup_failed"
+    case notFound = "not_found"
+    case cursorExpired = "cursor_expired"
     case unavailable, transport, protocolViolation = "protocol_violation"
 }
 
-struct ProtonHelperInfo: Decodable, Sendable {
+public struct ProtonHelperInfo: Decodable, Sendable {
     let `protocol`: Int
     let helperVersion: String
     let maxFrameBytes: Int
@@ -45,7 +47,7 @@ struct ProtonMessageBody: Decodable, Sendable {
 
 /// Each instance owns one account session in a private child. Blocking pipe IO
 /// runs on a dedicated queue, never the UI or Swift cooperative executor.
-final class ProtonHelperClient: @unchecked Sendable {
+public final class ProtonHelperClient: @unchecked Sendable {
     static let maxFrame = 8 * 1024 * 1024
     private let queue = DispatchQueue(label: "one.yic.pigi.proton-helper")
     private let executable: URL
@@ -62,7 +64,7 @@ final class ProtonHelperClient: @unchecked Sendable {
         self.timeout = timeout
     }
 
-    static func bundled(in bundle: Bundle = .main) throws -> ProtonHelperClient {
+    public static func bundled(in bundle: Bundle = .main) throws -> ProtonHelperClient {
         guard let root = bundle.executableURL?.deletingLastPathComponent().deletingLastPathComponent() else {
             throw ProtonHelperError.unavailable
         }
@@ -71,7 +73,7 @@ final class ProtonHelperClient: @unchecked Sendable {
         return ProtonHelperClient(executable: path)
     }
 
-    func negotiate() async throws -> ProtonHelperInfo {
+    public func negotiate() async throws -> ProtonHelperInfo {
         try await perform { try self.start() }
     }
 
@@ -103,7 +105,15 @@ final class ProtonHelperClient: @unchecked Sendable {
         }
     }
 
-    func logout() async throws {
+    func syncRequest<P: Encodable, R: Decodable>(_ method: String, _ params: P) async throws -> R {
+        try await perform {
+            let info = try self.start()
+            guard info.methods.contains(method) else { throw ProtonHelperError.unsupportedVersion }
+            return try self.exchange(method, params)
+        }
+    }
+
+    public func logout() async throws {
         struct Result: Decodable { let logged_out: Bool }
         try await perform {
             guard self.process != nil else { return }

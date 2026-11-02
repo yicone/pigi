@@ -86,7 +86,7 @@ func Serve(in io.Reader, out io.Writer, backend Backend) error {
 				resp.Error = fail("invalid_params")
 			} else {
 				negotiated = true
-				resp.Result = map[string]any{"protocol": Version, "helper_version": "0.1.0", "max_frame_bytes": MaxFrame, "methods": []string{"login", "list", "decrypt", "logout"}}
+				resp.Result = map[string]any{"protocol": Version, "helper_version": "0.2.0", "max_frame_bytes": MaxFrame, "methods": []string{"login", "list", "decrypt", "logout", "snapshot", "metadata", "labels", "latest", "events", "session", "resume"}}
 			}
 		case !negotiated:
 			resp.Error = fail("handshake_required")

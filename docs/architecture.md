@@ -5,13 +5,14 @@ pigi 没有服务器。同步在 SwiftPM library `PigiCore` 的 `LocalEngine`(Sw
 ```
 SwiftUI 界面 ── AppState ── ArchiveClient ── LocalEngine ─┬─ GmailSession (REST, OAuth PKCE, history 增量)
                                                           ├─ ImapConnection (Network.framework TLS)
+                                                          ├─ ProtonSession (只读 helper IPC, 事件游标)
                                                           └─ Store (系统 SQLite3, WAL, FTS5 trigram)
 ```
 
 ## 数据
 
 - 数据库:`~/Library/Application Support/pigi/mail.db`;列表头缓存:`.../pigi/mail-headers.json`。
-- 表:`accounts`、`messages`(含 `seq` 变更序号)、`attachments`、`muted`、FTS5 虚表。
+- 表:`accounts`、`messages`(含 `seq` 变更序号)、`attachments`、`account_labels`、`proton_snapshot`、`muted`、FTS5 虚表。
 - 变更流:每次写入递增 `seq`;界面用 `changes(after:)` 增量拉取,`events()` 推送唤醒。
 - 状态:`inbox / archived / trash / spam / deleted`;标签沿用 Gmail 词汇 `INBOX / UNREAD / STARRED / TRASH / SPAM`。
 

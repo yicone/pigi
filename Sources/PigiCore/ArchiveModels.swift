@@ -35,8 +35,9 @@ public struct ArchiveItem {
     public let seq: Int
     public let code: String?
     public let unsubKind: String?
+    public let labels: String?
 
-    public init(account: String, id: String, date: Int, subject: String?, fromName: String?, fromEmail: String?, snippet: String?, unread: Int, starred: Int, status: String, seq: Int, code: String?, unsubKind: String?) {
+    public init(account: String, id: String, date: Int, subject: String?, fromName: String?, fromEmail: String?, snippet: String?, unread: Int, starred: Int, status: String, seq: Int, code: String?, unsubKind: String?, labels: String? = nil) {
         self.account = account
         self.id = id
         self.date = date
@@ -50,6 +51,7 @@ public struct ArchiveItem {
         self.seq = seq
         self.code = code
         self.unsubKind = unsubKind
+        self.labels = labels
     }
 }
 
@@ -104,6 +106,14 @@ public struct ArchiveClient {
 
     public func addIMAP(email: String, password: String, host: String, port: Int) async throws {
         try await engine.addIMAP(email: email, password: password, host: host, port: port)
+    }
+
+    public func addProton(username: String, password: String, mailboxPassword: String, otp: String) async throws {
+        try await engine.addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+    }
+
+    public func protonLabels(_ email: String) async throws -> [ProtonLabel] {
+        try await engine.protonLabels(email)
     }
 
     public func deleteAccount(_ email: String) async throws { try await engine.deleteAccount(email) }

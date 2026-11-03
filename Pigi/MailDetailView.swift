@@ -85,8 +85,12 @@ struct MailDetailContent: View {
                 Text(mail.date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened).locale(Locale(identifier: "zh_CN"))))
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-                if state.isReadOnly(mail.accountID) {
-                    Label("签名未验证 · 无法确认发件人身份", systemImage: "questionmark.shield")
+                if mail.signatureStatus == "verified" {
+                    Label("签名已验证", systemImage: "checkmark.shield")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                } else if mail.signatureStatus == "failed" {
+                    Label("签名校验失败 · 请谨慎对待邮件内容", systemImage: "exclamationmark.shield")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ProtonMail/gluon/async"
 	proton "github.com/ProtonMail/go-proton-api"
+	"github.com/ProtonMail/gopenpgp/v2/constants"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 	"github.com/sirupsen/logrus"
 )
@@ -206,8 +207,24 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 		if err != nil {
 			return nil, fail("key_format")
 		}
-		// No sender key / trust chain is available. Never claim authenticity.
-		decrypted, err := ring.Decrypt(encrypted, nil, crypto.GetUnixTime())
+		// Only trust keys the service marks uncompromised; obsolete keys may
+		// still verify historical mail. Lookup failures never imply a bad signature.
+		var verifier *crypto.KeyRing
+		if msg.Sender != nil && msg.Sender.Address != "" {
+			keys, _, lookupErr := b.client.GetPublicKeys(ctx, msg.Sender.Address)
+			if lookupErr == nil {
+				trusted := proton.PublicKeys{}
+				for _, key := range keys {
+					if key.Flags&proton.KeyStateTrusted != 0 {
+						trusted = append(trusted, key)
+					}
+				}
+				if len(trusted) > 0 {
+					verifier, _ = trusted.GetKeyRing()
+				}
+			}
+		}
+		decrypted, status, err := decryptVerified(ring, encrypted, verifier, int64(msg.Time))
 		if err != nil {
 			return nil, fail("key_decryption")
 		}
@@ -216,7 +233,7 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 		if !utf8.Valid(plain) {
 			return nil, fail("key")
 		}
-		return map[string]string{"body": string(plain), "mime_type": string(msg.MIMEType), "signature_status": "unverified"}, nil
+		return map[string]string{"body": string(plain), "mime_type": string(msg.MIMEType), "signature_status": status}, nil
 	case "snapshot", "events", "labels", "latest", "metadata", "session", "resume":
 		return b.syncCall(ctx, method, raw)
 	case "logout":
@@ -315,4 +332,24 @@ func unlockSession(ctx context.Context, c *proton.Client, pass []byte) (map[stri
 		return nil, nil, err
 	}
 	return rings, salted, nil
+}
+
+// Signature errors preserve the decrypted body; integrity/decryption errors do not.
+func decryptVerified(ring *crypto.KeyRing, encrypted *crypto.PGPMessage, verifier *crypto.KeyRing, sentAt int64) (*crypto.PlainMessage, string, error) {
+	if sentAt <= 0 {
+		sentAt = crypto.GetUnixTime()
+	}
+	plain, err := ring.Decrypt(encrypted, verifier, sentAt)
+	status := "unverified"
+	if verifier != nil && err == nil {
+		status = "verified"
+	}
+	var sigErr crypto.SignatureVerificationError
+	if errors.As(err, &sigErr) {
+		if sigErr.Status != constants.SIGNATURE_NOT_SIGNED {
+			status = "failed"
+		}
+		err = nil
+	}
+	return plain, status, err
 }

@@ -33,11 +33,11 @@ extension LocalEngine {
     }
 
     func body(account: String, id: String) throws -> ArchiveClient.Body {
-        guard let row = try db().query("SELECT rowid,html FROM messages WHERE account=? AND id=?", [.text(account), .text(id)]).first else {
+        guard let row = try db().query("SELECT rowid,html,signature_status FROM messages WHERE account=? AND id=?", [.text(account), .text(id)]).first else {
             throw ArchiveClient.Failure(message: "邮件不存在")
         }
         let text = try db().query("SELECT body FROM fts WHERE rowid=?", [row["rowid"] ?? .null]).first?["body"]?.text ?? ""
-        return ArchiveClient.Body(html: row["html"]?.blob.flatMap(inflate), text: text)
+        return ArchiveClient.Body(html: row["html"]?.blob.flatMap(inflate), text: text, signatureStatus: row["signature_status"]?.text)
     }
 
     func search(_ term: String, account: String?) throws -> [ArchiveItem] {

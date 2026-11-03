@@ -195,7 +195,7 @@ extension LocalEngine {
             try save(Draft(account: email, id: id, threadID: nil, date: meta.time * 1000, subject: meta.subject,
                            name: meta.sender_name, address: meta.sender_email, to: email,
                            snippet: String(text.prefix(200)), labels: meta.mappedLabels, attachments: [], size: meta.size,
-                           html: html, text: text, headers: [:]))
+                           html: html, text: text, headers: [:], signatureStatus: body.signatureStatus))
         } catch ProtonHelperError.notFound {
             try checkProton(email, remote)
             try deleteProtonMessage(email, id)

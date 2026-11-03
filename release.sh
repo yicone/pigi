@@ -14,6 +14,10 @@ VERSION="$(head -1 VERSION | tr -d '[:space:]')"
 BUILD="$(date +%y%m%d%H%M)"
 FILE="Pigi-$VERSION-macos-universal.zip"
 SIGNING=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=-)
+# 未指定签名身份时，若本机有自签证书 "Pigi Local Signing" 则默认用它（仅自用，不可公证）。
+if [ -z "${PIGI_SIGNING_IDENTITY:-}" ] && security find-identity -p codesigning 2>/dev/null | grep -q '"Pigi Local Signing"'; then
+  SIGNING=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=Pigi Local Signing")
+fi
 if [ -n "${PIGI_SIGNING_IDENTITY:-}" ]; then
   SIGNING=(CODE_SIGN_STYLE=Manual "CODE_SIGN_IDENTITY=$PIGI_SIGNING_IDENTITY")
   [ -z "${PIGI_DEVELOPMENT_TEAM:-}" ] || SIGNING+=("DEVELOPMENT_TEAM=$PIGI_DEVELOPMENT_TEAM")

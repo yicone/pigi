@@ -23,11 +23,14 @@ public enum AgentProtocol {
         public let query: String?
         public let limit: Int?
         public let offset: Int?
+        public let since: Int?
+        public let status: String?
 
         public init(account: String? = nil, messageID: String? = nil, query: String? = nil,
-                    limit: Int? = nil, offset: Int? = nil) {
+                    limit: Int? = nil, offset: Int? = nil, since: Int? = nil, status: String? = nil) {
             self.account = account; self.messageID = messageID; self.query = query
             self.limit = limit; self.offset = offset
+            self.since = since; self.status = status
         }
     }
 
@@ -44,7 +47,14 @@ public enum AgentProtocol {
         public let status: String
     }
 
+    public struct Account: Codable {
+        public let account: String
+        public let kind: String?
+    }
+
     public struct Result: Codable {
+        public var accounts: [Account]? = nil
+        public var capabilities: [String] = ["accounts", "filters"]
         public let items: [Message]?
         public let nextOffset: Int?
         public let message: Message?
@@ -57,7 +67,7 @@ public enum AgentProtocol {
         public let message: String
         static func make(_ code: String) -> Self {
             let messages = ["invalid_request": "Invalid request", "unsupported_version": "Unsupported protocol version",
-                            "method_not_found": "Only list, search and get are supported", "not_found": "Message not found",
+                            "method_not_found": "Only accounts, list, search and get are supported", "not_found": "Message not found",
                             "internal_error": "Local mail store unavailable", "too_large": "Frame exceeds size limit",
                             "unauthorized": "Peer user is not authorized", "timeout": "Connection deadline exceeded"]
             return Self(code: code, message: messages[code] ?? "Request failed")
@@ -85,13 +95,25 @@ extension LocalEngine {
         typealias Failure = AgentProtocol.Failure
         guard request.version == AgentProtocol.version else { throw Failure.make("unsupported_version") }
         guard !request.id.isEmpty, request.id.utf8.count <= 128 else { throw Failure.make("invalid_request") }
-        guard ["list", "search", "get"].contains(request.method) else { throw Failure.make("method_not_found") }
+        guard ["accounts", "list", "search", "get"].contains(request.method) else { throw Failure.make("method_not_found") }
         let p = request.params
         let limit = p?.limit ?? 50, offset = p?.offset ?? 0
         guard (1...100).contains(limit), (0...1_000_000).contains(offset),
               (p?.account?.utf8.count ?? 0) <= 1024,
               (p?.messageID?.utf8.count ?? 0) <= 4096 else { throw Failure.make("invalid_request") }
 
+        guard (p?.since ?? 0) >= 0, (p?.since ?? 0) <= 9_007_199_254_740_991 else { throw Failure.make("invalid_request") }
+        if let status = p?.status, !["inbox", "archived", "spam", "trash"].contains(status) {
+            throw Failure.make("invalid_request")
+        }
+        if request.method == "accounts" {
+            guard p?.account == nil, p?.messageID == nil, p?.query == nil, p?.since == nil, p?.status == nil else { throw Failure.make("invalid_request") }
+            let rows = try db().query("SELECT email,kind FROM accounts ORDER BY email LIMIT ? OFFSET ?", [.int(limit + 1), .int(offset)])
+            var result = AgentProtocol.Result(items: nil, nextOffset: rows.count > limit ? offset + limit : nil,
+                                               message: nil, text: nil, contentTrust: "untrusted")
+            result.accounts = rows.prefix(limit).map { .init(account: $0["email"]?.text ?? "", kind: $0["kind"]?.text) }
+            return result
+        }
         let columns = "m.account,m.id,m.date,m.subject,m.from_name,m.from_email,m.snippet,m.unread,m.starred,m.status"
         func message(_ r: SQLRow) -> AgentProtocol.Message {
             .init(account: r["account"]?.text ?? "", messageID: r["id"]?.text ?? "", date: r["date"]?.int ?? 0,
@@ -101,7 +123,7 @@ extension LocalEngine {
         }
         if request.method == "get" {
             guard let account = p?.account, !account.isEmpty, let id = p?.messageID, !id.isEmpty,
-                  p?.query == nil, p?.limit == nil, p?.offset == nil else { throw Failure.make("invalid_request") }
+                  p?.query == nil, p?.limit == nil, p?.offset == nil, p?.since == nil, p?.status == nil else { throw Failure.make("invalid_request") }
             guard let row = try db().query("SELECT \(columns) FROM messages m WHERE m.account=? AND m.id=? AND m.status!='deleted'",
                                           [.text(account), .text(id)]).first else { throw Failure.make("not_found") }
             // Plain text only: never render HTML, fetch remote resources, mark read or execute content.
@@ -127,6 +149,8 @@ extension LocalEngine {
             }
         } else if p?.query != nil { throw Failure.make("invalid_request") }
         if let account = p?.account { conditions.append("m.account=?"); values.append(.text(account)) }
+        if let since = p?.since { conditions.append("m.date>=?"); values.append(.int(since)) }
+        if let status = p?.status { conditions.append("m.status=?"); values.append(.text(status)) }
         sql += " WHERE " + conditions.joined(separator: " AND ") + " ORDER BY m.date DESC,m.account,m.id LIMIT ? OFFSET ?"
         let rows = try db().query(sql, values + [.int(limit + 1), .int(offset)])
         return .init(items: rows.prefix(limit).map(message), nextOffset: rows.count > limit ? offset + limit : nil,

@@ -18,5 +18,6 @@ let package = Package(
                 .linkedLibrary("z"),
             ]
         ),
+        .testTarget(name: "AgentServiceTests", dependencies: ["PigiCore"], path: "Tests/AgentServiceTests"),
     ]
 )

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import OSLog
 #if canImport(PigiCore)
 import PigiCore
 #endif
@@ -143,6 +144,22 @@ private struct WindowOpener: ViewModifier {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let agentService = AgentSocketServer(audit: { event in
+        Logger(subsystem: "one.yic.pigi", category: "agent").info("method=\(event.method, privacy: .public) outcome=\(event.outcome, privacy: .public) duration_ms=\(event.durationMilliseconds)")
+    })
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        do { try agentService.start() }
+        catch {
+            // Do not log error descriptions: filesystem errors can contain private paths.
+            Logger(subsystem: "one.yic.pigi", category: "agent").error("Local agent service could not start")
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        agentService.stop()
+    }
+
     /// A click on the Dock icon with every window closed brings the main window back.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { MainWindow.show() }

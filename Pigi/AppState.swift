@@ -503,6 +503,7 @@ final class AppState {
                 $0.body = (isHTML ? body.html : nil) ?? body.text
                 $0.bodyLoaded = true
                 $0.isHTML = isHTML
+                $0.signatureStatus = body.signatureStatus
             }
         } catch {
             syncError = "读取邮件失败:\(error.localizedDescription)"

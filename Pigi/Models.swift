@@ -48,6 +48,7 @@ struct Mail: Identifiable, Hashable, Codable {
     /// How the mail can be unsubscribed from: one_click, link or mailto; nil when it cannot.
     var unsubKind: String? = nil
     var labels: [String]? = nil
+    var signatureStatus: String? = nil
 }
 
 /// What the sidebar has selected: every mailbox merged, or a single one.

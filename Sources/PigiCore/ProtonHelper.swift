@@ -48,7 +48,8 @@ struct ProtonMessageMetadata: Decodable, Sendable {
 struct ProtonMessageBody: Decodable, Sendable {
     let body: String
     let mimeType: String
-    enum CodingKeys: String, CodingKey { case body; case mimeType = "mime_type" }
+    var signatureStatus: String? = nil
+    enum CodingKeys: String, CodingKey { case body; case mimeType = "mime_type"; case signatureStatus = "signature_status" }
 }
 
 public struct ProtonLoginChallenge: Decodable, Sendable {

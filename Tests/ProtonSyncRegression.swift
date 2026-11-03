@@ -50,10 +50,10 @@ actor FixtureProton: ProtonSyncRemote {
     }
     func failEvents(_ code: ProtonHelperError?) { eventError = code }
     func callCounts() -> (Int, Int) { (latestCalls, snapshotCalls) }
-    func put(_ id: String, unread: Bool = true, labels: [String] = ["0", "5", "custom"], text: String = "fixture plaintext", html: Bool = false) {
+    func put(_ id: String, unread: Bool = true, labels: [String] = ["0", "5", "custom"], text: String = "fixture plaintext", html: Bool = false, signature: String? = nil) {
         rows[id] = ProtonSyncMetadata(id: id, subject: "Fixture \(id)", time: Int(Date().timeIntervalSince1970), unread: unread,
                                      sender_name: "Fixture sender", sender_email: "sender@example.test", labels: labels, size: 42)
-        bodies[id] = ProtonMessageBody(body: text, mimeType: html ? "text/html" : "text/plain")
+        bodies[id] = ProtonMessageBody(body: text, mimeType: html ? "text/html" : "text/plain", signatureStatus: signature)
     }
     func mimeBody(_ id: String, body: String) { bodies[id] = ProtonMessageBody(body: body, mimeType: "multipart/mixed") }
     func failure(_ id: String?, code: ProtonHelperError = .key) { failing = id; failureCode = code }
@@ -100,13 +100,14 @@ extension LocalEngine {
         try await eventRecoveryCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
-        await remote.put("one")
-        await remote.put("two", text: "<p>HTML fixture</p>", html: true)
+        await remote.put("one", signature: "verified")
+        await remote.put("two", text: "<p>HTML fixture</p>", html: true, signature: "failed")
         try await engine.fixture(email, remote: remote)
         try await engine.pullProton(email, remote: remote)
         let initialCursor = try await engine.cursor(email), initialOffset = try await engine.offset(email)
         precondition(initialCursor == "c0" && initialOffset == "two")
         let plain = try await engine.body(account: email, id: "one"), html = try await engine.body(account: email, id: "two")
+        precondition(plain.signatureStatus == "verified" && html.signatureStatus == "failed")
         precondition(plain.text == "fixture plaintext" && html.html == "<p>HTML fixture</p>")
         let labels = try await engine.protonLabels(email)
         precondition(labels.first?.name == "Work" && labels.first?.parent == "parent" && labels.first?.type == 3)
@@ -358,7 +359,12 @@ extension LocalEngine {
         state.select(.account("fixture@example.test"))
         try capture(MailListView().environment(state), "proton-inbox.png", width: 480, height: 500)
         try capture(MailDetailContent(mail: fixtureMail()).environment(state), "proton-signature.png", width: 900, height: 500)
-        print("PASS: synthetic Proton login, inbox and unverified signature UI rendered")
+        for status in ["verified", "failed", "unverified"] {
+            var mail = fixtureMail()
+            mail.signatureStatus = status
+            try capture(MailDetailContent(mail: mail).environment(state), "proton-signature-\(status).png", width: 900, height: 500)
+        }
+        print("PASS: synthetic Proton login, inbox and all signature states UI rendered")
     }
 
     static func fixtureMail() -> Mail {

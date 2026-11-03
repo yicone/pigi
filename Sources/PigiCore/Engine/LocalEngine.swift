@@ -35,7 +35,7 @@ public actor LocalEngine {
           account TEXT NOT NULL, id TEXT NOT NULL, thread_id TEXT, date INTEGER, subject TEXT,
           from_name TEXT, from_email TEXT, to_addr TEXT, snippet TEXT, labels TEXT,
           unread INTEGER, starred INTEGER, status TEXT, has_att INTEGER, size INTEGER,
-          html BLOB, seq INTEGER, code TEXT, unsub_kind TEXT, unsub TEXT, PRIMARY KEY(account, id))
+          signature_status TEXT, html BLOB, seq INTEGER, code TEXT, unsub_kind TEXT, unsub TEXT, PRIMARY KEY(account, id))
         """,
         "CREATE INDEX IF NOT EXISTS msg_seq ON messages(seq)",
         "CREATE INDEX IF NOT EXISTS msg_date ON messages(account, date)",
@@ -59,6 +59,9 @@ public actor LocalEngine {
         let opened = try Store(path: dir.appendingPathComponent("mail.db").path)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dir.appendingPathComponent("mail.db").path)
         for statement in Self.schema { try opened.run(statement) }
+        if !((try opened.query("PRAGMA table_info(messages)")).contains { $0["name"]?.text == "signature_status" }) {
+            try opened.run("ALTER TABLE messages ADD COLUMN signature_status TEXT")
+        }
         store = opened
         return opened
     }
@@ -172,6 +175,7 @@ public actor LocalEngine {
         var html: String
         var text: String
         var headers: [String: String]
+        var signatureStatus: String? = nil
     }
 
     func save(_ d: Draft) throws {
@@ -187,7 +191,7 @@ public actor LocalEngine {
                 .text(d.snippet), .text(labelsJSON(d.labels)), .int(d.labels.contains("UNREAD") ? 1 : 0),
                 .int(d.labels.contains("STARRED") ? 1 : 0), .text(Self.statusOf(d.labels)),
                 .int(d.attachments.isEmpty ? 0 : 1), .int(d.size), compress(d.html), .int(seq),
-                .opt(code), .opt(unsub?.kind), .opt(unsubJSON),
+                .opt(code), .opt(unsub?.kind), .opt(unsubJSON), .opt(d.signatureStatus),
             ]
             if let existing {
                 try s.run("DELETE FROM fts WHERE rowid=?", [existing["rowid"] ?? .null])
@@ -195,12 +199,12 @@ public actor LocalEngine {
                           [existing["rowid"] ?? .null, .text(d.subject), .text("\(d.name) \(d.address)"), .text(d.text)])
                 try s.run("""
                     UPDATE messages SET thread_id=?,date=?,subject=?,from_name=?,from_email=?,to_addr=?,snippet=?,labels=?,
-                    unread=?,starred=?,status=?,has_att=?,size=?,html=?,seq=?,code=?,unsub_kind=?,unsub=? WHERE account=? AND id=?
+                    unread=?,starred=?,status=?,has_att=?,size=?,html=?,seq=?,code=?,unsub_kind=?,unsub=?,signature_status=? WHERE account=? AND id=?
                     """, values + [.text(d.account), .text(d.id)])
             } else {
                 let rowid = try s.run("""
                     INSERT INTO messages(thread_id,date,subject,from_name,from_email,to_addr,snippet,labels,unread,starred,
-                    status,has_att,size,html,seq,code,unsub_kind,unsub,account,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    status,has_att,size,html,seq,code,unsub_kind,unsub,signature_status,account,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, values + [.text(d.account), .text(d.id)])
                 try s.run("INSERT INTO fts(rowid,subject,sender,body) VALUES(?,?,?,?)",
                           [.int(Int(rowid)), .text(d.subject), .text("\(d.name) \(d.address)"), .text(d.text)])

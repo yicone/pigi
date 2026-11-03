@@ -78,7 +78,9 @@ public struct ArchiveClient {
     public struct Body {
         public let html: String?
         public let text: String
-        public init(html: String?, text: String) {
+        public let signatureStatus: String?
+        public init(html: String?, text: String, signatureStatus: String? = nil) {
+            self.signatureStatus = signatureStatus
             self.html = html
             self.text = text
         }

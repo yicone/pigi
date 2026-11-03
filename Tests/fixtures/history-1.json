@@ -1,0 +1,15 @@
+{
+  "history": [
+    {
+      "labelsRemoved": [
+        {
+          "message": {
+            "id": "one"
+          }
+        }
+      ]
+    }
+  ],
+  "nextPageToken": "page2",
+  "historyId": "11"
+}

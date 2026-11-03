@@ -22,7 +22,13 @@ actor GmailSession {
     private var expires = Date.distantPast
     private var nextSlot = Date.distantPast
 
-    init(email: String) { self.email = email }
+    // Internal seam for credential-free engine regression fixtures.
+    typealias Fixture = @Sendable (String, [(String, String)]) async throws -> Data
+    private let fixture: Fixture?
+    init(email: String, fixture: Fixture? = nil) {
+        self.email = email
+        self.fixture = fixture
+    }
 
     private func token(force: Bool = false) async throws -> String {
         if !force, let access, expires > Date() { return access }
@@ -46,6 +52,7 @@ actor GmailSession {
     }
 
     func call(_ path: String, query: [(String, String)] = [], body: [String: Any]? = nil) async throws -> Data {
+        if let fixture { return try await fixture(path, query) }
         var parts = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/" + path)!
         if !query.isEmpty { parts.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) } }
         var refreshed = false

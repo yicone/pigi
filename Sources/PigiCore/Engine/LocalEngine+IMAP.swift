@@ -68,7 +68,7 @@ extension LocalEngine {
                 }
             }
             var stored: [String: SQLRow] = [:]
-            for row in try s.query("SELECT id,unread,starred,status,date,labels FROM messages WHERE account=?", [.text(email)]) {
+            for row in try s.query("SELECT id,unread,starred,status,date,labels FROM messages WHERE account=? AND status!='deleted'", [.text(email)]) {
                 if let id = row["id"]?.text { stored[id] = row }
             }
             for (uid, f) in flags {

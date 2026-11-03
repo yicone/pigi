@@ -130,7 +130,7 @@ extension LocalEngine {
         for _ in 0..<5 {
             let page: ProtonEventPage
             do { page = try await remote.events(cursor: cursor!) }
-            catch let error as ProtonHelperError where error == .notFound || error == .cursorExpired {
+            catch let error as ProtonHelperError where error == .cursorExpired {
                 let latest = try await remote.latest()
                 try checkProton(email, remote)
                 try beginProtonSnapshot(email, cursor: latest)

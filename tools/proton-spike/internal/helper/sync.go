@@ -200,10 +200,9 @@ func (b *ProtonBackend) syncCall(ctx context.Context, method string, raw json.Ra
 		}
 		events, more, err := b.client.GetEvent(ctx, p.Cursor)
 		if err != nil {
-			var api *proton.APIError
-			if errors.As(err, &api) && (api.Status == 400 || api.Status == 422) {
-				return nil, fail("cursor_expired")
-			}
+			// HTTP 400/422 (including InvalidValue) does not identify an expired
+			// cursor. Preserve API/version/HV errors; only an explicit RefreshMail
+			// response below authorizes a reset with this pinned SDK contract.
 			return nil, classify(err, "upstream")
 		}
 		changes := []syncChange{}

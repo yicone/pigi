@@ -16,6 +16,11 @@ Proton helper 及其本地缓存路径，不代表 Proton 服务或整个操作�
   未实现 verified/invalid/unsigned 判定，不把解密成功或发件地址当成真实性证明。
 - 断网、超时、429、407、版本头拒绝、验证码要求各有固定错误码与提示。
   helper 关闭自动网络重试；同步失败后等 120 秒再试，游标不跨过失败消息。
+  events 与其他接口使用相同的具体错误分类，HTTP 400/422/404 本身不证明游标过期；
+  `InvalidValue`（2001）也是通用错误，不能单独触发重建。固定 SDK 没有专用游标失效错误码，
+  因而不把任何 HTTP 错误猜测为 `cursor_expired`；服务器明确返回 `RefreshMail` 时才经
+  `reset:true` 重建快照。相关依据为固定 SDK `event_types.go` 的 `RefreshMail` 位和
+  `event.go` 的事件响应结构；不依赖可变/本地化的 Error 文本。
   `Retry-After` 暂未透传；服务要求更长冷却时间时可能继续返回 429，不会忙循环。
 - 子进程环境为空，**不会导入 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 或凭据**。
   Go 默认 transport 不读取 macOS PAC/系统代理；当前 app 没有显式代理配置入口。

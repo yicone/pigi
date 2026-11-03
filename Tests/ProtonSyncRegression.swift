@@ -26,9 +26,12 @@ actor FixtureProton: ProtonSyncRemote {
     var failing: String?
     var failureCode: ProtonHelperError = .key
     var latestID = "c0"
-    func latest() async throws -> String { latestID }
+    var eventError: ProtonHelperError?
+    var latestCalls = 0
+    var snapshotCalls = 0
+    func latest() async throws -> String { latestCalls += 1; return latestID }
     func labels() async throws -> [ProtonLabel] { [ProtonLabel(id: "custom", name: "Work", parent: "parent", type: 3)] }
-    func snapshot(after: String) async throws -> [String] { snapshotPages[after] ?? [] }
+    func snapshot(after: String) async throws -> [String] { snapshotCalls += 1; return snapshotPages[after] ?? [] }
     func metadata(id: String) async throws -> ProtonSyncMetadata {
         guard let row = rows[id] else { throw ProtonHelperError.notFound }
         return row
@@ -39,8 +42,11 @@ actor FixtureProton: ProtonSyncRemote {
         return body
     }
     func events(cursor: String) async throws -> ProtonEventPage {
-        pages[cursor] ?? ProtonEventPage(cursor: cursor, more: false, reset: false, changes: [])
+        if let eventError { throw eventError }
+        return pages[cursor] ?? ProtonEventPage(cursor: cursor, more: false, reset: false, changes: [])
     }
+    func failEvents(_ code: ProtonHelperError?) { eventError = code }
+    func callCounts() -> (Int, Int) { (latestCalls, snapshotCalls) }
     func put(_ id: String, unread: Bool = true, labels: [String] = ["0", "5", "custom"], text: String = "fixture plaintext", html: Bool = false) {
         rows[id] = ProtonSyncMetadata(id: id, subject: "Fixture \(id)", time: Int(Date().timeIntervalSince1970), unread: unread,
                                      sender_name: "Fixture sender", sender_email: "sender@example.test", labels: labels, size: 42)
@@ -85,6 +91,7 @@ extension LocalEngine {
         app.run()
     }
     static func run() async throws {
+        try await eventRecoveryCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
         await remote.put("one")
@@ -280,6 +287,46 @@ extension LocalEngine {
         catch ProtonHelperError.credentials {}
         try await client.logout()
         print("PASS: pipe session export persists only to the fixture Keychain; deactivated sessions cannot overwrite or resurrect secrets")
+    }
+
+    // Go's loopback tests establish HTTP -> wire classification; here exercise
+    // the real sync catch/state/presentation path rather than failing a body fetch.
+    static func eventRecoveryCases() async throws {
+        let engine = LocalEngine(), remote = FixtureProton(), email = "events@example.test"
+        await remote.rescan([], latest: "c0")
+        try await engine.fixture(email, remote: remote)
+        try await engine.pullProton(email, remote: remote)
+        let baseline = await remote.callCounts()
+        let sequence = try await engine.sequence()
+        for code: ProtonHelperError in [.apiVersion, .humanVerificationRequired, .upstream, .notFound] {
+            await remote.failEvents(code)
+            let delay = await engine.syncProton(email)
+            let cursor = try await engine.cursor(email)
+            let counts = await remote.callCounts()
+            let account = try await engine.inspect("SELECT backfill_done,page_token,last_error FROM accounts WHERE email='events@example.test'").first!
+            let afterSequence = try await engine.sequence()
+            precondition(delay == 120 && cursor == "c0" && account["backfill_done"]?.int == 1)
+            precondition(account["page_token"]?.text == nil && afterSequence == sequence)
+            precondition(counts == baseline, "event failure incorrectly sampled latest or started a snapshot")
+            precondition(account["last_error"]?.text == code.localizedDescription)
+        }
+        precondition(ProtonHelperError.apiVersion.localizedDescription != ProtonHelperError.humanVerificationRequired.localizedDescription)
+        print("PASS: events version/HV/upstream/404 failures retain cursor and distinct safe hints without snapshot/latest calls")
+
+        await remote.failEvents(nil)
+        await remote.event("c0", next: "fresh", changes: [], reset: true)
+        await remote.rescan([], latest: "fresh")
+        try await engine.pullProton(email, remote: remote)
+        let resetCursor = try await engine.cursor(email)
+        let resetAccount = try await engine.inspect("SELECT backfill_done FROM accounts WHERE email='events@example.test'").first!
+        let resetCounts = await remote.callCounts()
+        precondition(resetCursor == "fresh" && resetAccount["backfill_done"]?.int == 0)
+        precondition(resetCounts.0 == baseline.0 + 1 && resetCounts.1 == baseline.1)
+        try await engine.pullProton(email, remote: remote)
+        let complete = try await engine.inspect("SELECT backfill_done FROM accounts WHERE email='events@example.test'").first!
+        let completeCounts = await remote.callCounts()
+        precondition(complete["backfill_done"]?.int == 1 && completeCounts.1 == baseline.1 + 1)
+        print("PASS: explicit invalidated-state reset alone rebases cursor and rebuilds snapshot")
     }
 
     static func renderEvidence(_ state: AppState, to directory: URL) throws {

@@ -3,6 +3,7 @@ package helper
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -207,6 +208,72 @@ func TestKeySchemaFailures(t *testing.T) {
 			fault := classify(b.reloadKeys(context.Background()), "key")
 			if fault == nil || fault.Code != tc.want || b.rings != nil {
 				t.Fatal("key schema failed open or wrong error")
+			}
+		})
+	}
+}
+
+// Generic HTTP/InvalidValue errors are deliberately NOT cursor-expiry evidence.
+// Use the actual events endpoint so endpoint-specific handling cannot bypass classify.
+func TestEventFailuresPreserveSpecificCodes(t *testing.T) {
+	for _, status := range []int{400, 422} {
+		for _, tc := range []struct {
+			code int
+			want string
+		}{
+			{5001, "api_version"}, {5003, "api_version"}, {9001, "human_verification_required"},
+			{12087, "human_verification_required"}, {2001, "upstream"}, {2999, "upstream"},
+		} {
+			t.Run(fmt.Sprintf("http-%d-code-%d", status, tc.code), func(t *testing.T) {
+				calls := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					if r.Method != "GET" || r.URL.Path != "/core/v4/events/old" {
+						t.Error("wrong event endpoint")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					json.NewEncoder(w).Encode(map[string]any{"Code": tc.code, "Error": "PRIVATE_DIAGNOSTIC", "Details": map[string]any{"EventID": "PRIVATE_CURSOR"}})
+				}))
+				defer server.Close()
+				manager := proton.New(proton.WithHostURL(server.URL), proton.WithRetryCount(0), proton.WithLogger(quietLogger{}))
+				b := &ProtonBackend{manager: manager, client: manager.NewClient("f", "f", "f"), rings: map[string]*crypto.KeyRing{}, persistent: true}
+				defer b.Close()
+				result, fault := b.Call(context.Background(), "events", json.RawMessage(`{"cursor":"old"}`))
+				data, _ := json.Marshal(fault)
+				if result != nil || fault == nil || fault.Code != tc.want || strings.Contains(string(data), "PRIVATE") || calls != 1 {
+					t.Fatalf("incorrect events response: %s, calls=%d", data, calls)
+				}
+			})
+		}
+	}
+}
+
+func TestEventExplicitRefreshRequiresSnapshot(t *testing.T) {
+	for _, refresh := range []int{0, 1, 2, 255} {
+		t.Run(fmt.Sprintf("refresh-%d", refresh), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/core/v4/events/old" {
+					t.Error("wrong event endpoint")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{"Code": 1000, "EventID": "new", "Refresh": refresh})
+			}))
+			defer server.Close()
+			manager := proton.New(proton.WithHostURL(server.URL), proton.WithRetryCount(0), proton.WithLogger(quietLogger{}))
+			b := &ProtonBackend{manager: manager, client: manager.NewClient("f", "f", "f"), rings: map[string]*crypto.KeyRing{}, persistent: true}
+			defer b.Close()
+			result, fault := b.Call(context.Background(), "events", json.RawMessage(`{"cursor":"old"}`))
+			if fault != nil {
+				t.Fatal(fault)
+			}
+			data, _ := json.Marshal(result)
+			var page struct {
+				Cursor string
+				Reset  bool
+			}
+			if json.Unmarshal(data, &page) != nil || page.Cursor != "new" || page.Reset != (refresh&1 != 0) {
+				t.Fatalf("incorrect explicit refresh: %s", data)
 			}
 		})
 	}

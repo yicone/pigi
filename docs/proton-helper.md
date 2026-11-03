@@ -73,8 +73,8 @@ leave Go only through the private `session` response for Keychain storage. Plain
 | `rate_limited` | Upstream 429; caller must back off |
 | `not_authenticated`, `already_authenticated` | Invalid account-session state |
 | `cleanup_failed` | Remote revocation unconfirmed; retry logout before abandoning child |
-| `cursor_expired` | Invalid/expired event cursor (HTTP 400/422); resnapshot |
-| `not_found` | Message disappeared (record deletion) or event cursor unavailable (resnapshot) |
+| `cursor_expired` | Reserved for a confirmed invalid cursor; never inferred from generic HTTP 400/422. Current SDK signals invalid incremental state with `RefreshMail` → `reset:true` |
+| `not_found` | Message disappeared (record deletion); an events 404 alone does not authorize resnapshot |
 | `upstream` | Other service error, without raw details |
 | `invalid_request`, `invalid_params`, `unknown_method` | Caller/protocol error |
 | `unsupported_version`, `handshake_required`, `frame_too_large` | Negotiation/framing failure |

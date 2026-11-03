@@ -1,6 +1,6 @@
 # Local agent service (protocol v1)
 
-ACM-749 provides the App-owned read endpoint used by the future ACM-750 stdio MCP
+ACM-749 provides the App-owned read endpoint used by the ACM-750 stdio MCP
 adapter and ACM-752 verification-code tool. No sending, drafting, account management,
 remote sync trigger, attachment download, or mutation is exposed by this protocol.
 
@@ -94,8 +94,9 @@ Malformed requests can have no response `id`; never use IDs as authentication.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `list` | optional `account`, `limit` (default 50, 1–100), `offset` (default 0, 0–1,000,000) | `items`, optional `nextOffset`, `contentTrust` |
-| `search` | required nonblank `query` (up to 4096 UTF-8 bytes), optional `account`, `limit`, `offset` | same as list |
+| `accounts` | optional `limit`, `offset` | `accounts` (account identifier and provider `kind` only), optional `nextOffset`, `contentTrust` |
+| `list` | optional `account`, `since`, `status`, `limit` (default 50, 1–100), `offset` (default 0, 0–1,000,000) | `items`, optional `nextOffset`, `contentTrust` |
+| `search` | required nonblank `query` (up to 4096 UTF-8 bytes), optional `account`, `since`, `status`, `limit`, `offset` | same as list |
 | `get` | required nonempty `account` and `messageID`; no query/limit/offset | `message`, `text`, `contentTrust` |
 
 Account strings are exact matches, up to 1024 UTF-8 bytes. Message IDs are up to
@@ -152,3 +153,56 @@ a diagnostic hook, not a durable or tamper-proof access ledger.
 4. Run `swift test`, relevant existing regression scripts and `tools/build-debug.sh`.
    Do not launch/restart the user's App or use real accounts. Deliver on a fork branch
    and PR; merging/deployment remains separately authorized.
+
+## ACM-750 stdio MCP adapter
+
+Run `python3 -B /absolute/path/to/pigi/tools/pigi-mcp/pigi_mcp.py` from an MCP host
+with Python 3.10 or later. No packages or network service are needed. The App must
+be running with this revision's socket service; this change does not start it.
+MCP stdio follows the [2025-11-25 transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+Example host configuration (replace the script path):
+
+```json
+{"mcpServers":{"pigi":{"command":"python3","args":["-B","/absolute/path/to/pigi/tools/pigi-mcp/pigi_mcp.py"]}}}
+```
+
+The four tools are `list_accounts`, `search`, `list_messages`, and `get_message`.
+`get_message` requires `account` and `messageID`; `search` requires `query`.
+List and search accept `account`, `since` (inclusive Unix milliseconds), `status`
+(`inbox`, `archived`, `spam`, `trash`), `limit` and `offset`. Accounts also paginate
+and include configured accounts with no cached messages. Responses expose only
+account identifier and provider kind, never account errors or credentials.
+
+The v1 socket now additionally supports `accounts` and `since`/`status` on
+list/search. All successful results advertise `capabilities: ["accounts", "filters"]`.
+The adapter rejects filtered results from an older App without `filters`, rather
+than silently ignoring these filters. Update/build the App separately with user
+approval. Existing list/search/get callers remain compatible. Accounts rejects
+mail filters; get rejects since/status. Bounds and literal-search rules above apply.
+
+`--socket` overrides the default socket for isolated fixtures. The adapter checks
+socket/parent ownership and 0600/0700 permissions and peer UID, uses a seven-second
+total socket deadline, validates response version/ID/trust, and enforces the same
+frame limits as the App. It never opens mail.db or the Keychain and has no TCP,
+send, mutation, attachment, HTML rendering or remote fetch path. Stdout contains
+only JSON-RPC; failures never echo mail or request values. Every successful tool
+result includes `contentTrust: "untrusted"` and an explicit Chinese/English trust
+notice. This is data labeling, not a guarantee against downstream prompt injection.
+
+Every initialized `tools/call` invocation (including invalid arguments, unknown
+tools and socket failures) writes a row to `tool_calls` in
+`~/Library/Application Support/pigi-mcp/audit.sqlite3`. `--audit-db` selects an
+isolated audit path whose parent must be private (0700). The file is 0600;
+symlinks/hard links and unsafe ownership or modes are rejected. The table contains
+only id, started_ms, allowlisted tool name (or `invalid`), outcome and duration_ms.
+No account, query, request ID or mail content is logged. Intent is committed before
+socket access, completion before returning data; audit failure fails closed.
+A crash can leave a `started` row, which means outcome unknown. This is a local,
+same-user mutable ledger, not a tamper-proof log. Retention is manual; no automatic
+pruning or mail-database migration occurs. Handshake/discovery/ping and malformed
+JSON-RPC envelopes are not tool invocations and do not create audit rows.
+
+Validation: `python3 -B -m unittest discover -s tools/pigi-mcp -v`, `swift test`
+(including a real Swift socket -> Python MCP subprocess integration with synthetic
+accounts/messages), and the existing readonly prototype regression suite.
+The old `tools/readonly_mail` direct-database prototype is not used by this adapter.

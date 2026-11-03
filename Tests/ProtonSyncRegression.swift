@@ -1,11 +1,14 @@
 import AppKit
 import SwiftUI
 
+#if !CACHE_DISK_REGRESSION
 enum MailCache {
     static func load() -> [Mail] { [] }
     static func save(_ mails: [Mail]) {}
+    static func saveChecked(_ mails: [Mail]) throws {}
     static func clear() {}
 }
+#endif
 enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
@@ -91,6 +94,9 @@ extension LocalEngine {
         app.run()
     }
     static func run() async throws {
+        #if CACHE_DISK_REGRESSION
+        try await diskPrivacyCases()
+        #else
         try await eventRecoveryCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
@@ -249,7 +255,9 @@ extension LocalEngine {
         print("PASS: decrypted PGP/MIME maps decoded plaintext and HTML through the existing MIME parser")
         try await sessionPersistence()
         if CommandLine.arguments.count > 1 { try renderEvidence(state, to: URL(fileURLWithPath: CommandLine.arguments[1])) }
+        #endif
     }
+
     static func sessionPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

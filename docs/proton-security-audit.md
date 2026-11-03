@@ -131,3 +131,53 @@ Go 用例覆盖：新密钥替换旧密钥、轮换失败禁止旧密钥使用�
 验证码错误与挑战绑定。合成服务断言固定客户端头、不自动重试、错误不含原始诊断。
 Swift 覆盖不同错误提示、失败游标重放、账号隔离、删除/搜索清理、只读操作和签名提示渲染。
 这些用例不替代真实账号、真实私钥轮换、实际限流或系统代理验收。
+
+## 2026-11-03 后续返工：隔离磁盘验证与剩余门禁
+
+来源：ACM-797 评论 `01a19fe8-e957-748f-8d64-83329a08c741`、ACM-798 评论
+`01a1a006-3129-7164-a2d9-2f73c079cade`。events 的独立通过不代表整单通过。
+
+新增 `bash Tests/cache-disk-regression.sh` 使用临时 `CFFIXED_USER_HOME`，启动后断言
+Application Support 位于隔离目录，再执行真实 `AppState.removeAccount → ArchiveClient →
+LocalEngine.shared → Store/MailCache`。钥匙串和 MainWindow 被替代，真实产品磁盘路径代码
+未替代；不使用用户数据库、账号、安装版或进程。覆盖：
+
+- 现存 0755 目录及 0666 的 DB/WAL/SHM 收紧为 0700/0600；通过第二个打开的 SQLite
+  连接保留现存 WAL/SHM，验证实际权限迁移。Store 在打开 SQLite 前后处理侧文件，权限
+  迁移失败直接抛错，初始化失败会关闭 SQLite 句柄。
+- SQLite `max_page_count` 导致真实 SQLITE_FULL 写入失败并回滚；`query_only=ON`
+  导致实际 App 删除路径写失败，错误向上传播，数据库事务未部分删除。
+- 删除账号后实时核对磁盘数据库、FTS 和真实邮件头 JSON，另一个账号保持可读；JSON
+  不含 body。邮件头目标替换为目录时触发真实文件写入错误：删除操作显式报错，清除失败
+  写入的旧目标，并可恢复写入空缓存。不是把模拟 save 函数返回失败当成磁盘验证。
+
+上述是源代码集成路径测试，不是鼠标点击安装版的 UI 自动化，也不覆盖真实钥匙串/远端
+撤销、磁盘掉电、文件系统损坏、ACL/所有者错误、磁盘硬件故障或所有 I/O 组合。
+普通延迟保存仍为尽力执行；账号移除使用 throwing `saveChecked`，写入失败不再静默成功。
+如果目录访问/权限预检或旧文件删除本身失败，仍须人工处理，不能承诺数据已经清除。
+缓存继续为明文；历史 WAL/FTS、SSD、快照及备份的物理抹除边界不变。
+
+Swift：布局尺寸常量明确 nonisolated；IMAP 回调使用 `Mutex` 保护一次性 completion，
+在锁外恢复 continuation。已知未使用返回值改为明确丢弃，不改变既有尽力执行语义。
+IMAP 文件及实际 SidebarMetrics 源码片段结合 LayoutState 的 Swift 6 / warnings-as-errors
+定向 typecheck 通过。完整 `swift build -Xswiftc -swift-version -Xswiftc 6` 仍失败：
+ProtonHelper 泛型 Sendable、Store/IMAP 调用的隔离传递、Gmail JSON `[String: Any]`
+及 ArchiveModels 返回值跨 actor 等仍需进一步迁移。因此**整项目 Swift 6 尚未就绪**，
+不通过 unchecked 声明、关闭检查或改写旧验收掩盖该阻断。
+
+远程内容静态复核：`MailHTMLView` 禁止 JavaScript，但远程内容开启时允许 HTTP/HTTPS
+图片及 HTTPS 样式、字体；`MailDetailView` 与设置页的 `loadRemoteImages` 默认值为 true。
+所以有远程跟踪请求风险，静态“helper 无遥测”不能覆盖这部分。验证码使用 nonPersistent
+WebKit 存储，主框架限制官方 HTTPS 来源及挑战绑定，但子资源网络未逐包验证。
+本轮不修改这些产品行为；需用户决定远程内容策略并授权隔离网络/隐私验收。
+
+以下仍未修/未验，维持阻断，不能视为用户接受：
+
+- 真实认证代理、CONNECT 407、PAC/系统代理/VPN、真实账号/密钥轮换/服务限流：本轮没有
+  获批环境，不操作真实环境。需提供隔离测试环境、合成或专用测试账号及允许的网络范围。
+- 远程邮件/官方验证页流量、系统抓包和 helper 运行时全流量审计：未授权抓取用户机器
+  流量，保留后续门禁。应限定专用进程/网络命名空间、合成内容和保留/清除策略。
+- Developer ID、公证及 spctl：本机 `security find-identity -v -p codesigning` 显示
+  0 个有效身份，无可用 Developer ID/公证配置；不申请、安装身份或上传公证。
+  需提供签名环境并授权 Apple 上传；本地 ad-hoc 构建不能证明外部分发资格。
+- 全项目 Swift 6 迁移及上列未覆盖磁盘/网络场景。签名仍始终未验证。

@@ -126,7 +126,7 @@ public actor LocalEngine {
     }
 
     func setError(_ email: String, _ text: String?) {
-        try? db().run("UPDATE accounts SET last_error=? WHERE email=?", [.opt(text), .text(email)])
+        _ = try? db().run("UPDATE accounts SET last_error=? WHERE email=?", [.opt(text), .text(email)])
     }
 
     func announce() {
@@ -215,14 +215,14 @@ public actor LocalEngine {
 
     func updateLabels(_ account: String, _ id: String, _ labels: [String]) {
         guard let seq = try? nextSeq() else { return }
-        try? db().run("UPDATE messages SET labels=?,unread=?,starred=?,status=?,seq=? WHERE account=? AND id=?",
+        _ = try? db().run("UPDATE messages SET labels=?,unread=?,starred=?,status=?,seq=? WHERE account=? AND id=?",
                       [.text(labelsJSON(labels)), .int(labels.contains("UNREAD") ? 1 : 0), .int(labels.contains("STARRED") ? 1 : 0),
                        .text(Self.statusOf(labels)), .int(seq), .text(account), .text(id)])
     }
 
     func markDeleted(_ account: String, _ id: String) {
         guard let seq = try? nextSeq() else { return }
-        try? db().run("UPDATE messages SET status='deleted',seq=? WHERE account=? AND id=?", [.int(seq), .text(account), .text(id)])
+        _ = try? db().run("UPDATE messages SET status='deleted',seq=? WHERE account=? AND id=?", [.int(seq), .text(account), .text(id)])
     }
 
     func has(_ account: String, _ id: String) -> Bool {
@@ -263,9 +263,9 @@ public actor LocalEngine {
                           [.opt(profile["historyId"] as? String), .text(email)])
             }
             if acct["history_id"]?.text == nil {
-                try restart()
+                _ = try restart()
             } else if try await !incremental(gm, email, startHistory: acct["history_id"]?.text ?? "") {
-                try restart()
+                _ = try restart()
             }
             acct = try account(email) ?? acct
             if (acct["backfill_done"]?.int ?? 0) == 0 {

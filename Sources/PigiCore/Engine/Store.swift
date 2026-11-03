@@ -26,7 +26,34 @@ final class Store {
     private var handle: OpaquePointer?
 
     init(path: String) throws {
-        guard sqlite3_open(path, &handle) == SQLITE_OK else { throw SQLError(message: "无法打开数据库") }
+        if path != ":memory:" {
+            // Tighten existing databases/side files before SQLite can read or
+            // checkpoint them. Migration failures must not silently continue.
+            for candidate in [path, path + "-wal", path + "-shm"] where FileManager.default.fileExists(atPath: candidate) {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: candidate)
+            }
+        }
+        guard sqlite3_open(path, &handle) == SQLITE_OK else {
+            sqlite3_close(handle); handle = nil
+            throw SQLError(message: "无法打开数据库")
+        }
+        do {
+            if path != ":memory:" {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            }
+            try configure()
+            if path != ":memory:" {
+                for candidate in [path + "-wal", path + "-shm"] where FileManager.default.fileExists(atPath: candidate) {
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: candidate)
+                }
+            }
+        } catch {
+            sqlite3_close(handle); handle = nil
+            throw error
+        }
+    }
+
+    private func configure() throws {
         sqlite3_busy_timeout(handle, 30_000)
         try run("PRAGMA journal_mode=WAL")
         try run("PRAGMA synchronous=NORMAL")
@@ -77,7 +104,7 @@ final class Store {
             try body()
             try run("COMMIT")
         } catch {
-            try? run("ROLLBACK")
+            _ = try? run("ROLLBACK")
             throw error
         }
     }

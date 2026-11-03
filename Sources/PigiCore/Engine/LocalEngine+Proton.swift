@@ -20,7 +20,7 @@ extension LocalEngine {
                     try remote.persistInitial()
                 }
             } catch {
-                Keychain.set(ProtonSession.key(email), previousSecret ?? "")
+                _ = Keychain.set(ProtonSession.key(email), previousSecret ?? "")
                 previous?.reactivate()
                 throw error
             }

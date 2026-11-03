@@ -342,7 +342,7 @@ final class AppState {
         }
         hiddenAccounts.remove(id)
         // Flush the second cache now instead of waiting for a debounced save.
-        MailCache.save(mails)
+        try MailCache.saveChecked(mails)
     }
 
     // MARK: - Gmail accounts

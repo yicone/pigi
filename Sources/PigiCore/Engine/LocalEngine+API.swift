@@ -112,7 +112,7 @@ extension LocalEngine {
         try await probe.open()
         do { try await probe.login(user: address, password: password) } catch { probe.close(); throw error }
         await probe.logout()
-        Keychain.set("imap-\(address)", password)
+        _ = Keychain.set("imap-\(address)", password)
         try db().run("INSERT INTO accounts(email, added_at, kind, imap_host, imap_port) VALUES(?,?,'imap',?,?)",
                      [.text(address), .int(now()), .text(host), .int(port)])
         trigger(address)
@@ -121,7 +121,7 @@ extension LocalEngine {
     func deleteAccount(_ email: String) async throws {
         let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
         proton?.deactivate()
-        Keychain.set(ProtonSession.key(email), "")
+        _ = Keychain.set(ProtonSession.key(email), "")
         let s = try db()
         try s.transaction {
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
@@ -132,7 +132,7 @@ extension LocalEngine {
             try s.run("DELETE FROM proton_snapshot WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
-        Keychain.set("imap-\(email)", "")
+        _ = Keychain.set("imap-\(email)", "")
         sessions[email] = nil
         due[email] = nil
         announce()

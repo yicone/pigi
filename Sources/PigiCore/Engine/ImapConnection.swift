@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Synchronization
 
 public struct ImapError: LocalizedError {
     public let message: String
@@ -38,16 +39,24 @@ final class ImapConnection {
     func open() async throws {
         try await withTimeout(25, onTimeout: { [connection] in connection.cancel() }) { [connection] in
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                var resumed = false
+                let resumed = Mutex(false)
                 connection.stateUpdateHandler = { state in
-                    guard !resumed else { return }
+                    let result: Result<Void, Error>
                     switch state {
-                    case .ready: resumed = true; cont.resume()
-                    case .failed(let e): resumed = true; cont.resume(throwing: ImapError(message: "连接失败:\(e.localizedDescription)"))
-                    case .waiting(let e): resumed = true; connection.cancel(); cont.resume(throwing: ImapError(message: "无法连接服务器:\(e.localizedDescription)"))
-                    case .cancelled: resumed = true; cont.resume(throwing: ImapError(message: "连接已取消"))
-                    default: break
+                    case .ready: result = .success(())
+                    case .failed(let e): result = .failure(ImapError(message: "连接失败:\(e.localizedDescription)"))
+                    case .waiting(let e): result = .failure(ImapError(message: "无法连接服务器:\(e.localizedDescription)"))
+                    case .cancelled: result = .failure(ImapError(message: "连接已取消"))
+                    default: return
                     }
+                    let first = resumed.withLock { value in
+                        if value { return false }
+                        value = true
+                        return true
+                    }
+                    guard first else { return }
+                    if case .waiting = state { connection.cancel() }
+                    cont.resume(with: result)
                 }
                 connection.start(queue: .global())
             }

@@ -1,0 +1,50 @@
+{
+  "id": "two",
+  "threadId": "thread",
+  "internalDate": "1700000000000",
+  "labelIds": [
+    "INBOX",
+    "UNREAD"
+  ],
+  "payload": {
+    "mimeType": "multipart/mixed",
+    "headers": [
+      {
+        "name": "Subject",
+        "value": "New mail"
+      },
+      {
+        "name": "From",
+        "value": "Sender <sender@example.test>"
+      }
+    ],
+    "parts": [
+      {
+        "mimeType": "multipart/alternative",
+        "parts": [
+          {
+            "mimeType": "text/plain",
+            "body": {
+              "data": "cGxhaW4gYm9keQ"
+            }
+          },
+          {
+            "mimeType": "text/html",
+            "body": {
+              "data": "PHA-SFRNTCBib2R5PC9wPg"
+            }
+          }
+        ]
+      },
+      {
+        "partId": "2",
+        "mimeType": "text/plain",
+        "filename": "note.txt",
+        "body": {
+          "attachmentId": "attachment",
+          "size": 4
+        }
+      }
+    ]
+  }
+}

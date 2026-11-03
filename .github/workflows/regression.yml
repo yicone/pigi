@@ -1,0 +1,33 @@
+name: macOS regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/proton-spike/go.mod
+          cache-dependency-path: tools/proton-spike/go.sum
+      - name: Prepare pinned Proton API dependency
+        run: bash tools/proton-spike/prepare.sh
+      - name: Go helper tests
+        working-directory: tools/proton-spike
+        run: go test ./...
+      - name: Swift package build
+        run: swift build
+      - name: Swift regressions (synthetic fixtures only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in Tests/*-regression.sh; do
+            echo "Running $test"
+            bash "$test"
+          done
+      - name: Read-only client tests
+        run: python3 -m unittest discover -s tools/readonly_mail -p 'test_*.py'

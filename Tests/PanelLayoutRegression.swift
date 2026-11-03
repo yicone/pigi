@@ -15,6 +15,7 @@ enum MailCache {
     }
 
     static func save(_ mails: [Mail]) {}
+    static func saveChecked(_ mails: [Mail]) throws {}
     static func clear() {}
 }
 

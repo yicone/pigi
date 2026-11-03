@@ -12,14 +12,14 @@ public enum GmailStore {
     }
 
     public static func add(_ email: String, refreshToken: String) {
-        Keychain.set(keychainKey(email), refreshToken)
+        _ = Keychain.set(keychainKey(email), refreshToken)
         var list = emails
         if !list.contains(email) { list.append(email) }
         UserDefaults.standard.set(list, forKey: defaultsKey)
     }
 
     public static func remove(_ email: String) {
-        Keychain.set(keychainKey(email), "")
+        _ = Keychain.set(keychainKey(email), "")
         UserDefaults.standard.set(emails.filter { $0 != email }, forKey: defaultsKey)
     }
 }

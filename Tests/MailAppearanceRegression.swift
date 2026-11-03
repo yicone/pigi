@@ -5,6 +5,7 @@ import WebKit
 enum MailCache {
     static func load() -> [Mail] { [] }
     static func save(_ mails: [Mail]) {}
+    static func saveChecked(_ mails: [Mail]) throws {}
     static func clear() {}
 }
 

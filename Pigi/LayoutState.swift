@@ -14,8 +14,8 @@ final class LayoutState {
     static let shortNamesBelow: CGFloat = 240
     static let listRange: ClosedRange<CGFloat> = 280...560
     /// Width of the folded sidebar: the narrowest dragged sidebar (80) plus the handle, so letting go there doesn't move anything.
-    static let handleWidth: CGFloat = 22
-    static let railWidth: CGFloat = 80 + handleWidth
+    nonisolated static let handleWidth: CGFloat = 22
+    nonisolated static let railWidth: CGFloat = 80 + handleWidth
 
     var sidebarWidth: CGFloat = LayoutState.stored("sidebarWidthV4", LayoutState.defaultWidth) { didSet { UserDefaults.standard.set(sidebarWidth, forKey: "sidebarWidthV4") } }
     var listWidth: CGFloat = LayoutState.stored("listWidth", 360) { didSet { UserDefaults.standard.set(listWidth, forKey: "listWidth") } }

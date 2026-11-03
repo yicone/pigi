@@ -29,16 +29,24 @@ func (b *ProtonBackend) trackAuth() {
 }
 
 func (b *ProtonBackend) reloadKeys(ctx context.Context) error {
+	// A failed rotation must not leave stale keys usable by a later request.
+	for _, ring := range b.rings {
+		ring.ClearPrivateParams()
+	}
+	b.rings = nil
 	user, err := b.client.GetUser(ctx)
 	if err != nil {
-		return err
+		return classify(err, "key_format")
 	}
 	if !strings.EqualFold(user.Email, b.session.Email) {
 		return errors.New("account_mismatch")
 	}
 	addresses, err := b.client.GetAddresses(ctx)
 	if err != nil {
-		return err
+		return classify(err, "key_format")
+	}
+	if len(user.Keys) == 0 || len(addresses) == 0 {
+		return fail("key_missing")
 	}
 	userKR, rings, err := proton.Unlock(user, addresses, b.session.Salted, async.NoopPanicHandler{})
 	if userKR != nil {
@@ -49,9 +57,6 @@ func (b *ProtonBackend) reloadKeys(ctx context.Context) error {
 			ring.ClearPrivateParams()
 		}
 		return err
-	}
-	for _, ring := range b.rings {
-		ring.ClearPrivateParams()
 	}
 	b.rings = rings
 	return nil
@@ -195,10 +200,9 @@ func (b *ProtonBackend) syncCall(ctx context.Context, method string, raw json.Ra
 		}
 		events, more, err := b.client.GetEvent(ctx, p.Cursor)
 		if err != nil {
-			var api *proton.APIError
-			if errors.As(err, &api) && (api.Status == 400 || api.Status == 422) {
-				return nil, fail("cursor_expired")
-			}
+			// HTTP 400/422 (including InvalidValue) does not identify an expired
+			// cursor. Preserve API/version/HV errors; only an explicit RefreshMail
+			// response below authorizes a reset with this pinned SDK contract.
 			return nil, classify(err, "upstream")
 		}
 		changes := []syncChange{}

@@ -54,12 +54,20 @@ func classify(err error, fallback string) *Fault {
 	if err == nil {
 		return nil
 	}
+	var fault *Fault
+	if errors.As(err, &fault) {
+		return fault
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fail("timeout")
 	}
 	var api *proton.APIError
 	if errors.As(err, &api) {
 		switch {
+		case api.Code == proton.AppVersionMissingCode, api.Code == proton.AppVersionBadCode:
+			return fail("api_version")
+		case api.Status == http.StatusProxyAuthRequired:
+			return fail("proxy")
 		case api.IsHVError(), api.Code == proton.HumanValidationInvalidToken:
 			return fail("human_verification_required")
 		case api.Code == proton.PasswordWrong, api.Code == proton.UsernameInvalid, api.Status == 401:
@@ -71,6 +79,10 @@ func classify(err error, fallback string) *Fault {
 		case api.Status >= 500:
 			return fail("network")
 		default:
+			// A service error is not evidence of an unrecognized private-key schema.
+			if fallback == "key_format" {
+				return fail("upstream")
+			}
 			return fail(fallback)
 		}
 	}
@@ -184,18 +196,27 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 			return nil, classify(err, "upstream")
 		}
 		if !strings.HasPrefix(msg.Body, "-----BEGIN PGP MESSAGE-----") {
-			return nil, fail("key")
+			return nil, fail("key_format")
 		}
 		ring := b.rings[msg.AddressID]
 		if ring == nil {
-			return nil, fail("key")
+			return nil, fail("key_missing")
 		}
-		plain, err := msg.Decrypt(ring)
+		encrypted, err := crypto.NewPGPMessageFromArmored(msg.Body)
+		if err != nil {
+			return nil, fail("key_format")
+		}
+		// No sender key / trust chain is available. Never claim authenticity.
+		decrypted, err := ring.Decrypt(encrypted, nil, crypto.GetUnixTime())
+		if err != nil {
+			return nil, fail("key_decryption")
+		}
+		plain := decrypted.GetBinary()
 		defer clear(plain)
-		if err != nil || !utf8.Valid(plain) {
+		if !utf8.Valid(plain) {
 			return nil, fail("key")
 		}
-		return map[string]string{"body": string(plain), "mime_type": string(msg.MIMEType)}, nil
+		return map[string]string{"body": string(plain), "mime_type": string(msg.MIMEType), "signature_status": "unverified"}, nil
 	case "snapshot", "events", "labels", "latest", "metadata", "session", "resume":
 		return b.syncCall(ctx, method, raw)
 	case "logout":
@@ -257,11 +278,11 @@ func (b *ProtonBackend) Close() *Fault {
 func unlockSession(ctx context.Context, c *proton.Client, pass []byte) (map[string]*crypto.KeyRing, []byte, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, classify(err, "key_format")
 	}
 	addresses, err := c.GetAddresses(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, classify(err, "key_format")
 	}
 	salts, err := c.GetSalts(ctx)
 	if err != nil {
@@ -275,7 +296,7 @@ func unlockSession(ctx context.Context, c *proton.Client, pass []byte) (map[stri
 		}
 	}
 	if primary == "" {
-		return nil, nil, errors.New("missing_primary_key")
+		return nil, nil, fail("key_missing")
 	}
 	salted, err := salts.SaltForKey(pass, primary)
 	if err != nil || len(salted) == 0 {

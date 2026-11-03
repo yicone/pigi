@@ -20,7 +20,7 @@ extension LocalEngine {
                     try remote.persistInitial()
                 }
             } catch {
-                Keychain.set(ProtonSession.key(email), previousSecret ?? "")
+                _ = Keychain.set(ProtonSession.key(email), previousSecret ?? "")
                 previous?.reactivate()
                 throw error
             }
@@ -70,7 +70,7 @@ extension LocalEngine {
             // Never save SDK, SQL or decoding diagnostics, which may carry content.
             let safe = (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
             setError(email, safe)
-            if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key].contains(code) {
+            if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
                 (protonSessions[email] as? ProtonSession)?.deactivate()
                 protonSessions[email] = nil
             }
@@ -130,7 +130,7 @@ extension LocalEngine {
         for _ in 0..<5 {
             let page: ProtonEventPage
             do { page = try await remote.events(cursor: cursor!) }
-            catch let error as ProtonHelperError where error == .notFound || error == .cursorExpired {
+            catch let error as ProtonHelperError where error == .cursorExpired {
                 let latest = try await remote.latest()
                 try checkProton(email, remote)
                 try beginProtonSnapshot(email, cursor: latest)

@@ -48,8 +48,9 @@ func TestSyncReadOnlyMappingAndSessionRefresh(t *testing.T) {
 		case "/core/v4/events/c1":
 			_, _ = w.Write([]byte(`{"Code":1000,"EventID":"c2","More":0,"Refresh":1,"Messages":[{"ID":"two","Action":1}]}`))
 		case "/core/v4/events/expired":
-			w.WriteHeader(400)
-			_, _ = w.Write([]byte(`{"Code":2001,"Error":"private cursor diagnostic"}`))
+			// The server explicitly invalidates incremental state; a bare HTTP
+			// error or generic InvalidValue code is insufficient evidence.
+			_, _ = w.Write([]byte(`{"Code":1000,"EventID":"fresh","Refresh":1}`))
 		case "/auth/v4/refresh":
 			if r.Method != "POST" {
 				t.Error("wrong refresh method")
@@ -97,9 +98,10 @@ func TestSyncReadOnlyMappingAndSessionRefresh(t *testing.T) {
 	if !strings.Contains(string(data), `"cursor":"c2"`) || !strings.Contains(string(data), `"reset":true`) || !strings.Contains(string(data), `"deleted":true`) {
 		t.Fatal(string(data))
 	}
-	_, f := b.Call(ctx, "events", json.RawMessage(`{"cursor":"expired"}`))
-	if f == nil || f.Code != "cursor_expired" {
-		t.Fatal("expired cursor did not trigger resnapshot")
+	resetPage, f := b.Call(ctx, "events", json.RawMessage(`{"cursor":"expired"}`))
+	resetJSON, _ := json.Marshal(resetPage)
+	if f != nil || !strings.Contains(string(resetJSON), `"reset":true`) {
+		t.Fatal("explicit expired-state refresh did not trigger resnapshot")
 	}
 	secret := call("session", `{}`).(savedSession)
 	if secret.Access != "new-access" || secret.Refresh != "new-refresh" || !b.persistent {

@@ -12,6 +12,7 @@ for arch in arm64 amd64; do
     CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" "$GO_BIN" build -mod=readonly -trimpath -buildvcs=false \
         -ldflags='-s -w' -o "$OUT/helper-$arch" ./cmd/pigi-proton-helper
 done
+python3 "$ROOT/tools/proton-spike/audit-dependencies.py" "$OUT"
 lipo -create "$OUT/helper-arm64" "$OUT/helper-amd64" -output "$OUT/pigi-proton-helper"
 codesign --force --sign - --options runtime "$OUT/pigi-proton-helper"
 codesign --verify --strict "$OUT/pigi-proton-helper"

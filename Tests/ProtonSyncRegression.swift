@@ -1,11 +1,14 @@
 import AppKit
 import SwiftUI
 
+#if !CACHE_DISK_REGRESSION
 enum MailCache {
     static func load() -> [Mail] { [] }
     static func save(_ mails: [Mail]) {}
+    static func saveChecked(_ mails: [Mail]) throws {}
     static func clear() {}
 }
+#endif
 enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
@@ -24,29 +27,36 @@ actor FixtureProton: ProtonSyncRemote {
     var bodies: [String: ProtonMessageBody] = [:]
     var pages: [String: ProtonEventPage] = [:]
     var failing: String?
+    var failureCode: ProtonHelperError = .key
     var latestID = "c0"
-    func latest() async throws -> String { latestID }
+    var eventError: ProtonHelperError?
+    var latestCalls = 0
+    var snapshotCalls = 0
+    func latest() async throws -> String { latestCalls += 1; return latestID }
     func labels() async throws -> [ProtonLabel] { [ProtonLabel(id: "custom", name: "Work", parent: "parent", type: 3)] }
-    func snapshot(after: String) async throws -> [String] { snapshotPages[after] ?? [] }
+    func snapshot(after: String) async throws -> [String] { snapshotCalls += 1; return snapshotPages[after] ?? [] }
     func metadata(id: String) async throws -> ProtonSyncMetadata {
         guard let row = rows[id] else { throw ProtonHelperError.notFound }
         return row
     }
     func decrypt(id: String) async throws -> ProtonMessageBody {
-        if id == failing { throw ProtonHelperError.key }
+        if id == failing { throw failureCode }
         guard let body = bodies[id] else { throw ProtonHelperError.notFound }
         return body
     }
     func events(cursor: String) async throws -> ProtonEventPage {
-        pages[cursor] ?? ProtonEventPage(cursor: cursor, more: false, reset: false, changes: [])
+        if let eventError { throw eventError }
+        return pages[cursor] ?? ProtonEventPage(cursor: cursor, more: false, reset: false, changes: [])
     }
+    func failEvents(_ code: ProtonHelperError?) { eventError = code }
+    func callCounts() -> (Int, Int) { (latestCalls, snapshotCalls) }
     func put(_ id: String, unread: Bool = true, labels: [String] = ["0", "5", "custom"], text: String = "fixture plaintext", html: Bool = false) {
         rows[id] = ProtonSyncMetadata(id: id, subject: "Fixture \(id)", time: Int(Date().timeIntervalSince1970), unread: unread,
                                      sender_name: "Fixture sender", sender_email: "sender@example.test", labels: labels, size: 42)
         bodies[id] = ProtonMessageBody(body: text, mimeType: html ? "text/html" : "text/plain")
     }
     func mimeBody(_ id: String, body: String) { bodies[id] = ProtonMessageBody(body: body, mimeType: "multipart/mixed") }
-    func failure(_ id: String?) { failing = id }
+    func failure(_ id: String?, code: ProtonHelperError = .key) { failing = id; failureCode = code }
     func event(_ cursor: String, next: String, changes: [(String, Bool)], reset: Bool = false, more: Bool = false) {
         pages[cursor] = ProtonEventPage(cursor: next, more: more, reset: reset, changes: changes.map { .init(id: $0.0, deleted: $0.1) })
     }
@@ -84,6 +94,10 @@ extension LocalEngine {
         app.run()
     }
     static func run() async throws {
+        #if CACHE_DISK_REGRESSION
+        try await diskPrivacyCases()
+        #else
+        try await eventRecoveryCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
         await remote.put("one")
@@ -111,11 +125,13 @@ extension LocalEngine {
         await remote.put("one", unread: false, labels: ["6", "5", "10"], text: "replacement searchable body")
         await remote.put("three")
         await remote.event("c0", next: "c1", changes: [("one", false), ("three", false), ("two", true)])
-        await remote.failure("three")
-        do { try await engine.pullProton(email, remote: remote); fatalError("decrypt failure swallowed") }
-        catch ProtonHelperError.key {}
-        let failedCursor = try await engine.cursor(email)
-        precondition(failedCursor == "c0")
+        for code: ProtonHelperError in [.key, .keyMissing, .keyFormat, .keyDecryption, .network, .timeout, .rateLimited, .proxy, .apiVersion, .humanVerificationRequired] {
+            await remote.failure("three", code: code)
+            do { try await engine.pullProton(email, remote: remote); fatalError("failure swallowed") }
+            catch let error as ProtonHelperError { precondition(error == code) }
+            let failedCursor = try await engine.cursor(email)
+            precondition(failedCursor == "c0")
+        }
         await remote.failure(nil)
         try await engine.pullProton(email, remote: remote)
         let updatedCursor = try await engine.cursor(email)
@@ -131,6 +147,10 @@ extension LocalEngine {
         precondition(fts.first?["n"]?.int == 3)
         print("PASS: cursor stays on failure; replay updates body/FTS/flags and deletion without duplicates")
 
+        let distinctErrors: [ProtonHelperError] = [.keyMissing, .keyFormat, .keyDecryption, .network, .timeout, .rateLimited, .proxy, .apiVersion]
+        precondition(Set(distinctErrors.map { $0.localizedDescription }).count == distinctErrors.count)
+        let privacy = try await engine.inspect("PRAGMA secure_delete")
+        precondition(privacy.first?["secure_delete"]?.int == 1)
         let otherRemote = FixtureProton()
         await otherRemote.put("one", text: "isolated account")
         await otherRemote.rescan(["one"], latest: "o0")
@@ -169,6 +189,17 @@ extension LocalEngine {
         precondition(muted.first?["n"]?.int == 0)
         print("PASS: engine rejects modify, unsubscribe and mute before side effects")
 
+        try await engine.deleteAccount(other)
+        for table in ["accounts", "messages", "attachments", "account_labels", "proton_snapshot", "muted"] {
+            let column = table == "accounts" ? "email" : "account"
+            let remaining = try await engine.inspect("SELECT count(*) AS n FROM \(table) WHERE \(column)='other@example.test'")
+            precondition(remaining.first?["n"]?.int == 0)
+        }
+        let removedSearch = try await engine.search("isolated", account: other)
+        precondition(removedSearch.isEmpty)
+        let keptBody = try await engine.body(account: email, id: "three")
+        precondition(!keptBody.text.isEmpty)
+        print("PASS: cache deletion removes account tables and search while preserving another account")
         let state = AppState()
         var mail = fixtureMail()
         state.mails = [mail]
@@ -198,7 +229,7 @@ extension LocalEngine {
         do { try await engine.pullProton(email, remote: remote); fatalError("deleted account resumed") }
         catch is CancellationError {}
         let remaining = try await engine.accounts()
-        precondition(remaining.map(\.email) == [other])
+        precondition(remaining.isEmpty)
         print("PASS: removal clears local labels/mail and stale sync cannot resurrect account")
         let mimeEngine = LocalEngine(), mimeRemote = FixtureProton()
         await mimeRemote.put("one")
@@ -224,7 +255,9 @@ extension LocalEngine {
         print("PASS: decrypted PGP/MIME maps decoded plaintext and HTML through the existing MIME parser")
         try await sessionPersistence()
         if CommandLine.arguments.count > 1 { try renderEvidence(state, to: URL(fileURLWithPath: CommandLine.arguments[1])) }
+        #endif
     }
+
     static func sessionPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -264,6 +297,46 @@ extension LocalEngine {
         print("PASS: pipe session export persists only to the fixture Keychain; deactivated sessions cannot overwrite or resurrect secrets")
     }
 
+    // Go's loopback tests establish HTTP -> wire classification; here exercise
+    // the real sync catch/state/presentation path rather than failing a body fetch.
+    static func eventRecoveryCases() async throws {
+        let engine = LocalEngine(), remote = FixtureProton(), email = "events@example.test"
+        await remote.rescan([], latest: "c0")
+        try await engine.fixture(email, remote: remote)
+        try await engine.pullProton(email, remote: remote)
+        let baseline = await remote.callCounts()
+        let sequence = try await engine.sequence()
+        for code: ProtonHelperError in [.apiVersion, .humanVerificationRequired, .upstream, .notFound] {
+            await remote.failEvents(code)
+            let delay = await engine.syncProton(email)
+            let cursor = try await engine.cursor(email)
+            let counts = await remote.callCounts()
+            let account = try await engine.inspect("SELECT backfill_done,page_token,last_error FROM accounts WHERE email='events@example.test'").first!
+            let afterSequence = try await engine.sequence()
+            precondition(delay == 120 && cursor == "c0" && account["backfill_done"]?.int == 1)
+            precondition(account["page_token"]?.text == nil && afterSequence == sequence)
+            precondition(counts == baseline, "event failure incorrectly sampled latest or started a snapshot")
+            precondition(account["last_error"]?.text == code.localizedDescription)
+        }
+        precondition(ProtonHelperError.apiVersion.localizedDescription != ProtonHelperError.humanVerificationRequired.localizedDescription)
+        print("PASS: events version/HV/upstream/404 failures retain cursor and distinct safe hints without snapshot/latest calls")
+
+        await remote.failEvents(nil)
+        await remote.event("c0", next: "fresh", changes: [], reset: true)
+        await remote.rescan([], latest: "fresh")
+        try await engine.pullProton(email, remote: remote)
+        let resetCursor = try await engine.cursor(email)
+        let resetAccount = try await engine.inspect("SELECT backfill_done FROM accounts WHERE email='events@example.test'").first!
+        let resetCounts = await remote.callCounts()
+        precondition(resetCursor == "fresh" && resetAccount["backfill_done"]?.int == 0)
+        precondition(resetCounts.0 == baseline.0 + 1 && resetCounts.1 == baseline.1)
+        try await engine.pullProton(email, remote: remote)
+        let complete = try await engine.inspect("SELECT backfill_done FROM accounts WHERE email='events@example.test'").first!
+        let completeCounts = await remote.callCounts()
+        precondition(complete["backfill_done"]?.int == 1 && completeCounts.1 == baseline.1 + 1)
+        print("PASS: explicit invalidated-state reset alone rebases cursor and rebuilds snapshot")
+    }
+
     static func renderEvidence(_ state: AppState, to directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         func capture<V: View>(_ view: V, _ name: String, width: CGFloat, height: CGFloat) throws {
@@ -284,7 +357,8 @@ extension LocalEngine {
         state.mails = [fixtureMail()]
         state.select(.account("fixture@example.test"))
         try capture(MailListView().environment(state), "proton-inbox.png", width: 480, height: 500)
-        print("PASS: synthetic Proton login and inbox UI rendered")
+        try capture(MailDetailContent(mail: fixtureMail()).environment(state), "proton-signature.png", width: 900, height: 500)
+        print("PASS: synthetic Proton login, inbox and unverified signature UI rendered")
     }
 
     static func fixtureMail() -> Mail {

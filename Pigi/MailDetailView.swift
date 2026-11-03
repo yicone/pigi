@@ -85,6 +85,11 @@ struct MailDetailContent: View {
                 Text(mail.date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened).locale(Locale(identifier: "zh_CN"))))
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
+                if state.isReadOnly(mail.accountID) {
+                    Label("签名未验证 · 无法确认发件人身份", systemImage: "questionmark.shield")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
                 Text(mail.subject)
                     .font(.system(size: 17))
                     .lineLimit(3)

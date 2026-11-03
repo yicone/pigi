@@ -70,7 +70,7 @@ extension LocalEngine {
             // Never save SDK, SQL or decoding diagnostics, which may carry content.
             let safe = (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
             setError(email, safe)
-            if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key].contains(code) {
+            if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
                 (protonSessions[email] as? ProtonSession)?.deactivate()
                 protonSessions[email] = nil
             }

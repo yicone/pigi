@@ -41,7 +41,7 @@ Synthetic handshake (contains no account data):
 | `hello` | `{}` | Version, limit, supported methods |
 | `login` | `username`, `password`; optional `mailbox_password`, `otp` strings | `{"authenticated":true}` |
 | `list` | `page` ≥ 0, `limit` 1–100 | Array of `{id,subject,time,unread}` for inbox, newest first; time is Unix seconds |
-| `decrypt` | `id` nonempty, ≤1024 bytes | `{body,mime_type}`; UTF-8 plaintext decrypted locally with matching AddressID key |
+| `decrypt` | `id` nonempty, ≤1024 bytes | `{body,mime_type,signature_status:"unverified"}`; UTF-8 plaintext decrypted locally with matching AddressID key |
 | `snapshot` | `after` stable ID (empty initially), `limit` 1–100 | Array of message IDs from all folders; uses `AfterID`, not page offsets |
 | `metadata` | `id` | `{id,subject,time,unread,sender_name,sender_email,labels,size}`; time is Unix seconds |
 | `labels` | `{}` | Array of `{id,name,parent,type}`; user labels and folders |
@@ -54,10 +54,11 @@ Synthetic handshake (contains no account data):
 Login performs SRP, optional TOTP and key unlock. Failed post-auth login attempts
 revoke the provisional session. A failed revoke keeps the client available only
 for a retry of `logout`; list/decrypt are blocked because keys are cleared.
-`human_verification_required` and `second_factor_required` are explicit terminal
-login outcomes in v1. CAPTCHA continuation is deliberately not implemented here;
-the ACM-769 native interactive spike remains a separate diagnostic. Do not claim
-the new helper can yet complete a CAPTCHA login. Private keys never leave Go. Session tokens and the derived unlock secret
+The legacy `login` method returns `human_verification_required` and
+`second_factor_required` when interaction is required. The app uses `begin_login`
+and `continue_login` to continue official CAPTCHA, TOTP and mailbox-password
+challenges; verification URLs and results must pass the native challenge-binding
+policy. Private keys never leave Go. Session tokens and the derived unlock secret
 leave Go only through the private `session` response for Keychain storage. Plaintext signature authenticity is not asserted by this API.
 
 | Code | Meaning / recovery |
@@ -66,7 +67,9 @@ leave Go only through the private `session` response for Keychain storage. Plain
 | `credentials` | SRP login, password, authorization or supplied OTP rejected |
 | `human_verification_required` | Server requires manual CAPTCHA / rejects verification token |
 | `second_factor_required` | TOTP missing or another interactive factor required |
-| `key` | Missing mailbox/address key, unlock/decryption failed, invalid body encoding |
+| `key` | Mailbox key unlock or invalid plaintext encoding; check password/Keychain |
+| `key_missing`, `key_format`, `key_decryption` | Missing key, unrecognized key/ciphertext format, or failed ciphertext decryption; distinct recovery hints |
+| `api_version`, `proxy` | API rejects app version, or an API-formatted HTTP 407 proxy authentication response |
 | `rate_limited` | Upstream 429; caller must back off |
 | `not_authenticated`, `already_authenticated` | Invalid account-session state |
 | `cleanup_failed` | Remote revocation unconfirmed; retry logout before abandoning child |
@@ -153,3 +156,10 @@ credentials, key material or message bodies may enter logs or artifacts.
 sessions, never the user's database or Keychain. Helper Go tests use a loopback
 HTTP fixture and generated OpenPGP keys. These verify failure/replay and local
 mapping, but do not establish a real Proton account login or CAPTCHA flow.
+
+## Security audit
+
+See [Proton security audit](proton-security-audit.md) for repeatable failure tests,
+cache privacy/deletion limits, proxy support boundaries, runtime license inventory
+and the bounded telemetry conclusion. Dependency notices and inventory are embedded
+in the app resources during builds.

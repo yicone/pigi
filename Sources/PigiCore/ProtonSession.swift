@@ -175,7 +175,14 @@ extension ProtonHelperError: LocalizedError {
         case .unsupportedFactor: "当前仅支持 TOTP，请使用支持的验证方式"
         case .secondFactorRequired: "请输入当前的两步验证码"
         case .key: "Proton 密钥解锁失败，请检查独立邮箱密码或钥匙串权限"
-        case .network, .timeout, .rateLimited: "Proton 网络暂不可用或请求受限，请稍后重试"
+        case .keyMissing: "此邮件的地址密钥缺失，请重新登录以加载最新密钥"
+        case .keyFormat: "Proton 加密数据格式无法识别，请更新应用后重试"
+        case .keyDecryption: "Proton 邮件解密失败，密钥可能已轮换，请重新登录"
+        case .apiVersion: "Proton 已拒绝当前 API 版本，请更新应用"
+        case .proxy: "代理需要认证，请检查系统代理设置"
+        case .network: "无法连接 Proton，请检查网络与系统代理后重试"
+        case .timeout: "Proton 请求超时，请稍后重试"
+        case .rateLimited: "Proton 请求过于频繁，请至少等待两分钟后重试"
         default: "Proton 操作失败（\(rawValue)）"
         }
     }

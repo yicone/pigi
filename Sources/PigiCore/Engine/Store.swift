@@ -30,6 +30,9 @@ final class Store {
         sqlite3_busy_timeout(handle, 30_000)
         try run("PRAGMA journal_mode=WAL")
         try run("PRAGMA synchronous=NORMAL")
+        // Reduce deleted-page remnants. Historical WAL, FTS internals and backups
+        // remain outside this logical deletion guarantee.
+        try run("PRAGMA secure_delete=ON")
     }
 
     deinit { sqlite3_close(handle) }

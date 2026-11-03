@@ -9,6 +9,7 @@ enum MailCache {
         ) else { return nil }
         let folder = dir.appendingPathComponent("pigi", isDirectory: true)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
         return folder.appendingPathComponent("mail-headers.json")
     }
 
@@ -28,6 +29,7 @@ enum MailCache {
         }
         if let data = try? JSONEncoder().encode(slim) {
             try? data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 

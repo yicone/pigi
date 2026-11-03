@@ -341,6 +341,8 @@ final class AppState {
             if scope == .account(id) { select(.all) }
         }
         hiddenAccounts.remove(id)
+        // Flush the second cache now instead of waiting for a debounced save.
+        MailCache.save(mails)
     }
 
     // MARK: - Gmail accounts

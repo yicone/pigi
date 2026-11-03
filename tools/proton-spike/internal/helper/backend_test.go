@@ -28,6 +28,23 @@ func TestReadDecryptAndCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	otherKey, err := crypto.GenerateKey("other", "other@example.test", "x25519", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRing, err := crypto.NewKeyRing(otherKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherEncrypted, err := otherRing.Encrypt(crypto.NewPlainMessageFromString("synthetic other key"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherArmor, err := otherEncrypted.GetArmored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherRing.ClearPrivateParams()
 	body, address := "", "address"
 	revokeFails := true
 	service := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,9 +84,10 @@ func TestReadDecryptAndCleanup(t *testing.T) {
 	}
 	for _, c := range []struct{ body, address, code string }{
 		{armor, "address", ""},
-		{armor, "missing", "key"},
-		{"server plaintext", "address", "key"},
-		{"-----BEGIN PGP MESSAGE-----\ncorrupt", "address", "key"},
+		{armor, "missing", "key_missing"},
+		{otherArmor, "address", "key_decryption"},
+		{"server plaintext", "address", "key_format"},
+		{"-----BEGIN PGP MESSAGE-----\ncorrupt", "address", "key_format"},
 	} {
 		body, address = c.body, c.address
 		result, f := b.Call(ctx, "decrypt", json.RawMessage(`{"id":"synthetic-id"}`))
@@ -83,7 +101,7 @@ func TestReadDecryptAndCleanup(t *testing.T) {
 			t.Fatal(f)
 		}
 		decoded := result.(map[string]string)
-		if decoded["body"] != "synthetic plaintext" || decoded["mime_type"] != "text/plain" {
+		if decoded["body"] != "synthetic plaintext" || decoded["mime_type"] != "text/plain" || decoded["signature_status"] != "unverified" {
 			t.Fatal("wrong plaintext")
 		}
 	}

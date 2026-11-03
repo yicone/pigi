@@ -9,7 +9,11 @@ public enum ProtonHelperError: String, Error, Codable {
     case handshakeRequired = "handshake_required"
     case frameTooLarge = "frame_too_large"
     case unknownMethod = "unknown_method"
-    case network, timeout, credentials, key, upstream
+    case network, timeout, credentials, key, upstream, proxy
+    case apiVersion = "api_version"
+    case keyMissing = "key_missing"
+    case keyFormat = "key_format"
+    case keyDecryption = "key_decryption"
     case humanVerificationRequired = "human_verification_required"
     case secondFactorRequired = "second_factor_required"
     case loginExpired = "login_expired"

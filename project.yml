@@ -33,6 +33,9 @@ targets:
           HELPER="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/pigi-proton-helper"
           mkdir -p "$(dirname "$HELPER")"
           cp "$DERIVED_FILE_DIR/proton-helper/pigi-proton-helper" "$HELPER"
+          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          cp "$DERIVED_FILE_DIR/proton-helper/proton-third-party-notices.txt" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
+          cp "$DERIVED_FILE_DIR/proton-helper/proton-dependencies.json" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
           IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
           if [ "$IDENTITY" = "-" ]; then
             codesign --force --sign - --options runtime "$HELPER"

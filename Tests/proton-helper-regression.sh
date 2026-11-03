@@ -5,6 +5,6 @@ TEST_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/pigi-proton-regression.XXXXXX")"
 trap 'rm -rf "$TEST_BUILD"' EXIT
 bash "$ROOT/tools/build-proton-helper.sh" "$TEST_BUILD"
 xcrun swiftc -swift-version 5 -parse-as-library \
-    "$ROOT/Sources/PigiCore/ProtonHelper.swift" "$ROOT/Tests/ProtonHelperRegression.swift" \
+    "$ROOT/Sources/PigiCore/ProtonHelper.swift" "$ROOT/Sources/PigiCore/ProtonVerificationPolicy.swift" "$ROOT/Pigi/ProtonLoginPrompt.swift" "$ROOT/Tests/ProtonLoginRegression.swift" "$ROOT/Tests/ProtonHelperRegression.swift" \
     -o "$TEST_BUILD/proton-helper-regression"
 "$TEST_BUILD/proton-helper-regression" "$TEST_BUILD"

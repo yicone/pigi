@@ -31,6 +31,8 @@ struct ProtonHelperRegression {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
             return url
         }
+        try await loginCases(root: root)
+
         let mismatch = try fixture("wrong-id", "r=json.loads(sys.stdin.readline())\nprint(json.dumps({'version':1,'id':999,'result':{}}),flush=True)\n")
         try await fault(.protocolViolation) { _ = try await ProtonHelperClient(executable: mismatch).negotiate() }
 

@@ -1,8 +1,8 @@
 import Foundation
 
 extension LocalEngine {
-    func addProton(username: String, password: String, mailboxPassword: String, otp: String) async throws {
-        let remote = try await ProtonSession.signIn(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+    func addProton(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
+        let remote = try await ProtonSession.signIn(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
         let email = remote.email
         do {
             let existing = try account(email)

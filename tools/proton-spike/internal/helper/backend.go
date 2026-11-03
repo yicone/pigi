@@ -32,11 +32,13 @@ func (t identifiedTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 }
 
 type ProtonBackend struct {
-	manager    *proton.Manager
-	client     *proton.Client
-	rings      map[string]*crypto.KeyRing
-	session    savedSession
-	persistent bool
+	manager      *proton.Manager
+	client       *proton.Client
+	rings        map[string]*crypto.KeyRing
+	session      savedSession
+	persistent   bool
+	pending      *pendingLogin
+	loginAttempt func(context.Context, string, []byte, *proton.APIHVDetails) (*proton.Client, proton.Auth, error)
 }
 
 func NewBackend() *ProtonBackend {
@@ -89,8 +91,10 @@ type loginParams struct {
 
 func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMessage) (any, *Fault) {
 	switch method {
+	case "begin_login", "continue_login":
+		return b.loginCall(ctx, method, raw)
 	case "login":
-		if b.client != nil {
+		if b.client != nil || b.pending != nil {
 			return nil, fail("already_authenticated")
 		}
 		var p loginParams
@@ -209,6 +213,7 @@ func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMes
 }
 
 func (b *ProtonBackend) logout() *Fault {
+	b.clearPending()
 	clear(b.session.Salted)
 	b.session = savedSession{}
 	b.persistent = false

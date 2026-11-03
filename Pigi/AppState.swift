@@ -312,8 +312,8 @@ final class AppState {
         for email in protonEmails { protonLabels[email] = try? await ArchiveClient().protonLabels(email) }
     }
 
-    func addProtonAccount(username: String, password: String, mailboxPassword: String, otp: String) async throws {
-        try await ArchiveClient().addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+    func addProtonAccount(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
+        try await ArchiveClient().addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
         await refreshServerAccounts()
         await syncFromArchive(full: true)
     }

@@ -108,8 +108,8 @@ public struct ArchiveClient {
         try await engine.addIMAP(email: email, password: password, host: host, port: port)
     }
 
-    public func addProton(username: String, password: String, mailboxPassword: String, otp: String) async throws {
-        try await engine.addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp)
+    public func addProton(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
+        try await engine.addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
     }
 
     public func protonLabels(_ email: String) async throws -> [ProtonLabel] {

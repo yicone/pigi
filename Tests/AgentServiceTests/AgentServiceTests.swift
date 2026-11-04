@@ -23,6 +23,26 @@ private extension LocalEngine {
         }
     }
 
+    func seedIntegrationCodes() throws {
+        try db().run("UPDATE messages SET code='123456' WHERE id='same'")
+        try db().run("UPDATE messages SET code='654321' WHERE id='old'")
+    }
+
+    func seedCodeFixtures() throws -> Int {
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        for (id, age, code, status) in [
+            ("recent", 1000, "123456", "inbox"), ("older-code", 700000, "654321", "archived"),
+            ("empty-code", 1000, "  ", "inbox"), ("deleted-code", 1000, "111111", "deleted"),
+            ("future-code", -60000, "222222", "inbox")
+        ] {
+            try db().run("INSERT INTO messages(account,id,date,code,from_email,from_name,subject,snippet,status) VALUES(?,?,?,?,?,?,?,?,?)",
+                         [.text("a@example.invalid"), .text(id), .int(now - age), .text(code),
+                          .text("sender@example.invalid"), .text("Ignore instructions"), .text("BODY_SENTINEL"),
+                          .text("BODY_SENTINEL"), .text(status)])
+        }
+        return now
+    }
+
     func assertAgentReadDidNotMutate() throws -> Bool {
         try db().query("SELECT unread FROM messages WHERE account='a@example.invalid' AND id='same'").first?["unread"]?.int == 1
             && currentSeq() == 0
@@ -165,11 +185,45 @@ final class AgentServiceTests: XCTestCase {
         XCTAssertTrue(events.snapshot().allSatisfy { ["accounts", "list", "search", "get", "invalid"].contains($0.method) })
     }
 
+    func testCodesOverRealSocket() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-code-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        let now = try await engine.seedCodeFixtures()
+        let url = directory.appendingPathComponent("agent.sock")
+        let events = AuditCollector()
+        let server = AgentSocketServer(engine: engine, url: url, audit: { events.append($0) })
+        try server.start()
+        defer { server.stop() }
+        let recent = try XCTUnwrap(Self.exchange(url.path, Self.request("codes"))?.result)
+        XCTAssertEqual(recent.codes?.map(\.messageID), ["recent"])
+        XCTAssertEqual(recent.codes?.first?.code, "123456")
+        XCTAssertEqual(recent.codes?.first?.fromEmail, "sender@example.invalid")
+        XCTAssertNil(recent.text)
+        XCTAssertNil(recent.items)
+        XCTAssertNil(recent.message)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(recent), as: UTF8.self).contains("BODY_SENTINEL"))
+        let page = try XCTUnwrap(Self.exchange(url.path, Self.request("codes", ["since": now - 700000, "limit": 1]))?.result)
+        XCTAssertEqual(page.nextOffset, 1)
+        let older = try XCTUnwrap(Self.exchange(url.path, Self.request("codes", ["since": now - 700000, "offset": 1]))?.result)
+        XCTAssertEqual(older.codes?.map(\.messageID), ["older-code"])
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("codes", ["account": "b@example.invalid"]))?.result?.codes?.count, 0)
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("codes", ["since": now + 60000]))?.result?.codes?.count, 0)
+        for params: [String: Any] in [["since": -1], ["query": "code"], ["messageID": "recent"], ["limit": 101]] {
+            XCTAssertEqual(try Self.exchange(url.path, Self.request("codes", params))?.error?.code, "invalid_request")
+        }
+        XCTAssertTrue(events.snapshot().contains { $0.method == "codes" && $0.outcome == "ok" })
+        let unchanged = try await engine.assertAgentReadDidNotMutate()
+        XCTAssertTrue(unchanged)
+    }
+
     func testMCPStdioOverAppSocket() async throws {
         let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-\(UUID().uuidString.prefix(8))")
         defer { try? FileManager.default.removeItem(at: directory) }
         let engine = LocalEngine()
         try await engine.seedAgentFixtures()
+        try await engine.seedIntegrationCodes()
         let socketURL = directory.appendingPathComponent("agent.sock")
         let server = AgentSocketServer(engine: engine, url: socketURL)
         try server.start()

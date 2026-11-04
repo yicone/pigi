@@ -59,7 +59,7 @@ def integration(socket_path, audit_path):
         call(14, "search", {"query": "older", "since": 10, "status": "archived"}),
         call(15, "search", {"query": "secrets", "account": "b@example.invalid"}),
     ])
-    assert len(responses[2]["result"]["tools"]) == 4
+    assert len(responses[2]["result"]["tools"]) == 5
 
     def value(id):
         result = responses[id]["result"]
@@ -90,6 +90,17 @@ def integration(socket_path, audit_path):
     assert rows[6:] == [("get_message", "not_found"), ("list_messages", "invalid_arguments"),
                         ("invalid", "invalid_arguments"), ("list_messages", "ok"),
                         ("list_messages", "ok"), ("search", "ok"), ("search", "ok")], rows
+    codes = subprocess_calls(socket_path, audit_path, handshake() + [
+        call(20, "get_verification_code"), call(21, "get_verification_code", {"since": 0, "status": "archived"}),
+        call(22, "get_verification_code", {"since": -1})])
+    recent = json.loads(codes[20]["result"]["content"][0]["text"])
+    assert recent["codes"] == []
+    assert "BODY_SENTINEL" not in json.dumps(codes)
+    assert json.loads(codes[21]["result"]["content"][0]["text"])["codes"][0]["messageID"] == "old"
+    assert codes[22]["error"]["code"] == -32602
+    with sqlite3.connect(audit_path) as db:
+        assert db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id DESC LIMIT 3").fetchall() == [
+            ("get_verification_code", "invalid_arguments"), ("get_verification_code", "ok"), ("get_verification_code", "ok")]
     print("MCP stdio -> real Swift socket -> synthetic LocalEngine: passed")
 
 
@@ -108,6 +119,19 @@ class MCPTests(unittest.TestCase):
 
     def rows(self):
         return self.audit.db.execute("SELECT tool,outcome,duration_ms FROM tool_calls ORDER BY id").fetchall()
+
+    def test_verification_codes_audit_and_validation(self):
+        self.client.call.return_value = {"codes": [], "contentTrust": "untrusted"}
+        self.assertFalse(self.server.handle(call(2, "get_verification_code"))["result"]["isError"])
+        self.client.call.assert_called_with("codes", {})
+        self.server.handle(call(3, "get_verification_code", {"since": 123, "account": "a@example.invalid"}))
+        self.client.call.assert_called_with("codes", {"since": 123, "account": "a@example.invalid"})
+        for args in ({"since": -1}, {"since": True}, {"since": 1.5}, {"query": "x"}, {"messageID": "x"}):
+            self.assertEqual(self.server.handle(call(4, "get_verification_code", args))["error"]["code"], -32602)
+        self.client.call.side_effect = ToolError("unavailable")
+        self.assertTrue(self.server.handle(call(5, "get_verification_code"))["result"]["isError"])
+        self.assertEqual([r[:2] for r in self.rows()], [("get_verification_code", "ok")] * 2 +
+                         [("get_verification_code", "invalid_arguments")] * 5 + [("get_verification_code", "unavailable")])
 
     def test_validation_and_unknown_tools_audited_without_socket(self):
         for args in ({"limit": True}, {"offset": -1}, {"account": None}, {"status": "deleted"},
@@ -178,7 +202,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual([r.get("error", {}).get("code") for r in responses], [-32600, -32700, None])
         self.assertEqual(responses[2]["id"], 5)
 
-    def exchange(self, respond, timeout=0.5):
+    def exchange(self, respond, timeout=0.5, method="list"):
         endpoint = str(self.path / "agent.sock")
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(endpoint)
@@ -201,7 +225,7 @@ class MCPTests(unittest.TestCase):
         thread = threading.Thread(target=worker)
         thread.start()
         try:
-            return SocketClient(endpoint, timeout).call("list", {})
+            return SocketClient(endpoint, timeout).call(method, {})
         finally:
             thread.join(4)
             listener.close()
@@ -223,6 +247,25 @@ class MCPTests(unittest.TestCase):
                 connection.sendall(json.dumps({"id": req["id"], **response}).encode() + b"\n")
             with self.assertRaises(ToolError):
                 self.exchange(send)
+
+    def test_codes_transport_rejects_missing_capability_and_body(self):
+        item = {"code": "123456", "date": 123, "account": "a@example.invalid", "messageID": "same"}
+        def send_result(result):
+            def send(connection, req):
+                connection.sendall(json.dumps({"version": 1, "id": req["id"], "result": result}).encode() + b"\n")
+            return send
+        base = {"codes": [item], "contentTrust": "untrusted", "capabilities": ["codes"]}
+        self.assertEqual(self.exchange(send_result(base), method="codes")["codes"], [item])
+        for result, expected in [
+            ({**base, "capabilities": []}, "unsupported_server"),
+            ({**base, "text": "PRIVATE_SENTINEL"}, "invalid_response"),
+            ({**base, "codes": [{**item, "snippet": "PRIVATE_SENTINEL"}]}, "invalid_response"),
+            ({**base, "codes": [{**item, "date": True}]}, "invalid_response"),
+            ({**base, "codes": None}, "invalid_response")
+        ]:
+            with self.assertRaises(ToolError) as error:
+                self.exchange(send_result(result), method="codes")
+            self.assertEqual(error.exception.code, expected)
 
     def test_old_app_filters_fail_closed(self):
         # Simulate the old App's valid v1 response, which ignores unknown params.
@@ -269,7 +312,7 @@ class MCPTests(unittest.TestCase):
     def test_subprocess_stdio_when_app_is_absent(self):
         responses = subprocess_calls(self.path / "missing", self.path / "audit.sqlite3",
                                      handshake() + [request(2, "tools/list"), call(3, "list_messages")])
-        self.assertEqual(len(responses[2]["result"]["tools"]), 4)
+        self.assertEqual(len(responses[2]["result"]["tools"]), 5)
         self.assertTrue(responses[3]["result"]["isError"])
         self.assertEqual(self.rows()[0][:2], ("list_messages", "unavailable"))
 

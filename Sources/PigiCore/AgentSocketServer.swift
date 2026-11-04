@@ -160,7 +160,7 @@ public final class AgentSocketServer: @unchecked Sendable {
             do { request = try JSONDecoder().decode(AgentProtocol.Request.self, from: data) }
             catch { throw AgentProtocol.Failure.make("invalid_request") }
             if request.id.utf8.count <= 128 { id = request.id }
-            if ["accounts", "list", "search", "get"].contains(request.method) { method = request.method }
+            if ["accounts", "list", "search", "get", "codes"].contains(request.method) { method = request.method }
             // Block this bounded transport worker, never the engine actor or main thread.
             let completion = DispatchSemaphore(value: 0)
             let box = ReadCompletion()

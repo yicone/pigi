@@ -288,7 +288,7 @@ private enum VaultJSON {
     }
 }
 
-private final class MemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
+final class MemoryKeychainBackend: KeychainBackend, @unchecked Sendable {
     private let lock = NSLock()
     private var items: [String: Data] = [:]
     private var services: Set<String> = []

@@ -19,6 +19,8 @@ enum Keychain {
         values[key] = value.isEmpty ? nil : value
         return true
     }
+    static func translationAPIKey() throws -> String? { try get("translation-api-key") }
+    @discardableResult static func setTranslationAPIKey(_ value: String) -> Bool { set("translation-api-key", value) }
 }
 @MainActor enum MainWindow { static func show() {} }
 

@@ -129,7 +129,14 @@ private struct TranslationAPISection: View {
                 }
             }
         }
-        .task { hasKey = keyStore.apiKey() != nil }
+        .task {
+            do {
+                hasKey = try keyStore.apiKey() != nil
+            } catch {
+                hasKey = false
+                keyNote = "读不到钥匙串里的密钥"
+            }
+        }
         .onDisappear { testTask?.cancel() }
     }
 
@@ -152,7 +159,8 @@ private struct TranslationAPISection: View {
     private func runTest() {
         testResult = nil
         testing = true
-        let key = keyDraft.isEmpty ? (keyStore.apiKey() ?? "") : keyDraft
+        let storedKey = (try? keyStore.apiKey()) ?? nil
+        let key = keyDraft.isEmpty ? (storedKey ?? "") : keyDraft
         let current = config
         testTask = Task {
             let result = await TranslationConnectionTest.run(config: current, apiKey: key)

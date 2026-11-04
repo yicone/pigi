@@ -1,14 +1,10 @@
 import Foundation
 
 public struct KeychainKeyStore: KeyStore {
-    private let vault: KeychainVault
+    public init() {}
 
-    public init(vault: KeychainVault = .shared) {
-        self.vault = vault
-    }
-
-    public func apiKey() -> String? { vault.readTranslationAPIKey() }
+    public func apiKey() throws -> String? { try Keychain.translationAPIKey() }
 
     @discardableResult
-    public func setAPIKey(_ value: String) -> Bool { vault.writeTranslationAPIKey(value) }
+    public func setAPIKey(_ value: String) -> Bool { Keychain.setTranslationAPIKey(value) }
 }

@@ -5,6 +5,8 @@ enum Keychain {
     static func warm() {}
     static func get(_ key: String) -> String? { nil }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool { true }
+    static func translationAPIKey() throws -> String? { nil }
+    @discardableResult static func setTranslationAPIKey(_ value: String) -> Bool { true }
 }
 
 extension LocalEngine {

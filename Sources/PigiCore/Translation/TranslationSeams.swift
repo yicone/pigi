@@ -65,7 +65,7 @@ public protocol TranslationCache: Sendable {
 
 /// `setAPIKey("")` deletes the stored key.
 public protocol KeyStore: Sendable {
-    func apiKey() -> String?
+    func apiKey() throws -> String?
     @discardableResult
     func setAPIKey(_ value: String) -> Bool
 }

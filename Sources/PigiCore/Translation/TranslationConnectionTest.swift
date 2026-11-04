@@ -55,6 +55,6 @@ public enum TranslationConnectionTest {
 private struct InlineKeyStore: KeyStore {
     let key: String
     init(_ key: String) { self.key = key }
-    func apiKey() -> String? { key }
+    func apiKey() throws -> String? { key }
     func setAPIKey(_ value: String) -> Bool { false }
 }

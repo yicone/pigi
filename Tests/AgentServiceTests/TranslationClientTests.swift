@@ -329,14 +329,19 @@ final class TranslationClientTests: XCTestCase {
 
     // MARK: KeychainKeyStore
 
-    func testKeychainKeyStoreWriteReadDelete() {
-        let vault = KeychainVault(backend: MemoryKeychainBackend(), service: "pigi-tests")
-        let store = KeychainKeyStore(vault: vault)
-        XCTAssertNil(store.apiKey())
-        XCTAssertTrue(store.setAPIKey(key))
-        XCTAssertEqual(store.apiKey(), key)
-        XCTAssertTrue(store.setAPIKey(""))
-        XCTAssertNil(store.apiKey())
+    // KeychainKeyStore goes through the shared Keychain facade, which unit tests
+    // must not touch (refuseTestHost only fires under xcodebuild, not swift test).
+    // The vault's read/write/delete round-trip is covered by
+    // KeychainVaultTests.testTranslationKeySharesTheVaultItem.
+
+    func testKeyStoreReadFailureMapsToNotConfigured() async throws {
+        let transport = FakeTransport()
+        let translator = OpenAICompatibleTranslator(
+            config: makeConfig(), keyStore: FailingKeyStore(), transport: transport, log: CapturingTranslationLog())
+        await assertError(.notConfigured) {
+            try await translator.translate([TranslationSegment(id: 0, text: "a")])
+        }
+        XCTAssertEqual(transport.requestCount(), 0)
     }
 
     // MARK: TranslationConnectionTest
@@ -475,12 +480,17 @@ private final class FakeTransport: HTTPTransport, @unchecked Sendable {
     }
 }
 
+private struct FailingKeyStore: KeyStore {
+    func apiKey() throws -> String? { throw KeychainBackendError(code: errSecAuthFailed) }
+    func setAPIKey(_ value: String) -> Bool { false }
+}
+
 private final class MemoryKeyStore: KeyStore, @unchecked Sendable {
     private var key: String?
 
     init(_ key: String? = nil) { self.key = key }
 
-    func apiKey() -> String? { key }
+    func apiKey() throws -> String? { key }
 
     func setAPIKey(_ value: String) -> Bool {
         key = value.isEmpty ? nil : value

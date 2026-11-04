@@ -54,7 +54,13 @@ public struct OpenAICompatibleTranslator: SegmentTranslator {
 
     public func translate(_ segments: [TranslationSegment]) async throws -> [TranslationSegment] {
         if segments.isEmpty { return [] }
-        let key = keyStore.apiKey() ?? ""
+        // A keychain read failure means we cannot prove configuration; never leak details.
+        let key: String
+        do {
+            key = try keyStore.apiKey() ?? ""
+        } catch {
+            throw TranslationError.notConfigured
+        }
         guard !key.isEmpty, !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw TranslationError.notConfigured
         }

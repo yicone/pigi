@@ -51,7 +51,10 @@ struct PigiApp: App {
         _state = State(initialValue: appState)
         // Syncing belongs to the app, not the window: the menu bar keeps counting after the window closes.
         Task { await appState.runSyncLoop() }
-        Task { await LocalEngine.shared.start() }
+        Task {
+            do { try await LocalEngine.shared.start() }
+            catch { Logger(subsystem: "one.yic.pigi", category: "keychain").error("Sync startup stopped: keychain vault unavailable") }
+        }
         PanelHotKey.shared.start()
         MailNotifier.shared.start()
         MailNotifier.shared.onOpenMail = { id in

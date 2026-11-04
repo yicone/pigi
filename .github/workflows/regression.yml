@@ -18,6 +18,7 @@ jobs:
         with:
           go-version-file: tools/proton-spike/go.mod
           cache-dependency-path: tools/proton-spike/go.sum
+          cache: false
       - name: Prepare pinned Proton API dependency
         run: bash tools/proton-spike/prepare.sh
       - name: Go helper tests

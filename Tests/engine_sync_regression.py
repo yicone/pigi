@@ -30,7 +30,9 @@ def message(subject):
 
 def serve():
     try:
-        for phase in range(4):
+        # Connections 0-3 are the sync phases; connection 4 only probes LOGIN
+        # for the password-rotation regression, then logs out.
+        for phase in range(5):
             raw, _ = listener.accept()
             raw.settimeout(20)
             with context.wrap_socket(raw, server_side=True) as conn:

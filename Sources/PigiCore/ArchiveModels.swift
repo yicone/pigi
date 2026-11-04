@@ -110,6 +110,16 @@ public struct ArchiveClient {
         try await engine.addIMAP(email: email, password: password, host: host, port: port)
     }
 
+    /// Verifies a new IMAP password against the server, then replaces the stored one.
+    public func updateIMAPPassword(email: String, password: String) async throws {
+        try await engine.updateIMAPPassword(email: email, password: password)
+    }
+
+    /// Drops the cached Gmail session so the next sync re-reads the refresh token.
+    public func resetGmailSession(_ email: String) async {
+        await engine.resetGmailSession(email)
+    }
+
     public func addProton(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
         try await engine.addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
     }

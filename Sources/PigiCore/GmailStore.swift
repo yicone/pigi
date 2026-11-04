@@ -18,6 +18,18 @@ public enum GmailStore {
         UserDefaults.standard.set(list, forKey: defaultsKey)
     }
 
+    /// Replaces the refresh token of a mailbox that is already signed in.
+    /// Returns false when the mailbox is unknown so it can never create an account.
+    public static func replaceRefreshToken(_ token: String, for email: String) -> Bool {
+        guard emails.contains(email) else { return false }
+        return Keychain.set(keychainKey(email), token)
+    }
+
+    /// Two addresses name the same mailbox when they match ignoring case and whitespace.
+    public static func isSameMailbox(_ a: String, _ b: String) -> Bool {
+        a.trimmingCharacters(in: .whitespaces).lowercased() == b.trimmingCharacters(in: .whitespaces).lowercased()
+    }
+
     public static func remove(_ email: String) {
         _ = Keychain.set(keychainKey(email), "")
         UserDefaults.standard.set(emails.filter { $0 != email }, forKey: defaultsKey)

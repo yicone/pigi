@@ -12,7 +12,7 @@ public struct GmailFailure: LocalizedError {
 
 public struct GmailRevoked: LocalizedError {
     public init() {}
-    public var errorDescription: String? { "授权已失效,请在 邮箱管理 里删除后重新添加这个邮箱" }
+    public var errorDescription: String? { "授权已失效,请在 邮箱管理 里点该邮箱行的「重新授权」图标" }
 }
 
 /// Authorized calls to the Gmail REST API for one mailbox, with retry on quota errors and token refresh.

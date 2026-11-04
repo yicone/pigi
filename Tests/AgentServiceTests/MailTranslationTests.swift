@@ -24,6 +24,32 @@ private actor FakeMailTranslator: MailTextTranslator {
 }
 
 final class MailTranslationTests: XCTestCase {
+    func testConcurrencyConfigurationRejectsValuesOutsideOneThroughThree() throws {
+        for value in [-1, 0, 4, Int.max] {
+            XCTAssertThrowsError(try MailTranslationPipeline(concurrency: value)) { error in
+                XCTAssertEqual(error as? MailTranslationError, .invalidLimits)
+            }
+        }
+        for value in 1...3 {
+            XCTAssertEqual(try MailTranslationPipeline(concurrency: value).concurrency, value)
+        }
+        XCTAssertEqual(try MailTranslationPipeline().concurrency, 3)
+    }
+
+    func testDefaultAndExplicitMaximumNeverExceedThreeConcurrentChunks() async throws {
+        let body = (0..<12).map { "Hello paragraph \($0)" }.joined(separator: "\n\n")
+        for pipeline in [try MailTranslationPipeline(maxItems: 1),
+                         try MailTranslationPipeline(maxItems: 1, concurrency: 3)] {
+            let fake = FakeMailTranslator()
+            let output = try await pipeline.translate(body: body, isHTML: false, using: fake)
+            XCTAssertEqual(output, body)
+            let requests = await fake.requests.count
+            let peak = await fake.peak
+            XCTAssertEqual(requests, 12)
+            XCTAssertEqual(peak, 3)
+        }
+    }
+
     func testChineseInlineNodesNeverReachTranslatorInEnglishParagraph() async throws {
         let chinese = "这是一封中文邮件，请查看附件并回复，谢谢。"
         let traditional = "這是一封中文郵件，請查看附件並回覆，謝謝。"

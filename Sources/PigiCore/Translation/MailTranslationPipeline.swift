@@ -6,7 +6,7 @@ public struct MailTranslationPipeline: Sendable {
     public let concurrency: Int
 
     public init(maxCharacters: Int = 7_000, maxItems: Int = 80, concurrency: Int = 3) throws {
-        guard maxCharacters > 0, maxItems > 0, maxItems <= 80, concurrency > 0 else {
+        guard maxCharacters > 0, maxItems > 0, maxItems <= 80, (1...3).contains(concurrency) else {
             throw MailTranslationError.invalidLimits
         }
         self.maxCharacters = maxCharacters

@@ -538,7 +538,7 @@ private struct AccountsPage: View {
             case .imap:
                 AccountIconButton(systemName: "key", help: "更新密码") { updatingPassword = account }
             case .proton:
-                AccountIconButton(systemName: "person.crop.circle.badge.arrow.right", help: "重新登录") { addingProton = true }
+                AccountIconButton(systemName: "rectangle.portrait.and.arrow.right", help: "重新登录") { addingProton = true }
             }
             syncState(status[account.id])
             Toggle("", isOn: shown).labelsHidden().toggleStyle(.switch).controlSize(.small)

@@ -34,7 +34,7 @@ class SocketClient:
         self.timeout = timeout
 
     def call(self, method, params):
-        if method not in {"accounts", "list", "search", "get"}:
+        if method not in {"accounts", "list", "search", "get", "codes"}:
             raise ToolError("method_not_found")
         request_id = uuid.uuid4().hex
         frame = json.dumps({"version": 1, "id": request_id, "method": method,
@@ -113,6 +113,18 @@ class SocketClient:
                 raise ToolError("invalid_response")
             if method == "get" and (not isinstance(result.get("message"), dict) or not isinstance(result.get("text"), str)):
                 raise ToolError("invalid_response")
+            if method == "codes":
+                if not isinstance(capabilities, list) or "codes" not in capabilities:
+                    raise ToolError("unsupported_server")
+                codes = result.get("codes")
+                allowed = {"code", "fromName", "fromEmail", "date", "account", "messageID"}
+                if not isinstance(codes, list) or any(
+                        not isinstance(item, dict) or set(item) - allowed
+                        or not all(isinstance(item.get(key), str) for key in ("code", "account", "messageID"))
+                        or type(item.get("date")) is not int
+                        or any(key in item and not isinstance(item[key], str) for key in ("fromName", "fromEmail"))
+                        for item in codes) or set(result) - {"codes", "nextOffset", "contentTrust", "capabilities"}:
+                    raise ToolError("invalid_response")
             return result
         except (TimeoutError, socket.timeout):
             raise ToolError("timeout") from None

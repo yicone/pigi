@@ -16,15 +16,15 @@ public enum Keychain {
     static let service = Bundle.main.bundleIdentifier ?? "one.yic.pigi"
 
     /// Reads the vault once. Later lookups in this process stay in memory.
-    public static func warm() { KeychainVault.shared.warmSync() }
+    public static func warm() throws { try KeychainVault.shared.warmSync() }
 
-    public static func get(_ key: String) -> String? { KeychainVault.shared.read(key) }
+    public static func get(_ key: String) throws -> String? { try KeychainVault.shared.read(key) }
 
     @discardableResult
     public static func set(_ key: String, _ value: String) -> Bool { KeychainVault.shared.write(key, value) }
 
     /// Reserved for a future translation feature. Stored in `vault-v1`, not a second item.
-    public static func translationAPIKey() -> String? { KeychainVault.shared.readTranslationAPIKey() }
+    public static func translationAPIKey() throws -> String? { try KeychainVault.shared.readTranslationAPIKey() }
 
     @discardableResult
     public static func setTranslationAPIKey(_ value: String) -> Bool { KeychainVault.shared.writeTranslationAPIKey(value) }
@@ -47,21 +47,20 @@ public actor KeychainVault {
         self.memory = Locked(VaultMemory())
     }
 
-    public func warm() { warmSync() }
-    public func get(_ key: String) async -> String? { read(key) }
+    public func warm() throws { try warmSync() }
+    public func get(_ key: String) async throws -> String? { try read(key) }
     public func set(_ key: String, _ value: String) async -> Bool { write(key, value) }
-    public func translationAPIKey() async -> String? { readTranslationAPIKey() }
+    public func translationAPIKey() async throws -> String? { try readTranslationAPIKey() }
     public func setTranslationAPIKey(_ value: String) async -> Bool { writeTranslationAPIKey(value) }
     public nonisolated func startupCopyMatchingCount() -> Int { memory.withLock { $0.copyMatchingCount } }
 
-    nonisolated func warmSync() {
-        memory.withLock { state in try? ensureLoaded(&state) }
+    nonisolated func warmSync() throws {
+        try memory.withLock { state in try ensureLoaded(&state) }
     }
 
-    nonisolated func read(_ key: String) -> String? {
-        memory.withLock { state -> String? in
-            do { try ensureLoaded(&state) } catch { return nil }
-            if state.unreadable { return nil }
+    nonisolated func read(_ key: String) throws -> String? {
+        try memory.withLock { state -> String? in
+            try ensureLoaded(&state)
             return state.document.value(for: key)
         }
     }
@@ -91,11 +90,22 @@ public actor KeychainVault {
         }
     }
 
-    nonisolated func readTranslationAPIKey() -> String? { read(KeychainQuery.translationAccount) }
+    nonisolated func readTranslationAPIKey() throws -> String? { try read(KeychainQuery.translationAccount) }
     nonisolated func writeTranslationAPIKey(_ value: String) -> Bool { write(KeychainQuery.translationAccount, value) }
 
     private nonisolated func ensureLoaded(_ state: inout VaultMemory) throws {
-        if state.unreadable { return }
+        if let expected = state.unverifiedMigration {
+            do {
+                guard try backend.read(service: service, account: KeychainQuery.vaultAccount) == expected else {
+                    throw KeychainBackendError(code: errSecDecode)
+                }
+                state.unverifiedMigration = nil
+            } catch {
+                log.error("keychain vault verification failed \(Self.statusText(error))")
+                throw error
+            }
+        }
+        if state.unreadable { throw KeychainBackendError(code: errSecDecode) }
         if state.loaded {
             if !state.pendingDeletes.isEmpty { deletePending(&state) }
             return
@@ -118,7 +128,7 @@ public actor KeychainVault {
                 }
                 state.unreadable = true
                 state.loaded = true
-                return
+                throw error
             }
             state.pendingDeletes = items.map(\.account).filter { $0 != KeychainQuery.vaultAccount }
             state.loaded = true
@@ -162,7 +172,13 @@ public actor KeychainVault {
             return
         }
         do {
-            try backend.upsert(service: service, account: KeychainQuery.vaultAccount, data: try document.encoded())
+            let encoded = try document.encoded()
+            try backend.upsert(service: service, account: KeychainQuery.vaultAccount, data: encoded)
+            state.unverifiedMigration = encoded
+            guard try backend.read(service: service, account: KeychainQuery.vaultAccount) == encoded else {
+                throw KeychainBackendError(code: errSecDecode)
+            }
+            state.unverifiedMigration = nil
         } catch {
             log.error("keychain vault write failed \(Self.statusText(error))")
             throw error
@@ -208,7 +224,6 @@ enum KeychainQuery {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecReturnAttributes as String: true,
-            kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll,
         ]
     }
@@ -229,6 +244,7 @@ struct KeychainRecord: Sendable, Equatable {
 
 protocol KeychainBackend: Sendable {
     func loadAll(service: String) throws -> [KeychainRecord]
+    func read(service: String, account: String) throws -> Data?
     func upsert(service: String, account: String, data: Data) throws
     func delete(service: String, account: String) throws
 }
@@ -238,24 +254,51 @@ struct KeychainBackendError: Error {
 }
 
 struct SecurityKeychainBackend: KeychainBackend {
+    private let testService: String?
+
+    init() { testService = nil }
+
+    init(integrationTestService: String) {
+        precondition(integrationTestService.hasPrefix("one.yic.pigi.tests.") && integrationTestService.count > 24)
+        testService = integrationTestService
+    }
+
     func loadAll(service: String) throws -> [KeychainRecord] {
-        try refuseTestHost()
+        try refuseTestHost(service: service)
         guard !service.isEmpty else { throw KeychainBackendError(code: errSecParam) }
         let query = KeychainQuery.loadAll(service: service)
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound { return [] }
         guard status == errSecSuccess else { throw KeychainBackendError(code: status) }
-        let rows = Self.rows(item)
-        return rows.compactMap { row in
+        guard let rows = item as? [[String: Any]] else {
+            throw KeychainBackendError(code: errSecDecode)
+        }
+        return try rows.map { row in
             guard let account = row[kSecAttrAccount as String] as? String,
-                  let data = row[kSecValueData as String] as? Data else { return nil }
+                  let data = try read(service: service, account: account) else {
+                throw KeychainBackendError(code: errSecItemNotFound)
+            }
             return KeychainRecord(account: account, data: data)
         }
     }
 
+    func read(service: String, account: String) throws -> Data? {
+        try refuseTestHost(service: service)
+        guard !service.isEmpty, !account.isEmpty else { throw KeychainBackendError(code: errSecParam) }
+        var query = KeychainQuery.item(service: service, account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw KeychainBackendError(code: status) }
+        guard let data = item as? Data else { throw KeychainBackendError(code: errSecDecode) }
+        return data
+    }
+
     func upsert(service: String, account: String, data: Data) throws {
-        try refuseTestHost()
+        try refuseTestHost(service: service)
         guard !service.isEmpty, !account.isEmpty else { throw KeychainBackendError(code: errSecParam) }
         let query = KeychainQuery.item(service: service, account: account)
         let updated = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
@@ -273,22 +316,20 @@ struct SecurityKeychainBackend: KeychainBackend {
     }
 
     func delete(service: String, account: String) throws {
-        try refuseTestHost()
+        try refuseTestHost(service: service)
         guard !service.isEmpty, !account.isEmpty else { throw KeychainBackendError(code: errSecParam) }
         let status = SecItemDelete(KeychainQuery.item(service: service, account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainBackendError(code: status) }
     }
 
-    private func refuseTestHost() throws {
+    private func refuseTestHost(service: String) throws {
+        if let testService {
+            guard service == testService else { throw KeychainBackendError(code: errSecParam) }
+            return
+        }
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             throw KeychainBackendError(code: errSecInteractionNotAllowed)
         }
-    }
-
-    private static func rows(_ item: CFTypeRef?) -> [[String: Any]] {
-        if let many = item as? [[String: Any]] { return many }
-        if let one = item as? [String: Any] { return [one] }
-        return []
     }
 }
 
@@ -304,6 +345,7 @@ struct KeychainOSLog: KeychainLogging {
 }
 
 private struct VaultMemory: Sendable {
+    var unverifiedMigration: Data?
     var loaded = false
     var unreadable = false
     var loggedDecodeFailure = false

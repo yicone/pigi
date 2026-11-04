@@ -13,14 +13,14 @@ final class KeychainVaultTests: XCTestCase {
         "orphan-sentinel-813", "orphan-user-sentinel-813", "translation-sentinel-813",
     ]
 
-    func testLoadQueryIsLimitedToOneService() {
+    func testLoadQueryIsLimitedToOneService() throws {
         let query = KeychainQuery.loadAll(service: "one.yic.pigi")
         XCTAssertEqual(query[kSecAttrService as String] as? String, "one.yic.pigi")
         XCTAssertEqual(query[kSecClass as String] as? String, kSecClassGenericPassword as String)
         XCTAssertEqual(query[kSecMatchLimit as String] as? String, kSecMatchLimitAll as String)
-        XCTAssertEqual(query[kSecReturnData as String] as? Bool, true)
+        XCTAssertNil(query[kSecReturnData as String])
         XCTAssertEqual(query[kSecReturnAttributes as String] as? Bool, true)
-        XCTAssertEqual(query.count, 5)
+        XCTAssertEqual(query.count, 4)
         XCTAssertNil(query[kSecMatchSearchList as String])
         XCTAssertNil(query[kSecAttrAccessGroup as String])
         let item = KeychainQuery.item(service: "one.yic.pigi", account: KeychainQuery.vaultAccount)
@@ -41,15 +41,15 @@ final class KeychainVaultTests: XCTestCase {
             "translation-api-key": Data(translationSecret.utf8),
         ])
         let vault = makeVault(backend, log)
-        vault.warmSync()
+        try vault.warmSync()
         for _ in 0..<12 {
-            XCTAssertEqual(vault.read("gmail-refresh-a@example.test"), gmailSecret)
-            XCTAssertEqual(vault.read("imap-b@example.test"), imapSecret)
-            XCTAssertEqual(vault.read("proton-session-c@example.test"), protonSecret)
-            XCTAssertEqual(vault.read("translation-api-key"), translationSecret)
+            XCTAssertEqual(try vault.read("gmail-refresh-a@example.test"), gmailSecret)
+            XCTAssertEqual(try vault.read("imap-b@example.test"), imapSecret)
+            XCTAssertEqual(try vault.read("proton-session-c@example.test"), protonSecret)
+            XCTAssertEqual(try vault.read("translation-api-key"), translationSecret)
         }
-        XCTAssertNil(vault.read("proton-session"))
-        XCTAssertNil(vault.read("proton-session-not-an-email"))
+        XCTAssertNil(try vault.read("proton-session"))
+        XCTAssertNil(try vault.read("proton-session-not-an-email"))
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
         XCTAssertEqual(backend.loadCalls, 1)
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
@@ -80,8 +80,8 @@ final class KeychainVaultTests: XCTestCase {
             "proton-session": Data(orphanSecret.utf8),
         ])
         let vault = makeVault(backend, CapturingKeychainLog())
-        vault.warmSync()
-        XCTAssertEqual(vault.read("gmail-refresh-a@example.test"), "current-gmail")
+        try vault.warmSync()
+        XCTAssertEqual(try vault.read("gmail-refresh-a@example.test"), "current-gmail")
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
         let stored = try json(backend)
@@ -100,9 +100,9 @@ final class KeychainVaultTests: XCTestCase {
         XCTAssertEqual(Set(backend.snapshot().keys), ["gmail-refresh-a@example.test", "proton-session"])
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
         XCTAssertTrue(vault.write("imap-b@example.test", imapSecret))
-        XCTAssertEqual(vault.read("gmail-refresh-a@example.test"), gmailSecret)
-        XCTAssertEqual(vault.read("imap-b@example.test"), imapSecret)
-        XCTAssertNil(vault.read("proton-session"))
+        XCTAssertEqual(try vault.read("gmail-refresh-a@example.test"), gmailSecret)
+        XCTAssertEqual(try vault.read("imap-b@example.test"), imapSecret)
+        XCTAssertNil(try vault.read("proton-session"))
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
         XCTAssertEqual(vault.startupCopyMatchingCount(), 2)
         let stored = try json(backend)
@@ -111,7 +111,7 @@ final class KeychainVaultTests: XCTestCase {
         assertLogsHideSecrets(log)
     }
 
-    func testFailedLegacyDeleteRetriesWithoutAnotherCopy() {
+    func testFailedLegacyDeleteRetriesWithoutAnotherCopy() throws {
         let backend = MemoryKeychainBackend()
         backend.seed([
             "gmail-refresh-a@example.test": Data(gmailSecret.utf8),
@@ -119,18 +119,18 @@ final class KeychainVaultTests: XCTestCase {
         ])
         backend.setFailDeletes(["proton-session"])
         let vault = makeVault(backend, CapturingKeychainLog())
-        vault.warmSync()
+        try vault.warmSync()
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1", "proton-session"])
-        XCTAssertEqual(vault.read("gmail-refresh-a@example.test"), gmailSecret)
+        XCTAssertEqual(try vault.read("gmail-refresh-a@example.test"), gmailSecret)
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
         backend.setFailDeletes([])
-        vault.warmSync()
+        try vault.warmSync()
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
         XCTAssertEqual(backend.loadCalls, 1)
     }
 
-    func testUnreadableVaultIsNotOverwritten() {
+    func testUnreadableVaultIsNotOverwritten() throws {
         let backend = MemoryKeychainBackend()
         let log = CapturingKeychainLog()
         backend.seed([
@@ -138,8 +138,8 @@ final class KeychainVaultTests: XCTestCase {
             "gmail-refresh-a@example.test": Data(gmailSecret.utf8),
         ])
         let vault = makeVault(backend, log)
-        XCTAssertNil(vault.read("gmail-refresh-a@example.test"))
-        XCTAssertNil(vault.read("gmail-refresh-a@example.test"))
+        XCTAssertThrowsError(try vault.read("gmail-refresh-a@example.test"))
+        XCTAssertThrowsError(try vault.read("gmail-refresh-a@example.test"))
         XCTAssertFalse(vault.write("gmail-refresh-a@example.test", "replacement"))
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1", "gmail-refresh-a@example.test"])
         XCTAssertEqual(backend.snapshot()["vault-v1"], Data("not-json".utf8))
@@ -153,18 +153,18 @@ final class KeychainVaultTests: XCTestCase {
         let vault = makeVault(backend, CapturingKeychainLog())
         XCTAssertTrue(vault.write("gmail-refresh-a@example.test", gmailSecret))
         XCTAssertTrue(vault.writeTranslationAPIKey(translationSecret))
-        XCTAssertEqual(vault.readTranslationAPIKey(), translationSecret)
+        XCTAssertEqual(try vault.readTranslationAPIKey(), translationSecret)
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
-        XCTAssertEqual(vault.read("gmail-refresh-a@example.test"), gmailSecret)
+        XCTAssertEqual(try vault.read("gmail-refresh-a@example.test"), gmailSecret)
         let stored = try json(backend)
         XCTAssertEqual(stored["translationAPIKey"] as? String, translationSecret)
         XCTAssertTrue(vault.writeTranslationAPIKey(""))
-        XCTAssertNil(vault.readTranslationAPIKey())
+        XCTAssertNil(try vault.readTranslationAPIKey())
         XCTAssertTrue(try json(backend)["translationAPIKey"] is NSNull)
         XCTAssertFalse(vault.write("imap-missing@example.test", ""))
     }
 
-    func testStartupSyncReadsOnce() {
+    func testStartupSyncReadsOnce() throws {
         let backend = MemoryKeychainBackend()
         backend.seed([
             "gmail-refresh-a@example.test": Data(gmailSecret.utf8),
@@ -172,19 +172,19 @@ final class KeychainVaultTests: XCTestCase {
             "proton-session-c@example.test": Data(protonSecret.utf8),
         ])
         let vault = makeVault(backend, CapturingKeychainLog())
-        vault.warmSync()
+        try vault.warmSync()
         for email in ["a@example.test", "b@example.test", "c@example.test"] {
             for _ in 0..<8 {
-                _ = vault.read("gmail-refresh-\(email)")
-                _ = vault.read("imap-\(email)")
-                _ = vault.read("proton-session-\(email)")
+                _ = try vault.read("gmail-refresh-\(email)")
+                _ = try vault.read("imap-\(email)")
+                _ = try vault.read("proton-session-\(email)")
             }
         }
         XCTAssertEqual(backend.loadCalls, 1)
         XCTAssertEqual(vault.startupCopyMatchingCount(), 1)
     }
 
-    func testConcurrentProtonWritesKeepEveryAccount() async {
+    func testConcurrentProtonWritesKeepEveryAccount() async throws {
         let backend = MemoryKeychainBackend()
         let vault = makeVault(backend, CapturingKeychainLog())
         XCTAssertTrue(vault.write("gmail-refresh-keep@example.test", gmailSecret))
@@ -200,26 +200,68 @@ final class KeychainVaultTests: XCTestCase {
             }
         }
         for index in 0..<count {
-            let saved = await vault.get("proton-session-user\(index)@example.test")
+            let saved = try await vault.get("proton-session-user\(index)@example.test")
             XCTAssertEqual(saved, "proton-sentinel-813-\(index)")
         }
-        let kept = await vault.get("gmail-refresh-keep@example.test")
+        let kept = try await vault.get("gmail-refresh-keep@example.test")
         XCTAssertEqual(kept, gmailSecret)
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
         XCTAssertEqual(backend.loadCalls, 1)
     }
 
-    func testConcurrentSynchronousWritesDoNotDropSessions() {
+    func testConcurrentSynchronousWritesDoNotDropSessions() throws {
         let backend = MemoryKeychainBackend()
         let vault = makeVault(backend, CapturingKeychainLog())
         DispatchQueue.concurrentPerform(iterations: 24) { index in
             XCTAssertTrue(vault.write("proton-session-sync\(index)@example.test", "proton-sentinel-813-sync-\(index)"))
         }
         for index in 0..<24 {
-            XCTAssertEqual(vault.read("proton-session-sync\(index)@example.test"), "proton-sentinel-813-sync-\(index)")
+            XCTAssertEqual(try vault.read("proton-session-sync\(index)@example.test"), "proton-sentinel-813-sync-\(index)")
         }
         XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
         XCTAssertEqual(backend.loadCalls, 1)
+    }
+
+    func testReadFailureIsLoggedAndThrownWithoutCachingEmptyVault() throws {
+        let backend = MemoryKeychainBackend()
+        let log = CapturingKeychainLog()
+        backend.seed(["imap-test@example.test": Data("synthetic".utf8)])
+        backend.failLoads = true
+        let vault = makeVault(backend, log)
+        XCTAssertThrowsError(try vault.warmSync())
+        XCTAssertThrowsError(try vault.read("imap-test@example.test"))
+        XCTAssertFalse(log.snapshot().isEmpty)
+        XCTAssertEqual(backend.snapshot().count, 1)
+        backend.failLoads = false
+        XCTAssertEqual(try vault.read("imap-test@example.test"), "synthetic")
+    }
+
+    func testMigrationReadbackFailurePreservesLegacyUntilVerified() throws {
+        let backend = MemoryKeychainBackend()
+        backend.seed(["imap-test@example.test": Data("synthetic".utf8)])
+        backend.failReads = true
+        let vault = makeVault(backend, CapturingKeychainLog())
+        XCTAssertThrowsError(try vault.warmSync())
+        XCTAssertNotNil(backend.snapshot()["imap-test@example.test"])
+        XCTAssertThrowsError(try vault.warmSync())
+        XCTAssertNotNil(backend.snapshot()["imap-test@example.test"])
+        backend.failReads = false
+        try vault.warmSync()
+        XCTAssertEqual(try vault.read("imap-test@example.test"), "synthetic")
+        XCTAssertEqual(Set(backend.snapshot().keys), ["vault-v1"])
+    }
+
+    func testMigrationReadbackMismatchPreservesLegacy() throws {
+        let backend = MemoryKeychainBackend()
+        backend.seed(["imap-test@example.test": Data("synthetic".utf8)])
+        backend.mismatchReads = true
+        let vault = makeVault(backend, CapturingKeychainLog())
+        XCTAssertThrowsError(try vault.warmSync())
+        XCTAssertThrowsError(try vault.warmSync())
+        XCTAssertNotNil(backend.snapshot()["imap-test@example.test"])
+        backend.mismatchReads = false
+        try vault.warmSync()
+        XCTAssertEqual(try vault.read("imap-test@example.test"), "synthetic")
     }
 
     private func makeVault(_ backend: MemoryKeychainBackend, _ log: CapturingKeychainLog) -> KeychainVault {
@@ -253,6 +295,9 @@ private final class MemoryKeychainBackend: KeychainBackend, @unchecked Sendable 
     private var failUpserts = 0
     private var failDeletes: Set<String> = []
     private(set) var loadCalls = 0
+    var failLoads = false
+    var failReads = false
+    var mismatchReads = false
 
     func seed(_ items: [String: Data]) {
         lock.lock(); defer { lock.unlock() }
@@ -283,7 +328,15 @@ private final class MemoryKeychainBackend: KeychainBackend, @unchecked Sendable 
         lock.lock(); defer { lock.unlock() }
         services.insert(service)
         loadCalls += 1
+        if failLoads { throw KeychainBackendError(code: errSecAuthFailed) }
         return items.map { KeychainRecord(account: $0.key, data: $0.value) }
+    }
+
+    func read(service: String, account: String) throws -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        if failReads { throw KeychainBackendError(code: errSecAuthFailed) }
+        if mismatchReads { return Data("mismatch".utf8) }
+        return items[account]
     }
 
     func upsert(service: String, account: String, data: Data) throws {

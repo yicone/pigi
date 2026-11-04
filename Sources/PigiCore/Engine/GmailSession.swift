@@ -32,7 +32,7 @@ actor GmailSession {
 
     private func token(force: Bool = false) async throws -> String {
         if !force, let access, expires > Date() { return access }
-        guard let refresh = Keychain.get(GmailStore.keychainKey(email)), !refresh.isEmpty else { throw GmailRevoked() }
+        guard let refresh = try Keychain.get(GmailStore.keychainKey(email)), !refresh.isEmpty else { throw GmailRevoked() }
         do {
             let fresh = try await GmailAuth.refresh(refresh)
             access = fresh.accessToken

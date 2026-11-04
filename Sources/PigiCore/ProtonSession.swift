@@ -94,7 +94,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
     }
 
     static func fromKeychain(_ email: String) throws -> ProtonSession {
-        guard let json = Keychain.get(key(email)), let secret = try? JSONDecoder().decode(Secret.self, from: Data(json.utf8)),
+        guard let json = try Keychain.get(key(email)), let secret = try? JSONDecoder().decode(Secret.self, from: Data(json.utf8)),
               secret.email.lowercased() == email else { throw ProtonHelperError.credentials }
         let session = ProtonSession(client: try ProtonHelperClient.bundled(), email: email)
         session.initialSecret = secret

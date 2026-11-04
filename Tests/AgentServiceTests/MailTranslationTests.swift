@@ -24,6 +24,33 @@ private actor FakeMailTranslator: MailTextTranslator {
 }
 
 final class MailTranslationTests: XCTestCase {
+    func testChineseInlineNodesNeverReachTranslatorInEnglishParagraph() async throws {
+        let chinese = "这是一封中文邮件，请查看附件并回复，谢谢。"
+        let traditional = "這是一封中文郵件，請查看附件並回覆，謝謝。"
+        let body = "<p>Please read the following notice <span>\(chinese)</span> and reply to this message today.</p><p>\(traditional)</p>"
+        let fake = FakeMailTranslator()
+        let output = try await MailTranslationPipeline().translate(body: body, isHTML: true, using: fake)
+        let sent = try await fake.items().flatMap { $0 }.map(\.t).joined()
+        XCTAssertTrue(sent.contains("Please read"))
+        XCTAssertTrue(sent.contains("and reply"))
+        XCTAssertFalse(sent.contains(chinese))
+        XCTAssertFalse(sent.contains(traditional))
+        let doc = try XMLDocument(xmlString: output)
+        XCTAssertEqual(try doc.nodes(forXPath: "//span").first?.stringValue, chinese)
+    }
+
+    func testChineseOnlyHTMLAndPlainTextMakeNoRequests() async throws {
+        for isHTML in [true, false] {
+            let fake = FakeMailTranslator { _ in XCTFail("Chinese must not be sent"); return [] }
+            let text = "这是一封中文邮件，请查看附件并回复，谢谢。"
+            let body = isHTML ? "<p>\(text)</p>" : text
+            let output = try await MailTranslationPipeline().translate(body: body, isHTML: isHTML, using: fake)
+            XCTAssertEqual(output, body)
+            let requests = await fake.requests
+            XCTAssertTrue(requests.isEmpty)
+        }
+    }
+
     func testInlineSentenceAndDOMEscaping() async throws {
         let fake = FakeMailTranslator { items in
             items.map { TranslationItem(i: $0.i, t: $0.t

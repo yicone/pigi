@@ -113,7 +113,9 @@ private final class TranslationDocument {
                     let slot = slots.count
                     slots.append(Slot(node: node, original: text))
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty && !TranslationLanguage.shouldTranslate(text) && !TranslationLanguage.isPrimarilyChinese(text) {
+                    // A protected node must never be reintroduced when adjacent
+                    // English makes the combined paragraph translatable.
+                    if !trimmed.isEmpty && !TranslationLanguage.shouldTranslate(text) {
                         flush()
                     } else { pending.append(Piece(slot: slot, text: text)) }
                 } else { for child in node.children ?? [] { visit(child) } }

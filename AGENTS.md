@@ -22,10 +22,12 @@ pigi 的个人 fork（macOS 原生邮件客户端），仅供仓库主人自用�
 
 ## 签名
 - `project.yml` 默认 ad-hoc 签名，保持不改，方便其他环境编译。
-- 本机登录钥匙串里有一张自签代码签名证书 “Pigi Local Signing”，仅用于让本机多次重编译保持同一签名身份，这样钥匙串对 `one.yic.pigi` 的“始终允许”只需点一次。`tools/build-debug.sh` 与 `release.sh`（未设置 `PIGI_SIGNING_IDENTITY` 时）会自动使用它。
-- 首次授权：换成新签名后第一次运行，系统会弹窗询问 pigi 能否访问钥匙串条目，由用户本人点“始终允许”（需要时输入登录密码）。代理不得代点、不得索要或记录密码。
-- 换机器需要重新创建该证书（openssl 生成后 `security import` 到登录钥匙串，允许 `/usr/bin/codesign` 使用私钥；私钥与 p12 临时文件用后删除，不进仓库）。
-- 没有该证书时自动退回 ad-hoc，每次重编译后钥匙串都会重新要求授权。
+- Debug（`tools/build-debug.sh`）优先用登录钥匙串里有效的 Apple Development 证书（`security find-identity -v -p codesigning`），并确认证书 OU 里有 Team ID。身份名括号中的 10 位字符不一定等于这个 Team ID；以 `codesign -dvv` 的 `TeamIdentifier` 为准。app 与 Proton helper 使用同一身份。同一张证书下重编译时，系统按团队身份记住钥匙串授权，通常不必再点“始终允许”。
+- 找不到这类证书时，脚本会明确提示并退回自签 “Pigi Local Signing”。该证书没有 Team ID，macOS 按 cdhash 记授权，重编译后仍会弹窗。连这张自签证书也没有时，再退回 ad-hoc，并说明每次重编译都要重新授权。
+- `release.sh` 在未设置 `PIGI_SIGNING_IDENTITY` 时仍默认 “Pigi Local Signing”（仅自用，不可公证）。Release 要用别的身份时，显式设置 `PIGI_SIGNING_IDENTITY`（以及需要时的 `PIGI_DEVELOPMENT_TEAM`）。
+- 证书续期、更换签名身份，或第一次改用 Apple Development 之后，要由用户本人再点一轮“始终允许”（需要时输入登录密码）。代理不得代点、不得索要或记录密码。续期在 Apple Developer 更新 Apple Development 证书并装入登录钥匙串，允许 `/usr/bin/codesign` 使用对应私钥；私钥与 p12 不进仓库。
+- 换机器：安装同一 Team 的 Apple Development 证书。若只能自签，再创建 “Pigi Local Signing”（openssl 生成后 `security import` 到登录钥匙串，允许 `/usr/bin/codesign` 使用私钥；临时私钥与 p12 用后删除，不进仓库）。
+- 钥匙串条目合并为单条 `vault-v1` 由 ACM-813 负责。本脚本只选择签名身份，不创建、不修改、不删除钥匙串条目。签名切换后的首次“始终允许”可以和 ACM-813 迁移弹窗放在同一次用户操作里：若迁移还没跑过，先换好 Debug 签名，再让用户点授权，避免按旧 cdhash 授权后又因换证再弹一轮。
 
 ## 凭据
 邮箱账号、令牌、密码等一律不进仓库、提交信息、PR/Issue 评论与聊天记录。

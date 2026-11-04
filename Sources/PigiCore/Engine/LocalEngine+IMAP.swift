@@ -9,7 +9,7 @@ extension LocalEngine {
         let connection = ImapConnection(host: host, port: port)
         try await connection.open()
         do {
-            try await connection.login(user: email, password: Keychain.get("imap-\(email)") ?? "")
+            try await connection.login(user: email, password: try Keychain.get("imap-\(email)") ?? "")
         } catch {
             connection.close()
             throw error

@@ -12,8 +12,8 @@ extension LocalEngine {
             // Reauthentication keeps the cursor and mail. A completed new login
             // replaces only this account's secret, after identity is known.
             let previous = protonSessions[email] as? ProtonSession
+            let previousSecret = try Keychain.get(ProtonSession.key(email))
             previous?.deactivate()
-            let previousSecret = Keychain.get(ProtonSession.key(email))
             do {
                 try db().transaction {
                     try db().run("INSERT OR IGNORE INTO accounts(email,added_at,kind) VALUES(?,?,'proton')", [.text(email), .int(now())])

@@ -1,7 +1,7 @@
 import Foundation
 
-/// Which Gmail accounts are signed in. Emails live in UserDefaults, refresh
-/// tokens in the Keychain.
+/// Which Gmail accounts are signed in. Emails live in UserDefaults.
+/// Refresh tokens live in the shared `vault-v1` keychain item.
 public enum GmailStore {
     private static let defaultsKey = "gmailAccounts"
 

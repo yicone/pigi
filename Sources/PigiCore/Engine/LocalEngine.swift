@@ -80,6 +80,8 @@ public actor LocalEngine {
 
     public func start() {
         guard loop == nil else { return }
+        // One keychain read before per-account sync, so startup does not prompt once per mailbox.
+        Keychain.warm()
         try? ensureGmailAccounts()
         loop = Task { await runLoop() }
     }

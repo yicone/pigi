@@ -2,6 +2,7 @@ import Foundation
 
 // Never access the user's login keychain in this executable.
 enum Keychain {
+    static func warm() {}
     static func get(_ key: String) -> String? { nil }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool { true }
 }

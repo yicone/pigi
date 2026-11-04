@@ -9,6 +9,7 @@ enum MailCache {
     static func clear() {}
 }
 enum Keychain {
+    static func warm() {}
     static func get(_ key: String) -> String? { "fixture-token" }
     static func set(_ key: String, _ value: String) -> Bool { true }
 }

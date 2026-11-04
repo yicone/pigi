@@ -12,6 +12,7 @@ enum MailCache {
 enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
+    static func warm() {}
     static func get(_ key: String) -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
         lock.lock(); defer { lock.unlock() }

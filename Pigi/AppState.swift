@@ -63,6 +63,8 @@ final class AppState {
     /// erase a failed credential save. A successful account update clears it.
     var credentialError: String?
     private(set) var serverCredentialError: String?
+    /// Mailboxes that currently cannot reach their server; retried on the next poll.
+    private(set) var networkErrorSummary: String?
     var displayedCredentialError: String? { credentialError ?? serverCredentialError }
     var sidebarError: String? { displayedCredentialError ?? syncError }
     var isRefreshing = false
@@ -320,9 +322,23 @@ final class AppState {
     }
 
     func updateCredentialErrors(from accounts: [ArchiveAccount]) {
-        let messages = [CredentialPersistenceError.writeFailed.localizedDescription,
-                        CredentialPersistenceError.recoveryFailed.localizedDescription]
-        serverCredentialError = accounts.compactMap(\.lastError).first { messages.contains($0) }
+        // Rows written before the kind column carry only the message; the
+        // credential-store texts still identify them.
+        let keychainMessages = [CredentialPersistenceError.writeFailed.localizedDescription,
+                                CredentialPersistenceError.recoveryFailed.localizedDescription,
+                                CredentialPersistenceError.readFailed.localizedDescription]
+        serverCredentialError = accounts.first {
+            $0.lastErrorKind == AccountErrorKind.keychain.rawValue
+                || ($0.lastErrorKind == nil && keychainMessages.contains($0.lastError ?? ""))
+        }?.lastError
+        let offline = accounts.filter { $0.lastErrorKind == AccountErrorKind.network.rawValue }
+        if offline.isEmpty {
+            networkErrorSummary = nil
+        } else if offline.allSatisfy({ $0.kind == "proton" }) {
+            networkErrorSummary = "\(offline.count) 个 Proton 账号暂时无法连接，将自动重试"
+        } else {
+            networkErrorSummary = "\(offline.count) 个邮箱暂时无法连接，将自动重试"
+        }
     }
 
     func addProtonAccount(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {

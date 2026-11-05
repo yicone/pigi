@@ -100,11 +100,24 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
     }
 
     static func fromKeychain(_ email: String) throws -> ProtonSession {
-        guard let json = try Keychain.get(key(email)), let secret = try? JSONDecoder().decode(Secret.self, from: Data(json.utf8)),
-              secret.email.lowercased() == email else { throw ProtonHelperError.credentials }
+        let json: String?
+        do { json = try Keychain.get(key(email)) }
+        catch { throw CredentialPersistenceError.readFailed }
+        guard let json, let secret = try? JSONDecoder().decode(Secret.self, from: Data(json.utf8)),
+              secret.email.lowercased() == email else { throw ProtonHelperError.sessionMissing }
         let session = ProtonSession(client: try ProtonHelperClient.bundled(), email: email)
         session.initialSecret = secret
         return session
+    }
+
+    /// The compensating save after a failed call may itself fail. Only a
+    /// Keychain-side failure means credentials could not be recovered; a
+    /// helper/network failure must rethrow the original error instead.
+    private func recoverSecret(_ error: Error) async throws -> Never {
+        do { try await saveSecret() }
+        catch is CredentialPersistenceError { throw CredentialPersistenceError.recoveryFailed }
+        catch {}
+        throw error
     }
 
     func resume() async throws {
@@ -117,9 +130,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
             try await saveSecret()
         } catch {
             // A refresh may precede a failed network/key request. Preserve it.
-            do { try await saveSecret() }
-            catch { throw CredentialPersistenceError.recoveryFailed }
-            throw error
+            try await recoverSecret(error)
         }
     }
 
@@ -142,9 +153,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
             try await saveSecret()
             return result
         } catch {
-            do { try await saveSecret() }
-            catch { throw CredentialPersistenceError.recoveryFailed }
-            throw error
+            try await recoverSecret(error)
         }
     }
     func latest() async throws -> String {
@@ -177,6 +186,7 @@ extension ProtonHelperError: LocalizedError {
         case .invalidParams: "验证未完成或输入格式不正确，请重试"
         case .credentials: "账号、密码或验证码不正确，请检查后重试"
         case .notAuthenticated: "Proton 会话失效，请重新登录"
+        case .sessionMissing: "未找到已保存会话或会话已失效，请重新登录"
         case .cleanupFailed: "临时登录会话清理未完成，请稍后重试"
         case .humanVerificationRequired: "此验证方式暂不支持，请重新开始登录"
         case .loginExpired: "验证已超时，请重新开始登录"
@@ -188,7 +198,7 @@ extension ProtonHelperError: LocalizedError {
         case .keyDecryption: "Proton 邮件解密失败，密钥可能已轮换，请重新登录"
         case .apiVersion: "Proton 已拒绝当前 API 版本，请更新应用"
         case .proxy: "代理需要认证，请检查系统代理设置"
-        case .network: "无法连接 Proton，请检查网络与系统代理后重试"
+        case .network: "无法连接 Proton，请检查网络后重试"
         case .timeout: "Proton 请求超时，请稍后重试"
         case .rateLimited: "Proton 请求过于频繁，请至少等待两分钟后重试"
         default: "Proton 操作失败（\(rawValue)）"

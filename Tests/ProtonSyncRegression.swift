@@ -13,9 +13,16 @@ enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
     private static var rejectingWrites = false
+    private static var failingReads = false
+    struct FixtureReadError: Error {}
     static func rejectWrites(_ reject: Bool) { lock.lock(); defer { lock.unlock() }; rejectingWrites = reject }
+    static func failReads(_ fail: Bool) { lock.lock(); defer { lock.unlock() }; failingReads = fail }
     static func warm() throws {}
-    static func get(_ key: String) throws -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
+    static func get(_ key: String) throws -> String? {
+        lock.lock(); defer { lock.unlock() }
+        if failingReads { throw FixtureReadError() }
+        return values[key]
+    }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard !rejectingWrites else { return false }
@@ -78,6 +85,13 @@ extension LocalEngine {
         try db().run("INSERT OR IGNORE INTO accounts(email,kind) VALUES(?,'proton')", [.text(email)])
         protonSessions[email] = remote
     }
+    func fixtureAccount(_ email: String) throws {
+        if store == nil {
+            store = try Store(path: ":memory:")
+            for statement in Self.schema { try store!.run(statement) }
+        }
+        try db().run("INSERT OR IGNORE INTO accounts(email,kind) VALUES(?,'proton')", [.text(email)])
+    }
     func inspect(_ sql: String) throws -> [SQLRow] { try db().query(sql) }
     func cursor(_ email: String) throws -> String? { try account(email)?["history_id"]?.text }
     func offset(_ email: String) throws -> String? { try account(email)?["page_token"]?.text }
@@ -105,6 +119,8 @@ extension LocalEngine {
         #else
         try await credentialFailureCases()
         try await eventRecoveryCases()
+        try await timeoutRecoveryCases()
+        try await errorKindCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
         await remote.put("one", signature: "verified")
@@ -266,6 +282,200 @@ extension LocalEngine {
         #endif
     }
 
+    // A server-side timeout fault is a bounded call failure, not a keychain
+    // problem: the compensating secret export must not report recoveryFailed,
+    // and the helper process stays usable for the next call.
+    static func timeoutRecoveryCases() async throws {
+        let email = "fixture@example.test"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-timeout-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func fixture(_ name: String, _ source: String) throws -> URL {
+            let url = root.appendingPathComponent(name)
+            try ("#!/usr/bin/python3\nimport json,sys\n" + source).write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            return url
+        }
+        // session reports not_authenticated after the helper restart that a
+        // network failure used to cause; every sync method times out.
+        let offline = try fixture("helper-offline", """
+        for line in sys.stdin:
+            r=json.loads(line)
+            if r['method']=='hello':
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session','resume','latest','labels','snapshot','metadata','events']}
+            elif r['method']=='session':
+                print(json.dumps({'version':1,'id':r['id'],'error':{'code':'not_authenticated'}}),flush=True)
+                continue
+            elif r['method'] in ('resume','latest','labels'):
+                print(json.dumps({'version':1,'id':r['id'],'error':{'code':'timeout'}}),flush=True)
+                continue
+            else:
+                result={'logged_out':True}
+            print(json.dumps({'version':1,'id':r['id'],'result':result}),flush=True)
+        """)
+        let client = ProtonHelperClient(executable: offline)
+        let session = ProtonSession(client: client, email: email,
+                                    initialSecret: .init(uid: "synthetic", access: "synthetic", refresh: "synthetic", salted: "synthetic", email: email))
+        do { try await session.resume(); fatalError("timeout hidden") }
+        catch { precondition(error as? ProtonHelperError == .timeout, "resume: expected .timeout, got \(error)") }
+        do { _ = try await session.latest(); fatalError("timeout hidden") }
+        catch { precondition(error as? ProtonHelperError == .timeout, "latest: expected .timeout, got \(error)") }
+        let engine = LocalEngine()
+        try await engine.fixture(email, remote: session)
+        let delay = await engine.syncProton(email)
+        let account = try await engine.inspect("SELECT * FROM accounts WHERE email='\(email)'").first
+        precondition(delay == 120, "timeout sync must retry later")
+        precondition(account?["last_error"]?.text == ProtonHelperError.timeout.localizedDescription,
+                     "sync error: \(account?["last_error"]?.text ?? "nil")")
+        precondition(account?["last_error_kind"]?.text == AccountErrorKind.network.rawValue,
+                     "sync error kind: \(account?["last_error_kind"]?.text ?? "nil")")
+        let listed = try await engine.accounts()
+        let state = AppState()
+        state.updateCredentialErrors(from: listed)
+        precondition(listed.first?.lastErrorKind == AccountErrorKind.network.rawValue)
+        precondition(state.serverCredentialError == nil && state.displayedCredentialError == nil,
+                     "a network timeout must not raise the credential banner")
+        precondition(state.networkErrorSummary == "1 个 Proton 账号暂时无法连接，将自动重试",
+                     "summary: \(state.networkErrorSummary ?? "nil")")
+        print("PASS: helper timeout surfaces as a retryable network error, never a credential failure")
+
+        // A timeout fault frame leaves the helper alive: no restart, and the
+        // next call succeeds on the same process.
+        let hellos = root.appendingPathComponent("hellos.log")
+        let kept = try fixture("helper-kept", """
+        for line in sys.stdin:
+            r=json.loads(line)
+            if r['method']=='hello':
+                open('\(hellos.path)','a').write('hello\\n')
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session','labels']}
+            elif r['method']=='labels':
+                print(json.dumps({'version':1,'id':r['id'],'error':{'code':'timeout'}}),flush=True)
+                continue
+            elif r['method']=='session':
+                result={'uid':'synthetic','access':'synthetic','refresh':'synthetic','salted':'synthetic','email':'\(email)'}
+            else:
+                result={'logged_out':True}
+            print(json.dumps({'version':1,'id':r['id'],'result':result}),flush=True)
+        """)
+        let keptClient = ProtonHelperClient(executable: kept)
+        let keptSession = ProtonSession(client: keptClient, email: email)
+        do { let _: [ProtonLabel] = try await keptClient.syncRequest("labels", ProtonSession.Empty()); fatalError("timeout hidden") }
+        catch { precondition(error as? ProtonHelperError == .timeout, "labels: expected .timeout, got \(error)") }
+        try await keptSession.saveSecret()
+        let saved = try Keychain.get(ProtonSession.key(email))
+        precondition(saved?.contains("synthetic") == true, "session export after timeout failed")
+        let log = (try? String(contentsOf: hellos, encoding: .utf8)) ?? ""
+        precondition(log.split(separator: "\n").count == 1, "helper restarted after a timeout fault: \(log)")
+        print("PASS: a timeout fault frame keeps the helper process and session usable")
+    }
+
+    // Stored sync failures carry a kind so a temporary outage never looks like
+    // a credential problem, and old databases gain the column with a backfill.
+    static func errorKindCases() async throws {
+        // A missing or undecodable stored session is an auth hint, not a banner.
+        let missingEngine = LocalEngine()
+        try await missingEngine.fixtureAccount("missing@example.test")
+        do { _ = try ProtonSession.fromKeychain("missing@example.test"); fatalError("missing session hidden") }
+        catch { precondition(error as? ProtonHelperError == .sessionMissing, "fromKeychain: expected .sessionMissing, got \(error)") }
+        precondition(ProtonHelperError.sessionMissing.kind == .auth)
+        let missingDelay = await missingEngine.syncProton("missing@example.test")
+        let missingRow = try await missingEngine.inspect("SELECT last_error,last_error_kind FROM accounts WHERE email='missing@example.test'").first
+        precondition(missingDelay == 120)
+        precondition(missingRow?["last_error"]?.text == ProtonHelperError.sessionMissing.localizedDescription)
+        precondition(missingRow?["last_error_kind"]?.text == AccountErrorKind.auth.rawValue)
+        let missingState = AppState()
+        missingState.updateCredentialErrors(from: try await missingEngine.accounts())
+        precondition(missingState.serverCredentialError == nil && missingState.displayedCredentialError == nil)
+        precondition(missingState.networkErrorSummary == nil)
+        print("PASS: a missing stored session asks for re-login without the credential banner")
+
+        // A keychain read failure is a credential failure: red banner, kind keychain.
+        Keychain.failReads(true)
+        defer { Keychain.failReads(false) }
+        do { _ = try ProtonSession.fromKeychain("read@example.test"); fatalError("read failure hidden") }
+        catch { precondition(error as? CredentialPersistenceError == .readFailed, "fromKeychain: expected .readFailed, got \(error)") }
+        let readEngine = LocalEngine()
+        try await readEngine.fixtureAccount("read@example.test")
+        let readDelay = await readEngine.syncProton("read@example.test")
+        let readRow = try await readEngine.inspect("SELECT last_error,last_error_kind FROM accounts WHERE email='read@example.test'").first
+        precondition(readDelay == 120)
+        precondition(readRow?["last_error"]?.text == CredentialPersistenceError.readFailed.localizedDescription)
+        precondition(readRow?["last_error_kind"]?.text == AccountErrorKind.keychain.rawValue)
+        let readState = AppState()
+        readState.updateCredentialErrors(from: try await readEngine.accounts())
+        precondition(readState.serverCredentialError == CredentialPersistenceError.readFailed.localizedDescription)
+        precondition(readState.displayedCredentialError == CredentialPersistenceError.readFailed.localizedDescription)
+        precondition(readState.networkErrorSummary == nil)
+        print("PASS: a keychain read failure raises the credential banner as kind keychain")
+
+        let offlineProton = ArchiveAccount(email: "p@e.test", backfillDone: 1, total: 0, lastSync: nil,
+                                         lastError: ProtonHelperError.timeout.localizedDescription, stored: 0, kind: "proton",
+                                         lastErrorKind: AccountErrorKind.network.rawValue)
+        let offlineIMAP = ArchiveAccount(email: "i@e.test", backfillDone: 1, total: 0, lastSync: nil,
+                                       lastError: "连接超时", stored: 0, kind: "imap",
+                                       lastErrorKind: AccountErrorKind.network.rawValue)
+        let mixed = AppState()
+        mixed.updateCredentialErrors(from: [offlineProton, offlineIMAP])
+        precondition(mixed.networkErrorSummary == "2 个邮箱暂时无法连接，将自动重试")
+        precondition(mixed.displayedCredentialError == nil)
+        let cleared = AppState()
+        cleared.updateCredentialErrors(from: [])
+        precondition(cleared.networkErrorSummary == nil && cleared.displayedCredentialError == nil)
+        // Rows written before the kind column still match by message.
+        let legacy = AppState()
+        legacy.updateCredentialErrors(from: [ArchiveAccount(email: "old@e.test", backfillDone: 1, total: 0, lastSync: nil,
+                                                          lastError: CredentialPersistenceError.recoveryFailed.localizedDescription,
+                                                          stored: 0, kind: "proton")])
+        precondition(legacy.displayedCredentialError == CredentialPersistenceError.recoveryFailed.localizedDescription)
+        print("PASS: offline summary counts mailboxes and legacy rows still raise the banner")
+
+        // Databases from before the kind column gain it and a classified backfill.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pigi-migration-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try Store(path: root.appendingPathComponent("mail.db").path)
+        try store.run("""
+            CREATE TABLE accounts(
+              email TEXT PRIMARY KEY, history_id TEXT, page_token TEXT, backfill_done INTEGER DEFAULT 0,
+              total INTEGER DEFAULT 0, last_sync INTEGER, last_error TEXT, added_at INTEGER,
+              kind TEXT DEFAULT 'gmail', imap_host TEXT, imap_port INTEGER)
+            """)
+        let legacyRows: [(String, String?, String?)] = [
+            ("w@e.test", CredentialPersistenceError.writeFailed.localizedDescription, AccountErrorKind.keychain.rawValue),
+            ("r@e.test", CredentialPersistenceError.recoveryFailed.localizedDescription, AccountErrorKind.keychain.rawValue),
+            ("n1@e.test", "无法连接 Proton，请检查网络与系统代理后重试", AccountErrorKind.network.rawValue),
+            ("n2@e.test", ProtonHelperError.timeout.localizedDescription, AccountErrorKind.network.rawValue),
+            ("n3@e.test", "Proton 同步未完成，将重试", AccountErrorKind.network.rawValue),
+            ("n4@e.test", ProtonHelperError.proxy.localizedDescription, AccountErrorKind.network.rawValue),
+            ("n5@e.test", ProtonHelperError.rateLimited.localizedDescription, AccountErrorKind.network.rawValue),
+            ("a1@e.test", ProtonHelperError.notAuthenticated.localizedDescription, AccountErrorKind.auth.rawValue),
+            ("a2@e.test", ProtonHelperError.credentials.localizedDescription, AccountErrorKind.auth.rawValue),
+            ("a3@e.test", ProtonHelperError.sessionMissing.localizedDescription, AccountErrorKind.auth.rawValue),
+            ("o@e.test", ProtonHelperError.upstream.localizedDescription, AccountErrorKind.other.rawValue),
+            ("g@e.test", GmailRevoked().errorDescription, AccountErrorKind.other.rawValue),
+            ("ok@e.test", nil, nil),
+        ]
+        for (email, message, _) in legacyRows {
+            try store.run("INSERT INTO accounts(email,last_error) VALUES(?,?)", [.text(email), .opt(message)])
+        }
+        try LocalEngine.migrate(store)
+        let info = try store.query("PRAGMA table_info(accounts)")
+        precondition(info.contains { $0["name"]?.text == "last_error_kind" }, "column not added")
+        func kind(_ store: Store, _ email: String) throws -> String? {
+            try store.query("SELECT last_error_kind FROM accounts WHERE email=?", [.text(email)]).first?["last_error_kind"]?.text
+        }
+        for (email, _, expected) in legacyRows {
+            let actual = try kind(store, email)
+            precondition(actual == expected, "\(email): \(actual ?? "nil") != \(expected ?? "nil")")
+        }
+        try LocalEngine.migrate(store)
+        for (email, _, expected) in legacyRows {
+            let actual = try kind(store, email)
+            precondition(actual == expected, "\(email): second migrate changed kind")
+        }
+        print("PASS: last_error_kind migration adds the column and backfills message-classified kinds idempotently")
+    }
+
     static func sessionPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -314,6 +524,8 @@ extension LocalEngine {
         let cached = await engine.protonSessions["fixture@example.test"]
         precondition(delay == 120 && cached == nil)
         precondition(account?.lastError == CredentialPersistenceError.recoveryFailed.localizedDescription)
+        precondition(account?.lastErrorKind == AccountErrorKind.keychain.rawValue,
+                     "recovery save failure must be classified keychain")
         let state = AppState()
         state.updateCredentialErrors(from: account.map { [$0] } ?? [])
         precondition(state.sidebarError == account?.lastError && state.displayedCredentialError == account?.lastError)

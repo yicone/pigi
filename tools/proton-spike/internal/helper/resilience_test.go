@@ -96,6 +96,55 @@ func TestOfflineTimeoutAndExplicitProxy(t *testing.T) {
 	}
 }
 
+// A timeout fault is a bounded call result: backend state (client, rings,
+// session) survives it, so the parent must be able to keep using the same
+// helper process instead of restarting it.
+func TestTimeoutLeavesSessionCallable(t *testing.T) {
+	manager := proton.New(proton.WithHostURL("http://127.0.0.1:1"), proton.WithRetryCount(0), proton.WithLogger(quietLogger{}))
+	b := &ProtonBackend{manager: manager, client: manager.NewClient("f", "f", "f"), rings: map[string]*crypto.KeyRing{},
+		session: savedSession{UID: "u", Access: "a", Refresh: "r", Salted: []byte("s"), Email: "fixture@example.test"}, persistent: true}
+	defer b.Close()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, fault := b.Call(ctx, "latest", json.RawMessage(`{}`)); fault == nil || fault.Code != "timeout" {
+		t.Fatalf("expected timeout, got %v", fault)
+	}
+	result, fault := b.Call(context.Background(), "session", json.RawMessage(`{}`))
+	if fault != nil {
+		t.Fatalf("session unusable after timeout: %v", fault)
+	}
+	if s, ok := result.(savedSession); !ok || s.Email != "fixture@example.test" {
+		t.Fatalf("session lost after timeout: %v", result)
+	}
+	if _, fault := b.Call(context.Background(), "latest", json.RawMessage(`{}`)); fault == nil || fault.Code != "network" {
+		t.Fatalf("call routing broken after timeout: %v", fault)
+	}
+}
+
+// A resume that times out inside reloadKeys keeps the API client but has no
+// keyrings: session stays answerable while key-dependent calls refuse. This
+// documents current semantics; do not change them silently.
+func TestResumeTimeoutKeepsClientWithoutKeys(t *testing.T) {
+	manager := proton.New(proton.WithHostURL("http://127.0.0.1:1"), proton.WithRetryCount(0), proton.WithLogger(quietLogger{}))
+	b := &ProtonBackend{manager: manager}
+	defer b.Close()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	params := json.RawMessage(`{"uid":"u","access":"a","refresh":"r","salted":"c2FsdGVk","email":"fixture@example.test"}`)
+	if _, fault := b.Call(ctx, "resume", params); fault == nil || fault.Code != "timeout" {
+		t.Fatalf("expected timeout, got %v", fault)
+	}
+	if b.client == nil || b.rings != nil {
+		t.Fatal("resume timeout changed client/ring state unexpectedly")
+	}
+	if _, fault := b.Call(context.Background(), "session", json.RawMessage(`{}`)); fault != nil {
+		t.Fatalf("session unusable after resume timeout: %v", fault)
+	}
+	if _, fault := b.Call(context.Background(), "labels", json.RawMessage(`{}`)); fault == nil || fault.Code != "not_authenticated" {
+		t.Fatalf("labels should refuse without keyrings, got %v", fault)
+	}
+}
+
 func TestFailedKeyRotationDisablesStaleKeys(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

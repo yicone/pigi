@@ -24,7 +24,29 @@ public enum ProtonHelperError: String, Error, Codable {
     case cleanupFailed = "cleanup_failed"
     case notFound = "not_found"
     case cursorExpired = "cursor_expired"
+    case sessionMissing = "session_missing"
     case unavailable, transport, protocolViolation = "protocol_violation"
+}
+
+/// Coarse bucket for a stored sync failure, so the UI can tell a temporary
+/// network outage from a credential problem without parsing the message.
+public enum AccountErrorKind: String {
+    case network, auth, keychain, other
+}
+
+extension ProtonHelperError {
+    public var kind: AccountErrorKind {
+        switch self {
+        case .network, .timeout, .proxy, .rateLimited, .unavailable, .transport:
+            return .network
+        case .credentials, .notAuthenticated, .sessionMissing, .loginExpired, .invalidParams,
+             .secondFactorRequired, .unsupportedFactor, .humanVerificationRequired,
+             .key, .keyMissing, .keyFormat, .keyDecryption:
+            return .auth
+        default:
+            return .other
+        }
+    }
 }
 
 public struct ProtonHelperInfo: Decodable, Sendable {
@@ -246,6 +268,7 @@ public final class ProtonHelperClient: @unchecked Sendable {
         let began = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
         defer { watchdog.cancel() }
+        var faultTimeout = false
         do {
             try input.write(contentsOf: data)
             var complete = false
@@ -274,15 +297,18 @@ public final class ProtonHelperClient: @unchecked Sendable {
                   (response.result != nil) != (response.error != nil) else { throw ProtonHelperError.protocolViolation }
             if let fault = response.error {
                 guard let code = ProtonHelperError(rawValue: fault.code) else { throw ProtonHelperError.protocolViolation }
+                if code == .timeout { faultTimeout = true }
                 throw code
             }
             guard let result = response.result else { throw ProtonHelperError.protocolViolation }
             return result
         } catch {
             // Any transport/protocol failure invalidates this session. Known
-            // operation faults leave it usable (e.g. logout can retry cleanup).
+            // operation faults leave it usable (e.g. logout can retry cleanup),
+            // including a well-formed timeout fault: the call was bounded
+            // server-side, the child did not stall or die.
             if let code = error as? ProtonHelperError,
-               ![.transport, .timeout, .protocolViolation, .frameTooLarge].contains(code) { throw code }
+               faultTimeout || ![.transport, .timeout, .protocolViolation, .frameTooLarge].contains(code) { throw code }
             stop()
             throw (error as? ProtonHelperError) ?? ProtonHelperError.protocolViolation
         }

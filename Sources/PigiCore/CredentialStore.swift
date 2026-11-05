@@ -4,11 +4,13 @@ import Foundation
 public enum CredentialPersistenceError: Error, LocalizedError, Equatable {
     case writeFailed
     case recoveryFailed
+    case readFailed
 
     public var errorDescription: String? {
         switch self {
         case .writeFailed: "钥匙串写入失败，凭据未保存，请检查钥匙串权限后重试"
         case .recoveryFailed: "凭据补存或恢复失败，会话可能未保存，请检查钥匙串权限后重新登录"
+        case .readFailed: "钥匙串读取失败，请检查钥匙串权限后重试"
         }
     }
 }

@@ -36,9 +36,21 @@ SwiftUI 界面 ── AppState ── ArchiveClient ── LocalEngine ─┬─
 
 调试构建设置环境变量 `PIGI_INSECURE_TLS=1` 可连接自签名证书的本地 IMAP 测试服务器(仅 DEBUG)。
 
-CI 与本地测试不得依赖、也不得写入真实 `~/Library/Application Support/pigi`（`mail.db`、`translations.db`、`mail-headers.json`、`agent.sock`）或 `~/Library/Containers`。会走到产品磁盘路径的回归二进制用 `-D PIGI_REGRESSION` 编译：进程若仍解析到真实用户目录，在创建文件前直接失败。`swift test` 同样拒绝这条默认路径。需要真的打开该目录时，用临时 `CFFIXED_USER_HOME` 与 `HOME`（见 `Tests/isolate-support.sh`），并在结束后核对真实 `translations.db` 及其 `-wal`/`-shm` 没有被新建或改写。
+CI 与本地测试不得依赖、也不得写入真实 `~/Library/Application Support/pigi`（`mail.db`、`translations.db`、`mail-headers.json`、`agent.sock`）或 `~/Library/Containers`。会走到产品磁盘路径的回归二进制用 `-D PIGI_REGRESSION` 编译：进程若仍解析到真实用户目录，在创建文件前直接失败。`swift test` 同样拒绝这条默认路径。需要真的打开该目录时，用临时 `CFFIXED_USER_HOME` 与 `HOME`（见 `Tests/isolate-support.sh`）。快照比较整个真实 `pigi` 目录（含父目录自己的 mtime）。正在运行的 pigi 会改 `mail.db-wal`，并用原子替换改 `mail-headers.json` 和父目录 mtime；自托管 runner 上的旧回归还会打开默认 `translations.db`。有这些写入者时，快照变化不能算测试污染已经排除。核对前先退出 pigi、停掉 runner，并用 `lsof` 确认该目录没有打开者。
 
-应用内「清空译文缓存」只删除库里的译文行，不删除文件。测试留下的空 `translations.db` 要在退出应用、并确认没有真实译文之后，由用户自行删除该文件及 `-wal`/`-shm`。测试脚本不代删。
+应用内「清空译文缓存」只删除库里的译文行，不删除文件。不要用 `mode=ro&immutable=1` 判断 `translations.db` 是否为空：`immutable=1` 不读 WAL，已提交在 WAL 里的译文会显示成 0 行。测试脚本不代删。仅在用户确认后，按下面的顺序清理；非空或查询失败都保留原文件。绝不删除 `mail.db`，绝不删除整个 `pigi` 目录。
+
+1. 退出 pigi，并确认没有进程打开 `translations.db`、`translations.db-wal`、`translations.db-shm`。
+2. 把这三个文件成组复制到一个空的临时目录。缺少的侧文件不要另造，也不要单独复制主库。
+3. 在副本上查询，让 SQLite 读同目录的 WAL。不要加 `immutable=1`，也不要执行 checkpoint：
+
+```sh
+sqlite3 "file:$COPY/translations.db?mode=ro" "PRAGMA query_only=ON; SELECT count(*) FROM translations;"
+```
+
+`mode=ro` 可能更新副本自己的 `-shm`。那只发生在副本目录里。
+4. 结果不是单独一个 `0`，或查询失败：停止，保留原文件。
+5. 结果是 `0` 且用户确认后，只删除原来的这三个文件。
 
 ## 目录
 

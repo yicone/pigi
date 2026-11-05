@@ -1,4 +1,5 @@
 import SwiftUI
+import PigiCore
 
 struct MailDetailView: View {
     @Environment(AppState.self) private var state
@@ -24,6 +25,7 @@ struct MailDetailContent: View {
     @AppStorage("loadRemoteImages") private var loadRemoteImages = true
     /// Per-mail choice from the menu; nil follows the setting.
     @State private var remoteOverride: Bool?
+    @State var translation = MailTranslationReader()
     private var allowRemoteContent: Bool { remoteOverride ?? loadRemoteImages }
     let mail: Mail
     var inset: CGFloat = 26
@@ -48,9 +50,18 @@ struct MailDetailContent: View {
                     .frame(height: 1)
                     .padding(.horizontal, inset)
                 VStack(spacing: 0) {
+                    if let error = translation.errorMessage {
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, inset)
+                            .padding(.vertical, 8)
+                            .accessibilityIdentifier("mail.translation.error")
+                    }
                     Group {
                         if mail.bodyLoaded {
-                            MailHTMLView(body: mail.body, isHTML: mail.isHTML, allowRemoteContent: allowRemoteContent,
+                            MailHTMLView(body: translation.showingTranslation ? (translation.translatedBody ?? mail.body) : mail.body,
+                                         isHTML: mail.isHTML, allowRemoteContent: allowRemoteContent,
                                          horizontalInset: inset)
                         } else {
                             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -62,6 +73,32 @@ struct MailDetailContent: View {
             .foregroundStyle(.primary)
             .background(Color(nsColor: .textBackgroundColor))
             .onChange(of: mail.id) { remoteOverride = nil }
+            .onChange(of: translationSource, initial: true) {
+                translation.reset()
+                translation.refreshConfiguration()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+                translation.refreshConfiguration()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: KeychainKeyStore.didChangeNotification)) { _ in
+                translation.reset()
+                translation.refreshConfiguration()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                translation.refreshConfiguration()
+            }
+            .onDisappear { translation.reset() }
+    }
+
+    private var translationSource: TranslationSource {
+        TranslationSource(id: mail.id, body: mail.body, isHTML: mail.isHTML, loaded: mail.bodyLoaded)
+    }
+
+    private struct TranslationSource: Equatable {
+        let id: String
+        let body: String
+        let isHTML: Bool
+        let loaded: Bool
     }
 
     /// Sender, addresses, date and subject; the panel also has a back button.
@@ -110,10 +147,20 @@ struct MailDetailContent: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    /// Copy-code and unsubscribe, each only when the engine found one in this mail.
+    /// Translation follows the service settings; mail-specific actions follow engine metadata.
     @ViewBuilder
     private func actions(_ mail: Mail) -> some View {
         HStack(spacing: 8) {
+            if translation.isAvailable {
+                if translation.isTranslating { ProgressView().controlSize(.small) }
+                GlassPill(title: translation.isTranslating ? "翻译中…" : (translation.showingTranslation ? "原文" : "翻译"),
+                          systemImage: "character.bubble") {
+                    translation.toggle(body: mail.body, isHTML: mail.isHTML)
+                }
+                .disabled(!mail.bodyLoaded || translation.isTranslating)
+                .accessibilityIdentifier("mail.translation.toggle")
+                .help(translation.showingTranslation ? "显示原文" : "使用已配置的服务翻译为简体中文")
+            }
             if mail.code != nil {
                 GlassPill(title: "复制验证码", systemImage: "doc.on.doc") { state.copyCode(mail) }
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))

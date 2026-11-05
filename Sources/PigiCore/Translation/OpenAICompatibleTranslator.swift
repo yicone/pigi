@@ -34,7 +34,7 @@ public struct TranslationOSLog: TranslationLogging {
 }
 
 /// Non-streaming OpenAI-compatible `/chat/completions` translator. No SSE.
-public struct OpenAICompatibleTranslator: SegmentTranslator {
+public struct OpenAICompatibleTranslator: SegmentTranslator, MailTextTranslator {
     private let config: TranslationConfig
     private let keyStore: any KeyStore
     private let transport: any HTTPTransport
@@ -97,6 +97,20 @@ public struct OpenAICompatibleTranslator: SegmentTranslator {
         }
         log.info("translation ok status=\(response.statusCode) segments=\(segments.count) ms=\(Int(Date().timeIntervalSince(started) * 1000))")
         return try Self.decodeSegments(from: data, matching: segments)
+    }
+
+    /// Adapt the document pipeline to the same configured HTTP client. Its
+    /// mandatory marker instructions supplement the user's translation prompt.
+    public func translate(_ request: TranslationRequest) async throws -> String {
+        let items = try JSONDecoder().decode([TranslationItem].self, from: Data(request.user.utf8))
+        var pipelineConfig = config
+        pipelineConfig.systemPrompt += "\n\n" + request.system
+        let client = OpenAICompatibleTranslator(
+            config: pipelineConfig, keyStore: keyStore, transport: transport, log: log)
+        let result = try await client.translate(items.map { TranslationSegment(id: $0.i, text: $0.t) })
+        return String(decoding: try JSONEncoder().encode(result.map {
+            TranslationItem(i: $0.id, t: $0.text)
+        }), as: UTF8.self)
     }
 
     private static func map(_ error: URLError) -> TranslationError {

@@ -32,7 +32,8 @@ def serve():
     try:
         # Connections 0-3 are the sync phases; connection 4 probes an accepted LOGIN
         # and connection 5 a rejected one for the password-rotation regression.
-        for phase in range(6):
+        # Connections 6-7 accept login but the client rejects keychain writes.
+        for phase in range(8):
             raw, _ = listener.accept()
             raw.settimeout(20)
             with context.wrap_socket(raw, server_side=True) as conn:

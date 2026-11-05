@@ -11,11 +11,15 @@ public enum GmailStore {
         UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
     }
 
-    public static func add(_ email: String, refreshToken: String) {
-        _ = Keychain.set(keychainKey(email), refreshToken)
-        var list = emails
+    public static func add(_ email: String, refreshToken: String) throws {
+        try add(email, refreshToken: refreshToken, defaults: .standard, credentials: CredentialStore())
+    }
+
+    static func add(_ email: String, refreshToken: String, defaults: UserDefaults, credentials: CredentialStore) throws {
+        try credentials.save(keychainKey(email), refreshToken)
+        var list = defaults.stringArray(forKey: defaultsKey) ?? []
         if !list.contains(email) { list.append(email) }
-        UserDefaults.standard.set(list, forKey: defaultsKey)
+        defaults.set(list, forKey: defaultsKey)
     }
 
     /// Replaces the refresh token of a mailbox that is already signed in.

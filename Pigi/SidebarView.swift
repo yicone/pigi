@@ -270,10 +270,10 @@ private struct SyncStatus: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        if state.isSyncing || state.syncError != nil {
+        if state.isSyncing || state.sidebarError != nil {
             HStack(spacing: 6) {
                 if state.isSyncing { ProgressView().controlSize(.small) }
-                if let error = state.syncError {
+                if let error = state.sidebarError {
                     Text(error)
                         .font(.system(size: 11))
                         .foregroundStyle(.red)

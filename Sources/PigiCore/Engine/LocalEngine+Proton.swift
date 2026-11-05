@@ -3,35 +3,51 @@ import Foundation
 extension LocalEngine {
     func addProton(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
         let remote = try await ProtonSession.signIn(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
-        let email = remote.email
         do {
-            let existing = try account(email)
-            guard existing == nil || existing?["kind"]?.text == "proton" else {
-                throw ArchiveClient.Failure(message: "这个邮箱已使用其他类型添加")
-            }
-            // Reauthentication keeps the cursor and mail. A completed new login
-            // replaces only this account's secret, after identity is known.
-            let previous = protonSessions[email] as? ProtonSession
-            let previousSecret = try Keychain.get(ProtonSession.key(email))
-            previous?.deactivate()
-            do {
-                try db().transaction {
-                    try db().run("INSERT OR IGNORE INTO accounts(email,added_at,kind) VALUES(?,?,'proton')", [.text(email), .int(now())])
-                    try remote.persistInitial()
-                }
-            } catch {
-                _ = Keychain.set(ProtonSession.key(email), previousSecret ?? "")
-                previous?.reactivate()
-                throw error
-            }
-            protonSessions[email] = remote
-            trigger(email)
-            announce()
+            let previous = try installProton(remote)
             try? await previous?.client.logout()
         } catch {
             try? await remote.client.logout()
             throw error
         }
+    }
+
+    @discardableResult
+    func installProton(_ remote: ProtonSession) throws -> ProtonSession? {
+        let email = remote.email
+        let existing = try account(email)
+        guard existing == nil || existing?["kind"]?.text == "proton" else {
+            throw ArchiveClient.Failure(message: "这个邮箱已使用其他类型添加")
+        }
+        // Reauthentication keeps the cursor and mail. A completed new login
+        // replaces only this account's secret, after identity is known.
+        let previous = protonSessions[email] as? ProtonSession
+        let previousSecret = try credentials.read(ProtonSession.key(email))
+        previous?.deactivate()
+        var persisted = false
+        do {
+            try db().transaction {
+                try db().run("INSERT OR IGNORE INTO accounts(email,added_at,kind) VALUES(?,?,'proton')", [.text(email), .int(now())])
+                try remote.persistInitial()
+                persisted = true
+            }
+        } catch {
+            // A failed vault write leaves its previous value intact. Only
+            // compensate if saving succeeded and the database then failed.
+            if persisted {
+                do { try credentials.save(ProtonSession.key(email), previousSecret ?? "") }
+                catch {
+                    protonSessions[email] = nil
+                    throw CredentialPersistenceError.recoveryFailed
+                }
+            }
+            previous?.reactivate()
+            throw error
+        }
+        protonSessions[email] = remote
+        trigger(email)
+        announce()
+        return previous
     }
 
     func protonLabels(_ email: String) throws -> [ProtonLabel] {
@@ -68,9 +84,14 @@ extension LocalEngine {
         catch {
             if let attempted, protonSessions[email] !== attempted { return pollSeconds }
             // Never save SDK, SQL or decoding diagnostics, which may carry content.
-            let safe = (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
+            let safe = (error as? CredentialPersistenceError)?.localizedDescription
+                ?? (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
             setError(email, safe)
-            if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
+            if error is CredentialPersistenceError {
+                (protonSessions[email] as? ProtonSession)?.deactivate()
+                protonSessions[email] = nil
+                announce()
+            } else if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
                 (protonSessions[email] as? ProtonSession)?.deactivate()
                 protonSessions[email] = nil
             }

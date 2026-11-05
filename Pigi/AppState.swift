@@ -59,6 +59,12 @@ final class AppState {
     private var activeSyncs = 0
     var isSyncing: Bool { activeSyncs > 0 || archiveCatchingUp }
     var syncError: String?
+    /// Shared by mailbox settings and the sidebar; an ordinary refresh must not
+    /// erase a failed credential save. A successful account update clears it.
+    var credentialError: String?
+    private(set) var serverCredentialError: String?
+    var displayedCredentialError: String? { credentialError ?? serverCredentialError }
+    var sidebarError: String? { displayedCredentialError ?? syncError }
     var isRefreshing = false
 
     private static let syncWindow: TimeInterval = 30 * 24 * 3600
@@ -301,6 +307,7 @@ final class AppState {
     /// Takes the list of IMAP mailboxes from the engine, which knows which ones exist.
     func refreshServerAccounts() async {
         guard let list = try? await ArchiveClient().accounts() else { return }
+        updateCredentialErrors(from: list)
         let emails = list.filter { $0.kind == "imap" }.map(\.email)
         if emails != imapAccounts.map(\.id) {
             imapAccounts = emails.map(Self.imapAccount)
@@ -312,15 +319,25 @@ final class AppState {
         for email in protonEmails { protonLabels[email] = try? await ArchiveClient().protonLabels(email) }
     }
 
+    func updateCredentialErrors(from accounts: [ArchiveAccount]) {
+        let messages = [CredentialPersistenceError.writeFailed.localizedDescription,
+                        CredentialPersistenceError.recoveryFailed.localizedDescription]
+        serverCredentialError = accounts.compactMap(\.lastError).first { messages.contains($0) }
+    }
+
     func addProtonAccount(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws {
-        try await ArchiveClient().addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
+        try await reportCredentialFailure {
+            try await ArchiveClient().addProton(username: username, password: password, mailboxPassword: mailboxPassword, otp: otp, interaction: interaction)
+        }
         await refreshServerAccounts()
         await syncFromArchive(full: true)
     }
 
     /// Adds a mailbox the engine reads over IMAP. Throws with the engine's reason when the login fails.
     func addIMAPAccount(email: String, password: String, host: String, port: Int) async throws {
-        try await ArchiveClient().addIMAP(email: email, password: password, host: host, port: port)
+        try await reportCredentialFailure {
+            try await ArchiveClient().addIMAP(email: email, password: password, host: host, port: port)
+        }
         await refreshServerAccounts()
         await syncFromArchive()
     }
@@ -347,14 +364,15 @@ final class AppState {
 
     // MARK: - Gmail accounts
 
-    func addGmailAccount(to groupID: String? = nil) async {
+    func addGmailAccount(to groupID: String? = nil,
+                         signIn: () async throws -> (email: String, token: GmailAuth.Token) = GmailAuth.signIn) async {
         do {
-            let (email, token) = try await GmailAuth.signIn()
+            let (email, token) = try await signIn()
             guard let refresh = token.refreshToken else {
                 syncError = "Google 没有返回长期授权,请在 Google 账号的第三方应用访问权限里移除 pigi 后重试"
                 return
             }
-            GmailStore.add(email, refreshToken: refresh)
+            try await reportCredentialFailure { try GmailStore.add(email, refreshToken: refresh) }
             if !gmailAccounts.contains(where: { $0.id == email }) {
                 gmailAccounts.append(Self.gmailAccount(email))
             }
@@ -364,6 +382,10 @@ final class AppState {
             await syncFromArchive()
             await loadMissingAvatars()
         } catch GmailAuth.AuthError.cancelled {
+            return
+        } catch is CredentialPersistenceError {
+            // Already shown in both mailbox settings and the sidebar. Do not
+            // duplicate it in syncError, which would survive a successful retry.
             return
         } catch {
             syncError = "登录失败:\(error.localizedDescription)"
@@ -380,8 +402,12 @@ final class AppState {
             case .replaced: break
             case .differentMailbox: return "授权的不是同一个邮箱"
             case .noRefreshToken: return "Google 没有返回长期授权,请在 Google 账号的第三方应用访问权限里移除 pigi 后重试"
-            case .unknownMailbox, .keychainFailed: return "钥匙串写入失败,未更新授权"
+            case .unknownMailbox: return "没有这个 Gmail 邮箱"
+            case .keychainFailed:
+                credentialError = CredentialPersistenceError.writeFailed.localizedDescription
+                return credentialError
             }
+            credentialError = nil
             await ArchiveClient().resetGmailSession(email)
             try await ArchiveClient().poke()
             await syncFromArchive()
@@ -395,8 +421,20 @@ final class AppState {
 
     /// Verifies a new IMAP password with the server, then stores it; local mail is untouched.
     func updateIMAPPassword(email: String, password: String) async throws {
-        try await ArchiveClient().updateIMAPPassword(email: email, password: password)
+        try await reportCredentialFailure {
+            try await ArchiveClient().updateIMAPPassword(email: email, password: password)
+        }
         await syncFromArchive()
+    }
+
+    func reportCredentialFailure(_ operation: () async throws -> Void) async throws {
+        do {
+            try await operation()
+            credentialError = nil
+        } catch let error as CredentialPersistenceError {
+            credentialError = error.localizedDescription
+            throw error
+        }
     }
 
     func removeGmailAccount(_ email: String) {

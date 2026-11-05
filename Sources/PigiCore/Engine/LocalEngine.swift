@@ -6,6 +6,12 @@ import Foundation
 public actor LocalEngine {
     public static let shared = LocalEngine()
 
+    let credentials: CredentialStore
+
+    init(credentials: CredentialStore = CredentialStore()) {
+        self.credentials = credentials
+    }
+
     var store: Store?
     var sessions: [String: GmailSession] = [:]
     var protonSessions: [String: any ProtonSyncRemote] = [:]

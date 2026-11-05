@@ -12,13 +12,15 @@ enum MailCache {
 enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
-    static func warm() {}
-    static func get(_ key: String) -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
+    static func warm() throws {}
+    static func get(_ key: String) throws -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         values[key] = value.isEmpty ? nil : value
         return true
     }
+    static func translationAPIKey() throws -> String? { try get("translation-api-key") }
+    @discardableResult static func setTranslationAPIKey(_ value: String) -> Bool { set("translation-api-key", value) }
 }
 @MainActor enum MainWindow { static func show() {} }
 
@@ -284,14 +286,17 @@ extension LocalEngine {
         let session = ProtonSession(client: client, email: "fixture@example.test")
         try await session.saveSecret()
         let key = ProtonSession.key("fixture@example.test")
-        precondition(Keychain.get(key)?.contains("synthetic-refresh") == true)
+        let savedSecret = try Keychain.get(key)
+        precondition(savedSecret?.contains("synthetic-refresh") == true)
         session.deactivate()
         Keychain.set(key, "new session")
         try await session.saveSecret()
-        precondition(Keychain.get(key) == "new session")
+        let replacedSecret = try Keychain.get(key)
+        precondition(replacedSecret == "new session")
         Keychain.set(key, "")
         try await session.saveSecret()
-        precondition(Keychain.get(key) == nil)
+        let removedSecret = try Keychain.get(key)
+        precondition(removedSecret == nil)
         let mismatch = ProtonSession(client: client, email: "other@example.test")
         do { try await mismatch.saveSecret(); fatalError("cross-account session persisted") }
         catch ProtonHelperError.credentials {}

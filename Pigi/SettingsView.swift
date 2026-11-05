@@ -9,6 +9,7 @@ struct SettingsView: View {
         case general = "通用"
         case accounts = "邮箱管理"
         case notifications = "通知"
+        case translation = "翻译"
         case archive = "同步"
         case shortcuts = "快捷键"
         case about = "关于"
@@ -18,6 +19,7 @@ struct SettingsView: View {
             case .general: "gearshape"
             case .accounts: "tray.2"
             case .notifications: "bell"
+            case .translation: "character.bubble"
             case .archive: "externaldrive.badge.icloud"
             case .shortcuts: "keyboard"
             case .about: "info.circle"
@@ -56,6 +58,7 @@ struct SettingsView: View {
                 case .general: GeneralPage()
                 case .accounts: AccountsPage()
                 case .notifications: NotificationsPage()
+                case .translation: TranslationPage()
                 case .archive: SyncSettingsPage()
                 case .shortcuts: ShortcutsPage()
                 case .about: AboutPage()
@@ -145,7 +148,7 @@ private struct GeneralPage: View {
 }
 
 /// Title and one line of explanation shared by every page.
-private struct PageHeader: View {
+struct PageHeader: View {
     let title: String
     let note: String
 
@@ -160,7 +163,7 @@ private struct PageHeader: View {
     }
 }
 
-private struct FormLabel: View {
+struct FormLabel: View {
     let text: String
     init(_ text: String) { self.text = text }
 

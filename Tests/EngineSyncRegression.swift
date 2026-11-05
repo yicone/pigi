@@ -10,6 +10,8 @@ enum Keychain {
         writes.withLock { $0[key] = value }
         return true
     }
+    static func translationAPIKey() throws -> String? { nil }
+    @discardableResult static func setTranslationAPIKey(_ value: String) -> Bool { true }
 }
 
 extension LocalEngine {

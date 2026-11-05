@@ -132,6 +132,11 @@ public struct ArchiveClient {
 
     public func body(account: String, id: String) async throws -> Body { try await engine.body(account: account, id: id) }
 
+    /// Translate an original stored mail for reading; never modifies mail.db or agent.sock results.
+    public func translateMail(account: String, id: String) async throws -> CachedTranslation {
+        try await engine.translateMail(account: account, id: id)
+    }
+
     public func search(_ term: String, account: String?) async throws -> [ArchiveItem] { try await engine.search(term, account: account) }
 
     public func modify(account: String, id: String, add: [String], remove: [String]) async throws {

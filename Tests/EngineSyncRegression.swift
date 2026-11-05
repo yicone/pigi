@@ -6,7 +6,7 @@ enum Keychain {
     static let writes = Mutex<[String: String]>([:])
     static let rejectWrites = Mutex(false)
     static func warm() throws {}
-    static func get(_ key: String) throws -> String? { nil }
+    static func get(_ key: String) throws -> String? { key.hasPrefix("imap-") ? "synthetic-password" : nil }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
         guard !rejectWrites.withLock({ $0 }) else { return false }
         writes.withLock { $0[key] = value }

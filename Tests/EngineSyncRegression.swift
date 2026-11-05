@@ -1,10 +1,15 @@
 import Foundation
+import Synchronization
 
 // Never access the user's login keychain in this executable.
 enum Keychain {
+    static let writes = Mutex<[String: String]>([:])
     static func warm() {}
     static func get(_ key: String) -> String? { nil }
-    @discardableResult static func set(_ key: String, _ value: String) -> Bool { true }
+    @discardableResult static func set(_ key: String, _ value: String) -> Bool {
+        writes.withLock { $0[key] = value }
+        return true
+    }
     static func translationAPIKey() throws -> String? { nil }
     @discardableResult static func setTranslationAPIKey(_ value: String) -> Bool { true }
 }
@@ -85,8 +90,58 @@ actor GmailFixture {
         }
         print("PASS: IMAP initial, incremental flags/new UID, UIDVALIDITY reuse and MIME attachment")
 
+        // Rotating the password verifies the login against the fixture, then stores it;
+        // the accounts row and every synced message stay untouched.
+        let kept = try await imap.rows("SELECT COUNT(*) AS c FROM messages").first?["c"]?.int
+        try await imap.updateIMAPPassword(email: " Fixture@Example.TEST ", password: "rotated")
+        precondition(Keychain.writes.withLock { $0["imap-\(email)"] } == "rotated", "verified password must be stored")
+        let after = try await imap.rows("SELECT COUNT(*) AS c FROM messages").first?["c"]?.int
+        precondition(after == kept, "updating a password must not touch stored mail")
+        let writesBeforeFailures = Keychain.writes.withLock { $0.count }
+        for (address, expected) in [("ghost@example.test", "没有这个 IMAP 邮箱"), (email, "密码不能为空")] {
+            do {
+                try await imap.updateIMAPPassword(email: address, password: expected == "密码不能为空" ? "" : "x")
+                preconditionFailure("updateIMAPPassword(\(address)) must fail")
+            } catch let error as ArchiveClient.Failure {
+                precondition(error.message == expected, error.message)
+            }
+        }
+        let rotatedKey = "imap-\(email)"
+        do {
+            try await imap.updateIMAPPassword(email: email, password: "wrong-password")
+            preconditionFailure("a rejected login must fail")
+        } catch is ImapError {}
+        precondition(Keychain.writes.withLock { $0[rotatedKey] } == "rotated", "a wrong password must not overwrite the stored one")
+        let afterReject = try await imap.rows("SELECT COUNT(*) AS c FROM messages").first?["c"]?.int
+        precondition(afterReject == kept, "a rejected password must not touch stored mail")
+        print("PASS: IMAP password rotation verifies login, stores key, keeps mail; wrong password keeps old key")
+
+
         let gmail = LocalEngine()
         try await gmail.prepare(email, kind: "gmail", port: 0)
+        // The Gmail row must refuse the IMAP password path before opening any connection.
+        do {
+            try await gmail.updateIMAPPassword(email: email, password: "x")
+            preconditionFailure("a Gmail mailbox must reject updateIMAPPassword")
+        } catch let error as ArchiveClient.Failure {
+            precondition(error.message == "没有这个 IMAP 邮箱", error.message)
+        }
+        precondition(Keychain.writes.withLock { $0.count } == writesBeforeFailures, "rejected updates must write nothing")
+        // Gmail re-authorization writes only for the mailbox that is already signed in.
+        let signedIn = "signed-in@example.test"
+        GmailStore.add(signedIn, refreshToken: "old-refresh")
+        defer { GmailStore.remove(signedIn) }
+        let gmailKey = GmailStore.keychainKey(signedIn)
+        let writesBeforeReauth = Keychain.writes.withLock { $0 }
+        precondition(GmailStore.applyReauthorization(authorizedEmail: "other@example.test", refreshToken: "intruder", for: signedIn) == .differentMailbox)
+        precondition(GmailStore.applyReauthorization(authorizedEmail: signedIn, refreshToken: nil, for: signedIn) == .noRefreshToken)
+        precondition(Keychain.writes.withLock { $0 } == writesBeforeReauth, "wrong mailbox or missing token must write nothing")
+        precondition(GmailStore.applyReauthorization(authorizedEmail: " Signed-In@Example.TEST", refreshToken: "new-refresh", for: signedIn) == .replaced)
+        precondition(Keychain.writes.withLock { $0[gmailKey] } == "new-refresh", "matching mailbox must replace the token")
+        precondition(GmailStore.emails.filter { $0 == signedIn }.count == 1, "re-authorization must not add an account")
+        precondition(GmailStore.applyReauthorization(authorizedEmail: "unknown@example.test", refreshToken: "x", for: "unknown@example.test") == .unknownMailbox)
+        precondition(Keychain.writes.withLock { $0["gmail-refresh-unknown@example.test"] } == nil, "unknown mailbox must never be created")
+        print("PASS: Gmail re-authorization replaces the token only for the matching signed-in mailbox")
         let fixture = GmailFixture(root)
         let session = GmailSession(email: email, fixture: { path, query in try await fixture.call(path, query) })
         await gmail.install(session, email: email)
@@ -113,5 +168,12 @@ actor GmailFixture {
         let finalCursor = try await gmail.rows("SELECT history_id FROM accounts")
         precondition(finalCursor[0]["history_id"]?.text == "13")
         print("PASS: Gmail backfill, paginated incremental, labels/deletion, cursor and nested MIME fixture")
+
+        let cached = await gmail.sessions[email]
+        precondition(cached != nil)
+        await gmail.resetGmailSession(email)
+        let dropped = await gmail.sessions[email]
+        precondition(dropped == nil, "resetGmailSession must drop the cached session")
+        print("PASS: Gmail session reset drops the cached session")
     }
 }

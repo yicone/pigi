@@ -30,7 +30,9 @@ def message(subject):
 
 def serve():
     try:
-        for phase in range(4):
+        # Connections 0-3 are the sync phases; connection 4 probes an accepted LOGIN
+        # and connection 5 a rejected one for the password-rotation regression.
+        for phase in range(6):
             raw, _ = listener.accept()
             raw.settimeout(20)
             with context.wrap_socket(raw, server_side=True) as conn:
@@ -39,7 +41,9 @@ def serve():
                 while line := stream.readline():
                     tag, cmd = line.decode().rstrip('\r\n').split(' ', 1)
                     if cmd.startswith('LOGIN '):
-                        pass
+                        if 'wrong-password' in cmd:
+                            conn.sendall(f'{tag} NO [AUTHENTICATIONFAILED] invalid credentials\r\n'.encode())
+                            continue
                     elif cmd == 'CAPABILITY':
                         conn.sendall(b'* CAPABILITY IMAP4rev1\r\n')
                     elif cmd.startswith('SELECT '):

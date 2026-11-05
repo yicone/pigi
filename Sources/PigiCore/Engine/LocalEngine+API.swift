@@ -118,6 +118,26 @@ extension LocalEngine {
         trigger(address)
     }
 
+    /// Replaces the stored password of an existing IMAP mailbox after proving it logs in,
+    /// so a wrong password is never saved. The accounts table and synced mail are untouched.
+    func updateIMAPPassword(email: String, password: String) async throws {
+        let address = email.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !password.isEmpty else { throw ArchiveClient.Failure(message: "密码不能为空") }
+        guard let row = try account(address), row["kind"]?.text == "imap" else { throw ArchiveClient.Failure(message: "没有这个 IMAP 邮箱") }
+        let probe = ImapConnection(host: row["imap_host"]?.text ?? "", port: row["imap_port"]?.int ?? 993)
+        try await probe.open()
+        do { try await probe.login(user: address, password: password) } catch { probe.close(); throw error }
+        await probe.logout()
+        guard Keychain.set("imap-\(address)", password) else { throw ArchiveClient.Failure(message: "钥匙串写入失败") }
+        trigger(address)
+    }
+
+    /// Drops the cached Gmail session so the next sync re-reads the refresh token.
+    func resetGmailSession(_ email: String) {
+        sessions[email] = nil
+        trigger(email)
+    }
+
     func deleteAccount(_ email: String) async throws {
         let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
         proton?.deactivate()

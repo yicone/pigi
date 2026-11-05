@@ -370,6 +370,35 @@ final class AppState {
         }
     }
 
+    /// Re-runs the Google sign-in for a mailbox that is already added and swaps its
+    /// refresh token in place, so its mail stays put. Returns the failure message,
+    /// or nil on success and when the user cancelled.
+    func reauthorizeGmailAccount(_ email: String) async -> String? {
+        do {
+            let (authorizedEmail, token) = try await GmailAuth.signIn()
+            switch GmailStore.applyReauthorization(authorizedEmail: authorizedEmail, refreshToken: token.refreshToken, for: email) {
+            case .replaced: break
+            case .differentMailbox: return "授权的不是同一个邮箱"
+            case .noRefreshToken: return "Google 没有返回长期授权,请在 Google 账号的第三方应用访问权限里移除 pigi 后重试"
+            case .unknownMailbox, .keychainFailed: return "钥匙串写入失败,未更新授权"
+            }
+            await ArchiveClient().resetGmailSession(email)
+            try await ArchiveClient().poke()
+            await syncFromArchive()
+            return nil
+        } catch GmailAuth.AuthError.cancelled {
+            return nil
+        } catch {
+            return "重新授权失败:\(error.localizedDescription)"
+        }
+    }
+
+    /// Verifies a new IMAP password with the server, then stores it; local mail is untouched.
+    func updateIMAPPassword(email: String, password: String) async throws {
+        try await ArchiveClient().updateIMAPPassword(email: email, password: password)
+        await syncFromArchive()
+    }
+
     func removeGmailAccount(_ email: String) {
         GmailStore.remove(email)
         gmailClients[email] = nil

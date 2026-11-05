@@ -429,6 +429,8 @@ private struct AccountsPage: View {
     @State private var adding = false
     @State private var addingProton = false
     @State private var removing: Account?
+    @State private var updatingPassword: Account?
+    @State private var reauthorizing = false
     @State private var failure: String?
     @State private var status: [String: ArchiveAccount] = [:]
 
@@ -472,6 +474,7 @@ private struct AccountsPage: View {
         .padding(EdgeInsets(top: 32, leading: 32, bottom: 24, trailing: 32))
         .sheet(isPresented: $adding) { AddIMAPSheet() }
         .sheet(isPresented: $addingProton) { AddProtonSheet() }
+        .sheet(item: $updatingPassword) { account in UpdateIMAPPasswordSheet(email: account.id) }
         .task {
             while !Task.isCancelled {
                 if let list = try? await ArchiveClient().accounts() {
@@ -525,21 +528,45 @@ private struct AccountsPage: View {
                 .padding(.horizontal, 6).padding(.vertical, 1)
                 .background(Color.primary.opacity(0.07), in: Capsule())
             Spacer()
-            if account.kind == .proton {
-                Button("重新登录") { addingProton = true }.font(.system(size: 11.5))
+            switch account.kind {
+            case .gmail:
+                AccountIconButton(systemName: "arrow.clockwise.circle", help: "重新授权") {
+                    Task {
+                        reauthorizing = true
+                        failure = await state.reauthorizeGmailAccount(account.id)
+                        reauthorizing = false
+                    }
+                }
+                .disabled(reauthorizing)
+            case .imap:
+                AccountIconButton(systemName: "key", help: "更新密码") { updatingPassword = account }
+            case .proton:
+                AccountIconButton(systemName: "rectangle.portrait.and.arrow.right", help: "重新登录") { addingProton = true }
             }
             syncState(status[account.id])
             Toggle("", isOn: shown).labelsHidden().toggleStyle(.switch).controlSize(.small)
                 .help(shown.wrappedValue ? "在窗口和面板中显示" : "已隐藏,仍在后台同步")
-            Button { removing = account } label: {
-                Image(systemName: "trash").font(.system(size: 12)).foregroundStyle(.secondary)
-                    .frame(width: 24, height: 24).contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("删除")
+            AccountIconButton(systemName: "trash", help: "删除") { removing = account }
         }
         .padding(.vertical, 9)
         .padding(.horizontal, 12)
+    }
+}
+
+/// The small plain icon button used on account rows.
+private struct AccountIconButton: View {
+    let systemName: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName).font(.system(size: 12)).foregroundStyle(.secondary)
+                .frame(width: 24, height: 24).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 
@@ -643,6 +670,60 @@ private struct AddIMAPSheet: View {
             try await state.addIMAPAccount(
                 email: email.trimmingCharacters(in: .whitespaces), password: password,
                 host: host.trimmingCharacters(in: .whitespaces), port: Int(port) ?? 993)
+            dismiss()
+        } catch {
+            failure = error.localizedDescription
+        }
+    }
+}
+
+/// Replaces the stored password of an IMAP mailbox that is already added.
+private struct UpdateIMAPPasswordSheet: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.dismiss) private var dismiss
+    let email: String
+    @State private var password = ""
+    @State private var working = false
+    @State private var failure: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("更新 IMAP 密码").font(.system(size: 16, weight: .semibold))
+            Text("先用新密码登录服务器验证,通过后才替换保存的密码;本地已同步的邮件不受影响。")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+                GridRow {
+                    FormLabel("邮箱")
+                    Text(email).font(.system(size: 13))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GridRow {
+                    FormLabel("密码")
+                    SecureField("", text: $password, prompt: Text("密码或授权码")).textFieldStyle(.roundedBorder)
+                }
+            }
+            if let failure {
+                Text(failure).font(.system(size: 12)).foregroundStyle(.red).lineLimit(3)
+            }
+            HStack {
+                if working { ProgressView().controlSize(.small); Text("正在验证…").font(.system(size: 12)).foregroundStyle(.secondary) }
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("更新") { Task { await update() } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(working || password.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+    }
+
+    private func update() async {
+        working = true
+        defer { working = false }
+        do {
+            try await state.updateIMAPPassword(email: email, password: password)
             dismiss()
         } catch {
             failure = error.localizedDescription

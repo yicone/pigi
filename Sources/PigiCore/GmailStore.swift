@@ -30,6 +30,17 @@ public enum GmailStore {
         a.trimmingCharacters(in: .whitespaces).lowercased() == b.trimmingCharacters(in: .whitespaces).lowercased()
     }
 
+    public enum ReauthorizationResult: Equatable { case replaced, differentMailbox, noRefreshToken, unknownMailbox, keychainFailed }
+
+    /// Applies a finished Google sign-in to an existing mailbox. Nothing is written
+    /// unless the authorized address matches and Google returned a refresh token.
+    public static func applyReauthorization(authorizedEmail: String, refreshToken: String?, for email: String) -> ReauthorizationResult {
+        guard isSameMailbox(authorizedEmail, email) else { return .differentMailbox }
+        guard let refreshToken else { return .noRefreshToken }
+        guard emails.contains(email) else { return .unknownMailbox }
+        return replaceRefreshToken(refreshToken, for: email) ? .replaced : .keychainFailed
+    }
+
     public static func remove(_ email: String) {
         _ = Keychain.set(keychainKey(email), "")
         UserDefaults.standard.set(emails.filter { $0 != email }, forKey: defaultsKey)

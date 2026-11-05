@@ -31,6 +31,12 @@ final class AccountRecoveryTests: XCTestCase {
         XCTAssertFalse(GmailStore.replaceRefreshToken("token", for: "a@example.test "))
     }
 
+    /// A different or token-less sign-in is refused before any keychain write.
+    func testApplyReauthorizationRefusesBeforeWriting() {
+        XCTAssertEqual(GmailStore.applyReauthorization(authorizedEmail: "b@example.test", refreshToken: "t", for: "a@example.test"), .differentMailbox)
+        XCTAssertEqual(GmailStore.applyReauthorization(authorizedEmail: "a@example.test", refreshToken: nil, for: "a@example.test"), .noRefreshToken)
+    }
+
     /// Password rotation must stop at the guards: no connection, no keychain write.
     func testUpdateIMAPPasswordGuards() async throws {
         let engine = LocalEngine()

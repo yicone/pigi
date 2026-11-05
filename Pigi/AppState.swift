@@ -376,14 +376,11 @@ final class AppState {
     func reauthorizeGmailAccount(_ email: String) async -> String? {
         do {
             let (authorizedEmail, token) = try await GmailAuth.signIn()
-            guard GmailStore.isSameMailbox(authorizedEmail, email) else {
-                return "授权的不是同一个邮箱"
-            }
-            guard let refresh = token.refreshToken else {
-                return "Google 没有返回长期授权,请在 Google 账号的第三方应用访问权限里移除 pigi 后重试"
-            }
-            guard GmailStore.replaceRefreshToken(refresh, for: email) else {
-                return "钥匙串写入失败,未更新授权"
+            switch GmailStore.applyReauthorization(authorizedEmail: authorizedEmail, refreshToken: token.refreshToken, for: email) {
+            case .replaced: break
+            case .differentMailbox: return "授权的不是同一个邮箱"
+            case .noRefreshToken: return "Google 没有返回长期授权,请在 Google 账号的第三方应用访问权限里移除 pigi 后重试"
+            case .unknownMailbox, .keychainFailed: return "钥匙串写入失败,未更新授权"
             }
             await ArchiveClient().resetGmailSession(email)
             try await ArchiveClient().poke()

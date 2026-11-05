@@ -106,7 +106,16 @@ actor GmailFixture {
                 precondition(error.message == expected, error.message)
             }
         }
-        print("PASS: IMAP password rotation verifies login, stores key, keeps mail")
+        let rotatedKey = "imap-\(email)"
+        do {
+            try await imap.updateIMAPPassword(email: email, password: "wrong-password")
+            preconditionFailure("a rejected login must fail")
+        } catch is ImapError {}
+        precondition(Keychain.writes.withLock { $0[rotatedKey] } == "rotated", "a wrong password must not overwrite the stored one")
+        let afterReject = try await imap.rows("SELECT COUNT(*) AS c FROM messages").first?["c"]?.int
+        precondition(afterReject == kept, "a rejected password must not touch stored mail")
+        print("PASS: IMAP password rotation verifies login, stores key, keeps mail; wrong password keeps old key")
+
 
         let gmail = LocalEngine()
         try await gmail.prepare(email, kind: "gmail", port: 0)
@@ -118,6 +127,21 @@ actor GmailFixture {
             precondition(error.message == "没有这个 IMAP 邮箱", error.message)
         }
         precondition(Keychain.writes.withLock { $0.count } == writesBeforeFailures, "rejected updates must write nothing")
+        // Gmail re-authorization writes only for the mailbox that is already signed in.
+        let signedIn = "signed-in@example.test"
+        GmailStore.add(signedIn, refreshToken: "old-refresh")
+        defer { GmailStore.remove(signedIn) }
+        let gmailKey = GmailStore.keychainKey(signedIn)
+        let writesBeforeReauth = Keychain.writes.withLock { $0 }
+        precondition(GmailStore.applyReauthorization(authorizedEmail: "other@example.test", refreshToken: "intruder", for: signedIn) == .differentMailbox)
+        precondition(GmailStore.applyReauthorization(authorizedEmail: signedIn, refreshToken: nil, for: signedIn) == .noRefreshToken)
+        precondition(Keychain.writes.withLock { $0 } == writesBeforeReauth, "wrong mailbox or missing token must write nothing")
+        precondition(GmailStore.applyReauthorization(authorizedEmail: " Signed-In@Example.TEST", refreshToken: "new-refresh", for: signedIn) == .replaced)
+        precondition(Keychain.writes.withLock { $0[gmailKey] } == "new-refresh", "matching mailbox must replace the token")
+        precondition(GmailStore.emails.filter { $0 == signedIn }.count == 1, "re-authorization must not add an account")
+        precondition(GmailStore.applyReauthorization(authorizedEmail: "unknown@example.test", refreshToken: "x", for: "unknown@example.test") == .unknownMailbox)
+        precondition(Keychain.writes.withLock { $0["gmail-refresh-unknown@example.test"] } == nil, "unknown mailbox must never be created")
+        print("PASS: Gmail re-authorization replaces the token only for the matching signed-in mailbox")
         let fixture = GmailFixture(root)
         let session = GmailSession(email: email, fixture: { path, query in try await fixture.call(path, query) })
         await gmail.install(session, email: email)

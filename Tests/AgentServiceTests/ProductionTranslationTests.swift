@@ -22,6 +22,11 @@ private extension LocalEngine {
         translationDependencies = state.dependencies
     }
 
+    /// Swap the engine's cache mid-run; a new instance on the same path simulates an app restart.
+    func installTranslationCache(_ cache: SQLiteTranslationCache) {
+        translationCache = cache
+    }
+
     func seedProductionMail(cache: SQLiteTranslationCache, html: Bool) throws {
         translationCache = cache
         let memory = try Store(path: ":memory:")
@@ -208,6 +213,43 @@ final class ProductionTranslationTests: XCTestCase {
         _ = try await fixture.request()
         let records = await fixture.transport.recorded()
         XCTAssertEqual(records.count, 4)
+    }
+
+    @MainActor
+    func testReaderDelegatesToEngineAndReadsThroughWholeMailCache() async throws {
+        let fixture = try await ProductionFixture()
+        addTeardownBlock { await fixture.cleanup() }
+        let reader = MailTranslationReader(store: fixture.configStore, keyStore: ProductionKeyStore())
+        reader.toggle(account: "mail@example.invalid", id: "one")
+        await reader.task?.value
+        XCTAssertEqual(reader.translatedBody, "你好 世界")
+        XCTAssertTrue(reader.showingTranslation)
+        reader.reset()
+        reader.toggle(account: "mail@example.invalid", id: "one")
+        await reader.task?.value
+        XCTAssertEqual(reader.translatedBody, "你好 世界")
+        let requests = await fixture.transport.recorded()
+        XCTAssertEqual(requests.count, 2, "second translation was not served from the engine cache")
+    }
+
+    @MainActor
+    func testFileBackedCacheServesWholeMailAfterReopen() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("translations.db").path
+        let fixture = try await ProductionFixture()
+        addTeardownBlock { await fixture.cleanup() }
+        await fixture.engine.installTranslationCache(SQLiteTranslationCache(path: path))
+        let first = try await fixture.request()
+        // A fresh cache instance over the same file simulates an app restart.
+        await fixture.engine.installTranslationCache(SQLiteTranslationCache(path: path))
+        let second = try await fixture.request()
+        XCTAssertEqual(first, second)
+        let requests = await fixture.transport.recorded()
+        XCTAssertEqual(requests.count, 2, "reopened cache did not serve the stored translation")
+        let rows = try Store(path: path).query("SELECT count(*) AS n FROM translations")
+        XCTAssertEqual(rows.first?["n"]?.int, 1)
     }
 
     @MainActor

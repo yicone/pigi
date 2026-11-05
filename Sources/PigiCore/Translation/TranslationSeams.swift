@@ -39,28 +39,35 @@ public protocol TranslationPolicy: Sendable {
 }
 
 public struct TranslationCacheKey: Hashable, Sendable {
-    public var accountID: String
-    public var mailID: String
-    public var bodyHash: String
-    public var model: String
-    public var promptVersion: Int
-    public var targetLanguage: String
+    public let accountID: String
+    public let mailID: String
+    public let bodyHash: String
+    public let model: String
+    /// Includes the prompt contract version, provider, temperature and actual system prompt.
+    public let promptVersion: Int
+    public let targetLanguage: String
 
-    public init(accountID: String, mailID: String, bodyHash: String, model: String, promptVersion: Int, targetLanguage: String) {
+    /// Use the same configuration snapshot as the request. There is deliberately no raw-version
+    /// initializer: callers cannot omit the editable settings when constructing a cache key.
+    public init(accountID: String, mailID: String, bodyHash: String, configuration: TranslationConfig) {
         self.accountID = accountID
         self.mailID = mailID
         self.bodyHash = bodyHash
-        self.model = model
-        self.promptVersion = promptVersion
-        self.targetLanguage = targetLanguage
+        self.model = configuration.model
+        self.promptVersion = Self.promptFingerprint(version: TranslationConfig.promptVersion,
+            systemPrompt: configuration.systemPrompt, temperature: configuration.temperature,
+            endpoint: configuration.baseURL)
+        self.targetLanguage = configuration.targetLanguage
     }
 }
 
+/// Only whole-mail, validated results can be committed. Storage failures remain visible to callers.
 public protocol TranslationCache: Sendable {
-    func get(_ key: TranslationCacheKey) async -> [TranslationSegment]?
-    func put(_ key: TranslationCacheKey, _ value: [TranslationSegment]) async
-    func clear() async
-    func purge(accountID: String) async
+    func get(_ key: TranslationCacheKey) async throws -> CachedTranslation?
+    func begin(_ key: TranslationCacheKey) async throws -> SQLiteTranslationCache.Ticket
+    func put(_ value: CachedTranslation, for ticket: SQLiteTranslationCache.Ticket, validated: Bool) async throws
+    func clear() async throws
+    func purge(accountID: String) async throws
 }
 
 /// `setAPIKey("")` deletes the stored key.

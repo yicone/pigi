@@ -13,6 +13,11 @@ public actor LocalEngine {
     }
 
     var store: Store?
+    var translationCache = SQLiteTranslationCache.shared
+    #if DEBUG
+    // Actor-isolated fixture dependencies for testing the public ArchiveClient/shared-engine path.
+    var translationDependencies: TranslationDependencies?
+    #endif
     var sessions: [String: GmailSession] = [:]
     var protonSessions: [String: any ProtonSyncRemote] = [:]
     var due: [String: Date] = [:]

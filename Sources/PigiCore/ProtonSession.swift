@@ -63,6 +63,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
     struct Empty: Encodable {}
     let client: ProtonHelperClient
     let email: String
+    private let credentials: CredentialStore
     private let lock = NSLock()
     private var active = true
     private var initialSecret: Secret?
@@ -76,7 +77,12 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
     }
     static func key(_ email: String) -> String { "proton-session-" + email }
 
-    init(client: ProtonHelperClient, email: String) { self.client = client; self.email = email }
+    init(client: ProtonHelperClient, email: String, credentials: CredentialStore = CredentialStore(), initialSecret: Secret? = nil) {
+        self.client = client
+        self.email = email
+        self.credentials = credentials
+        self.initialSecret = initialSecret
+    }
 
     static func signIn(username: String, password: String, mailboxPassword: String, otp: String, interaction: ProtonLoginInteraction? = nil) async throws -> ProtonSession {
         let client = try ProtonHelperClient.bundled()
@@ -111,7 +117,8 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
             try await saveSecret()
         } catch {
             // A refresh may precede a failed network/key request. Preserve it.
-            try? await saveSecret()
+            do { try await saveSecret() }
+            catch { throw CredentialPersistenceError.recoveryFailed }
             throw error
         }
     }
@@ -123,7 +130,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
         guard active else { return }
         guard secret.email.lowercased() == email else { throw ProtonHelperError.credentials }
         let json = String(decoding: try JSONEncoder().encode(secret), as: UTF8.self)
-        guard Keychain.set(Self.key(email), json) else { throw ProtonHelperError.key }
+        try credentials.save(Self.key(email), json)
     }
     func saveSecret() async throws {
         let secret: Secret = try await client.syncRequest("session", Empty())
@@ -135,7 +142,8 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
             try await saveSecret()
             return result
         } catch {
-            try? await saveSecret()
+            do { try await saveSecret() }
+            catch { throw CredentialPersistenceError.recoveryFailed }
             throw error
         }
     }

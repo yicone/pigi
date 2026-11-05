@@ -424,7 +424,7 @@ private struct AboutPage: View {
 
 // MARK: - Mailbox management
 
-private struct AccountsPage: View {
+struct AccountsPage: View {
     @Environment(AppState.self) private var state
     @State private var adding = false
     @State private var addingProton = false
@@ -456,6 +456,11 @@ private struct AccountsPage: View {
 
             GmailClientField()
 
+            if let error = state.displayedCredentialError {
+                Text(error).font(.system(size: 12)).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(state.allAccounts) { account in
@@ -478,6 +483,7 @@ private struct AccountsPage: View {
         .task {
             while !Task.isCancelled {
                 if let list = try? await ArchiveClient().accounts() {
+                    state.updateCredentialErrors(from: list)
                     status = Dictionary(list.map { ($0.email, $0) }, uniquingKeysWith: { first, _ in first })
                 }
                 try? await Task.sleep(for: .seconds(5))

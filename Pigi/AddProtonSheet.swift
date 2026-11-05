@@ -87,7 +87,8 @@ struct AddProtonSheet: View {
         } catch is CancellationError {
             // User closed the flow; the core revokes the provisional session.
         } catch {
-            failure = (error as? ProtonHelperError)?.localizedDescription ?? "Proton 登录未完成，请检查账号或钥匙串权限后重试"
+            failure = (error as? CredentialPersistenceError)?.localizedDescription
+                ?? (error as? ProtonHelperError)?.localizedDescription ?? "Proton 登录未完成，请检查账号或钥匙串权限后重试"
         }
     }
 }

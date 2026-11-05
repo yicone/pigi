@@ -12,10 +12,13 @@ enum MailCache {
 enum Keychain {
     private static var values: [String: String] = [:]
     private static let lock = NSLock()
+    private static var rejectingWrites = false
+    static func rejectWrites(_ reject: Bool) { lock.lock(); defer { lock.unlock() }; rejectingWrites = reject }
     static func warm() throws {}
     static func get(_ key: String) throws -> String? { lock.lock(); defer { lock.unlock() }; return values[key] }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        guard !rejectingWrites else { return false }
         values[key] = value.isEmpty ? nil : value
         return true
     }
@@ -100,6 +103,7 @@ extension LocalEngine {
         #if CACHE_DISK_REGRESSION
         try await diskPrivacyCases()
         #else
+        try await credentialFailureCases()
         try await eventRecoveryCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
@@ -276,6 +280,12 @@ extension LocalEngine {
                 result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session']}
             elif r['method']=='session':
                 result={'uid':'synthetic-uid','access':'synthetic-access','refresh':'synthetic-refresh','salted':'c3ludGhldGlj','email':'fixture@example.test'}
+            elif r['method']=='resume':
+                result={'authenticated':True}
+            elif r['method']=='latest':
+                result={'cursor':'fixture-cursor'}
+            elif r['method']=='labels':
+                result=[]
             else:
                 result={'logged_out':True}
             print(json.dumps({'version':1,'id':r['id'],'result':result}),flush=True)
@@ -288,6 +298,27 @@ extension LocalEngine {
         let key = ProtonSession.key("fixture@example.test")
         let savedSecret = try Keychain.get(key)
         precondition(savedSecret?.contains("synthetic-refresh") == true)
+        Keychain.rejectWrites(true)
+        do { try await session.saveSecret(); fatalError("failed save was hidden") }
+        catch CredentialPersistenceError.writeFailed {}
+        do { _ = try await session.latest(); fatalError("failed request save was hidden") }
+        catch CredentialPersistenceError.recoveryFailed {}
+        let resumed = ProtonSession(client: client, email: "fixture@example.test",
+                                    initialSecret: .init(uid: "synthetic", access: "synthetic", refresh: "synthetic", salted: "synthetic", email: "fixture@example.test"))
+        do { try await resumed.resume(); fatalError("failed resume save was hidden") }
+        catch CredentialPersistenceError.recoveryFailed {}
+        let engine = LocalEngine()
+        try await engine.fixture("fixture@example.test", remote: session)
+        let delay = await engine.syncProton("fixture@example.test")
+        let account = try await engine.accounts().first
+        let cached = await engine.protonSessions["fixture@example.test"]
+        precondition(delay == 120 && cached == nil)
+        precondition(account?.lastError == CredentialPersistenceError.recoveryFailed.localizedDescription)
+        let state = AppState()
+        state.updateCredentialErrors(from: account.map { [$0] } ?? [])
+        precondition(state.sidebarError == account?.lastError && state.displayedCredentialError == account?.lastError)
+        Keychain.rejectWrites(false)
+        print("PASS: Proton save, request, resume and background sync surface failed writes and failed recovery saves")
         session.deactivate()
         Keychain.set(key, "new session")
         try await session.saveSecret()
@@ -302,6 +333,36 @@ extension LocalEngine {
         catch ProtonHelperError.credentials {}
         try await client.logout()
         print("PASS: pipe session export persists only to the fixture Keychain; deactivated sessions cannot overwrite or resurrect secrets")
+    }
+
+    static func credentialFailureCases() async throws {
+        let state = AppState()
+        let before = GmailStore.emails
+        Keychain.rejectWrites(true)
+        defer { Keychain.rejectWrites(false) }
+        await state.addGmailAccount(signIn: {
+            ("credential-fixture@example.test", GmailAuth.Token(accessToken: "synthetic", refreshToken: "synthetic", expiresAt: .distantFuture))
+        })
+        let message = CredentialPersistenceError.writeFailed.localizedDescription
+        precondition(GmailStore.emails == before && state.gmailAccounts.isEmpty)
+        precondition(state.displayedCredentialError == message && state.sidebarError == message)
+        state.syncError = nil
+        precondition(state.sidebarError == message, "refresh erased the credential failure")
+        do {
+            try await state.reportCredentialFailure { throw CredentialPersistenceError.recoveryFailed }
+            fatalError("credential error was not rethrown to the settings sheet")
+        } catch CredentialPersistenceError.recoveryFailed {}
+        precondition(state.displayedCredentialError == CredentialPersistenceError.recoveryFailed.localizedDescription)
+        precondition(state.sidebarError == state.displayedCredentialError)
+        try await state.reportCredentialFailure {}
+        precondition(state.displayedCredentialError == nil && state.sidebarError == nil, "successful recovery kept a stale error")
+        let account = ArchiveAccount(email: "credential-fixture@example.test", backfillDone: 1, total: 0,
+                                     lastSync: nil, lastError: message, stored: 0, kind: "proton")
+        state.updateCredentialErrors(from: [account])
+        precondition(state.displayedCredentialError == message && state.sidebarError == message)
+        state.updateCredentialErrors(from: [])
+        precondition(state.displayedCredentialError == nil)
+        print("PASS: failed Gmail save never adds an account; settings and sidebar retain redacted credential failures until recovery")
     }
 
     // Go's loopback tests establish HTTP -> wire classification; here exercise
@@ -361,6 +422,12 @@ extension LocalEngine {
             window.close()
         }
         try capture(AddProtonSheet().environment(state), "proton-login.png", width: 460, height: 360)
+        state.credentialError = CredentialPersistenceError.writeFailed.localizedDescription
+        try capture(AccountsPage().environment(state), "credential-settings.png", width: 600, height: 600)
+        let layout = LayoutState()
+        layout.sidebarWidth = 250
+        try capture(SidebarView().environment(state).environment(layout), "credential-sidebar.png", width: 250, height: 600)
+        state.credentialError = nil
         state.mails = [fixtureMail()]
         state.select(.account("fixture@example.test"))
         try capture(MailListView().environment(state), "proton-inbox.png", width: 480, height: 500)

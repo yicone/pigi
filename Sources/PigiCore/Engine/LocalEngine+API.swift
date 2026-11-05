@@ -112,7 +112,13 @@ extension LocalEngine {
         try await probe.open()
         do { try await probe.login(user: address, password: password) } catch { probe.close(); throw error }
         await probe.logout()
-        _ = Keychain.set("imap-\(address)", password)
+        try saveIMAPAccount(address, password: password, host: host, port: port)
+    }
+
+    /// Called only after the server accepted the login. Never register or queue
+    /// an account whose credentials could not be saved.
+    func saveIMAPAccount(_ address: String, password: String, host: String, port: Int) throws {
+        try credentials.save("imap-\(address)", password)
         try db().run("INSERT INTO accounts(email, added_at, kind, imap_host, imap_port) VALUES(?,?,'imap',?,?)",
                      [.text(address), .int(now()), .text(host), .int(port)])
         trigger(address)
@@ -128,7 +134,7 @@ extension LocalEngine {
         try await probe.open()
         do { try await probe.login(user: address, password: password) } catch { probe.close(); throw error }
         await probe.logout()
-        guard Keychain.set("imap-\(address)", password) else { throw ArchiveClient.Failure(message: "钥匙串写入失败") }
+        try credentials.save("imap-\(address)", password)
         trigger(address)
     }
 

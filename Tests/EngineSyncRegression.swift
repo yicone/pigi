@@ -4,9 +4,11 @@ import Synchronization
 // Never access the user's login keychain in this executable.
 enum Keychain {
     static let writes = Mutex<[String: String]>([:])
-    static func warm() {}
-    static func get(_ key: String) -> String? { nil }
+    static let rejectWrites = Mutex(false)
+    static func warm() throws {}
+    static func get(_ key: String) throws -> String? { nil }
     @discardableResult static func set(_ key: String, _ value: String) -> Bool {
+        guard !rejectWrites.withLock({ $0 }) else { return false }
         writes.withLock { $0[key] = value }
         return true
     }
@@ -116,6 +118,26 @@ actor GmailFixture {
         precondition(afterReject == kept, "a rejected password must not touch stored mail")
         print("PASS: IMAP password rotation verifies login, stores key, keeps mail; wrong password keeps old key")
 
+        // Accepted server logins must still fail if local credential persistence fails.
+        let writesBeforeRejection = Keychain.writes.withLock { $0 }
+        Keychain.rejectWrites.withLock { $0 = true }
+        let adding = LocalEngine()
+        try await adding.prepare("existing@example.test", kind: "imap", port: port)
+        do {
+            try await adding.addIMAP(email: "new-fixture@example.test", password: "synthetic", host: "127.0.0.1", port: port)
+            preconditionFailure("adding IMAP must fail when the keychain rejects the password")
+        } catch CredentialPersistenceError.writeFailed {}
+        let addedRows = try await adding.rows("SELECT email FROM accounts")
+        let queued = await adding.due
+        precondition(addedRows.count == 1 && addedRows[0]["email"]?.text == "existing@example.test" && queued.isEmpty)
+        do {
+            try await imap.updateIMAPPassword(email: email, password: "synthetic")
+            preconditionFailure("updating IMAP must fail when the keychain rejects the password")
+        } catch CredentialPersistenceError.writeFailed {}
+        precondition(Keychain.writes.withLock { $0 } == writesBeforeRejection)
+        Keychain.rejectWrites.withLock { $0 = false }
+        print("PASS: IMAP accepted login plus rejected credential write throws without adding an account or replacing the old password")
+
 
         let gmail = LocalEngine()
         try await gmail.prepare(email, kind: "gmail", port: 0)
@@ -129,7 +151,7 @@ actor GmailFixture {
         precondition(Keychain.writes.withLock { $0.count } == writesBeforeFailures, "rejected updates must write nothing")
         // Gmail re-authorization writes only for the mailbox that is already signed in.
         let signedIn = "signed-in@example.test"
-        GmailStore.add(signedIn, refreshToken: "old-refresh")
+        try GmailStore.add(signedIn, refreshToken: "old-refresh")
         defer { GmailStore.remove(signedIn) }
         let gmailKey = GmailStore.keychainKey(signedIn)
         let writesBeforeReauth = Keychain.writes.withLock { $0 }

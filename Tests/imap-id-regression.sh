@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/Tests/isolate-support.sh"
 TEST_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/pigi-imap-id-regression.XXXXXX")"
-trap 'rm -rf "$TEST_BUILD"' EXIT
+trap isolate_support_finish EXIT
+isolate_support_snapshot
 xcrun swiftc -swift-version 5 -D DEBUG -parse-as-library \
     -target "$(uname -m)-apple-macosx15.0" -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     "$ROOT/Sources/PigiCore/Engine/ImapConnection.swift" "$ROOT/Tests/ImapIDRegression.swift" \

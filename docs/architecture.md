@@ -36,6 +36,10 @@ SwiftUI 界面 ── AppState ── ArchiveClient ── LocalEngine ─┬─
 
 调试构建设置环境变量 `PIGI_INSECURE_TLS=1` 可连接自签名证书的本地 IMAP 测试服务器(仅 DEBUG)。
 
+CI 与本地测试不得依赖、也不得写入真实 `~/Library/Application Support/pigi`（`mail.db`、`translations.db`、`mail-headers.json`、`agent.sock`）或 `~/Library/Containers`。会走到产品磁盘路径的回归二进制用 `-D PIGI_REGRESSION` 编译：进程若仍解析到真实用户目录，在创建文件前直接失败。`swift test` 同样拒绝这条默认路径。需要真的打开该目录时，用临时 `CFFIXED_USER_HOME` 与 `HOME`（见 `Tests/isolate-support.sh`），并在结束后核对真实 `translations.db` 及其 `-wal`/`-shm` 没有被新建或改写。
+
+应用内「清空译文缓存」只删除库里的译文行，不删除文件。测试留下的空 `translations.db` 要在退出应用、并确认没有真实译文之后，由用户自行删除该文件及 `-wal`/`-shm`。测试脚本不代删。
+
 ## 目录
 
 ```

@@ -100,6 +100,7 @@ extension LocalEngine {
         app.run()
     }
     static func run() async throws {
+        try AppSupport.assertProcessSupportIsIsolated()
         #if CACHE_DISK_REGRESSION
         try await diskPrivacyCases()
         #else

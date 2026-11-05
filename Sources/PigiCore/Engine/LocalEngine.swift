@@ -7,6 +7,7 @@ public actor LocalEngine {
     public static let shared = LocalEngine()
 
     var store: Store?
+    var translationCache = SQLiteTranslationCache.shared
     var sessions: [String: GmailSession] = [:]
     var protonSessions: [String: any ProtonSyncRemote] = [:]
     var due: [String: Date] = [:]

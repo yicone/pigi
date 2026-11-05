@@ -56,11 +56,13 @@ public struct TranslationCacheKey: Hashable, Sendable {
     }
 }
 
+/// Only whole-mail, validated results can be committed. Storage failures remain visible to callers.
 public protocol TranslationCache: Sendable {
-    func get(_ key: TranslationCacheKey) async -> [TranslationSegment]?
-    func put(_ key: TranslationCacheKey, _ value: [TranslationSegment]) async
-    func clear() async
-    func purge(accountID: String) async
+    func get(_ key: TranslationCacheKey) async throws -> CachedTranslation?
+    func begin(_ key: TranslationCacheKey) async throws -> SQLiteTranslationCache.Ticket
+    func put(_ value: CachedTranslation, for ticket: SQLiteTranslationCache.Ticket, validated: Bool) async throws
+    func clear() async throws
+    func purge(accountID: String) async throws
 }
 
 /// `setAPIKey("")` deletes the stored key.

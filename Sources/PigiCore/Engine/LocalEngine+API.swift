@@ -139,6 +139,9 @@ extension LocalEngine {
     }
 
     func deleteAccount(_ email: String) async throws {
+        // Fail before deleting the mailbox if its plaintext translation cache cannot be cleared.
+        // Purge also invalidates outstanding request tickets, preventing late writes.
+        try await purgeTranslationData(accountID: email)
         let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
         proton?.deactivate()
         _ = Keychain.set(ProtonSession.key(email), "")
@@ -157,6 +160,15 @@ extension LocalEngine {
         due[email] = nil
         announce()
         try? await proton?.client.logout()
+    }
+
+    func purgeTranslationData(accountID: String, privacy: TranslationPrivacySettings? = nil) async throws {
+        try await translationCache.purge(accountID: accountID)
+        if let privacy {
+            await privacy.removeAccount(accountID)
+        } else {
+            await TranslationPrivacySettings.shared.removeAccount(accountID)
+        }
     }
 
     // MARK: actions

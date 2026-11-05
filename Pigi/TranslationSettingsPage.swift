@@ -16,6 +16,7 @@ struct TranslationPage: View {
                 )
                 TranslationEnableSection(config: persisted)
                 TranslationAPISection(config: persisted)
+                TranslationPrivacySection(endpoint: config.baseURL)
                 TranslationAdvancedSection(config: persisted)
                 Spacer()
             }

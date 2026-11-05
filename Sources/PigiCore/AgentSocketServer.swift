@@ -34,6 +34,7 @@ public final class AgentSocketServer: @unchecked Sendable {
         defer { lock.unlock() }
         guard listener == -1 else { return }
         let directory = url.deletingLastPathComponent()
+        try AppSupport.assertNotRealUserData(directory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var info = stat()
         guard lstat(directory.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR,

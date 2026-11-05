@@ -63,10 +63,7 @@ public actor LocalEngine {
 
     func db() throws -> Store {
         if let store { return store }
-        let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("pigi", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        let dir = try AppSupport.pigiDirectory()
         let opened = try Store(path: dir.appendingPathComponent("mail.db").path)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dir.appendingPathComponent("mail.db").path)
         for statement in Self.schema { try opened.run(statement) }

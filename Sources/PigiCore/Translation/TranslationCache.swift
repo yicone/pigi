@@ -49,19 +49,15 @@ public actor SQLiteTranslationCache: TranslationCache {
     private var generation = UUID()
     private var accountGenerations: [String: UUID] = [:]
 
-    /// nil uses Application Support/pigi/translations.db; tests pass an isolated path.
+    /// nil uses Application Support/pigi/translations.db. Tests pass an isolated path.
+    /// With no path, regression binaries and XCTest refuse the real user directory.
     public init(path: String? = nil) { self.path = path }
 
     private func db() throws -> Store {
         if let store { return store }
         let resolved: String
         if let path { resolved = path } else {
-            let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                appropriateFor: nil, create: true).appendingPathComponent("pigi", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-            resolved = directory.appendingPathComponent("translations.db").path
+            resolved = try AppSupport.pigiDirectory().appendingPathComponent("translations.db").path
         }
         let opened = try Store(path: resolved)
         try opened.run("""

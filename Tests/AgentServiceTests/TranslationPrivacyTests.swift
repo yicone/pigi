@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import PigiCore
 
@@ -255,10 +256,63 @@ final class TranslationPrivacyTests: XCTestCase {
             serviceConsent: true, isProton: true, accountConsent: false), .needsAccountConsent)
     }
 
+    func testGuardRejectsRealSupportAndAllowsTemporaryPaths() throws {
+        XCTAssertTrue(AppSupport.refusesRealUserData)
+        let home = realPasswdHome()
+        let support = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/pigi")
+        let containers = URL(fileURLWithPath: home)
+            .appendingPathComponent("Library/Containers/one.yic.pigi/Data/Library/Application Support/pigi")
+        for url in [support, containers] {
+            XCTAssertThrowsError(try AppSupport.assertNotRealUserData(url)) { error in
+                XCTAssertEqual(error as? AppSupport.Failure, .realUserData)
+            }
+        }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("pigi-isolate-" + UUID().uuidString)
+        XCTAssertNoThrow(try AppSupport.assertNotRealUserData(temporary))
+    }
+
+    func testDefaultCacheDoesNotTouchRealTranslationsDatabase() async throws {
+        guard AppSupport.refusesRealUserData else {
+            XCTFail("XCTest did not enable the real-data guard")
+            return
+        }
+        let before = realTranslationFingerprints()
+        let cache = SQLiteTranslationCache()
+        do {
+            _ = try await cache.get(key())
+            XCTFail("default cache opened the user support directory")
+        } catch AppSupport.Failure.realUserData {}
+        XCTAssertEqual(realTranslationFingerprints(), before)
+    }
+
     @MainActor
     func testInvalidEndpointNeverGrantsConsent() {
         for endpoint in ["", "ftp://api.example.invalid", "https://user:secret@api.example.invalid", "https://api.example.invalid?key=secret"] {
             XCTAssertNil(TranslationPrivacySettings.serviceIdentity(endpoint))
+        }
+    }
+
+    private func realPasswdHome() -> String {
+        var pwd = passwd()
+        var result: UnsafeMutablePointer<passwd>?
+        let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: 16_384)
+        defer { buffer.deallocate() }
+        guard getpwuid_r(getuid(), &pwd, buffer, 16_384, &result) == 0, let result, let dir = result.pointee.pw_dir else {
+            XCTFail("passwd home unavailable")
+            return ""
+        }
+        return String(cString: dir)
+    }
+
+    private func realTranslationFingerprints() -> [String] {
+        let dir = URL(fileURLWithPath: realPasswdHome()).appendingPathComponent("Library/Application Support/pigi")
+        return ["translations.db", "translations.db-wal", "translations.db-shm"].map { name in
+            let path = dir.appendingPathComponent(name).path
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return "absent" }
+            let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+            let size = (attrs[.size] as? NSNumber)?.intValue ?? -1
+            let inode = (attrs[.systemFileNumber] as? NSNumber)?.intValue ?? -1
+            return "\(modified) \(size) \(inode)"
         }
     }
 }

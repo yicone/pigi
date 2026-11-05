@@ -7,12 +7,7 @@ import PigiCore
 /// Bodies are not stored; they are fetched when a mail is opened.
 enum MailCache {
     private static func url() throws -> URL {
-        let dir = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
-        )
-        let folder = dir.appendingPathComponent("pigi", isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+        let folder = try AppSupport.pigiDirectory()
         let file = folder.appendingPathComponent("mail-headers.json")
         if FileManager.default.fileExists(atPath: file.path) {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)

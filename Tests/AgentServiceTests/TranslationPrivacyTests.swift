@@ -19,7 +19,67 @@ final class TranslationPrivacyTests: XCTestCase {
     private let value = CachedTranslation(subject: "主题", body: "正文")
     private func key(account: String = "a@example.invalid", mail: String = "same", hash: String = "body1",
                      model: String = "m", prompt: Int = 1, language: String = "zh-Hans") -> TranslationCacheKey {
-        .init(accountID: account, mailID: mail, bodyHash: hash, model: model, promptVersion: prompt, targetLanguage: language)
+        .init(accountID: account, mailID: mail, bodyHash: hash,
+              configuration: TranslationConfig(baseURL: "https://api.example.invalid/v1", model: model,
+                  systemPrompt: "prompt-v\(prompt)", targetLanguage: language))
+    }
+
+    func testConfigurationChangesMissPersistedTranslations() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("translations.db").path
+        let cache = SQLiteTranslationCache(path: path)
+        let original = TranslationConfig(baseURL: "https://provider-a.example.invalid/v1", model: "same-model",
+            temperature: nil, systemPrompt: "Translate faithfully.")
+        func configuredKey(_ config: TranslationConfig) -> TranslationCacheKey {
+            .init(accountID: "a@example.invalid", mailID: "same-mail", bodyHash: "same-source", configuration: config)
+        }
+        let originalKey = configuredKey(original)
+        let ticket = try await cache.begin(originalKey)
+        try await cache.put(value, for: ticket, validated: true)
+        let reopened = SQLiteTranslationCache(path: path)
+        let hit = try await reopened.get(configuredKey(original))
+        XCTAssertEqual(hit, value)
+
+        var provider = original; provider.baseURL = "https://provider-b.example.invalid/v1"
+        var temperature = original; temperature.temperature = 0.2
+        var changedTemperature = original; changedTemperature.temperature = 0.7
+        var prompt = original; prompt.systemPrompt = "Use a different translation style."
+        for config in [provider, temperature, changedTemperature, prompt] {
+            let changedKey = configuredKey(config)
+            let miss = try await reopened.get(changedKey)
+            XCTAssertNil(miss, "configuration change must not reuse the stored translation")
+            let changedValue = CachedTranslation(subject: "新主题", body: config.baseURL + config.systemPrompt + String(describing: config.temperature))
+            let changedTicket = try await reopened.begin(changedKey)
+            try await reopened.put(changedValue, for: changedTicket, validated: true)
+            let changedHit = try await cache.get(configuredKey(config))
+            XCTAssertEqual(changedHit, changedValue)
+            let unchangedHit = try await cache.get(originalKey)
+            XCTAssertEqual(unchangedHit, value)
+        }
+    }
+
+    func testLegacyRawPromptVersionDoesNotHitConfiguredKey() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("translations.db").path
+        let cache = SQLiteTranslationCache(path: path)
+        let config = TranslationConfig(baseURL: "https://provider.example.invalid/v1", model: "m")
+        let currentKey = TranslationCacheKey(accountID: "a@example.invalid", mailID: "mail", bodyHash: "source", configuration: config)
+        _ = try await cache.get(currentKey) // Create the production schema.
+        let legacy = try Store(path: path)
+        try legacy.run("INSERT INTO translations VALUES(?,?,?,?,?,?,?)", [
+            .text(currentKey.accountID), .text(currentKey.mailID), .text(currentKey.bodyHash), .text(currentKey.model),
+            .int(TranslationConfig.promptVersion), .text(currentKey.targetLanguage), .blob(try JSONEncoder().encode(value))])
+        let miss = try await cache.get(currentKey)
+        XCTAssertNil(miss, "legacy entries without configuration fingerprints must not be reused")
+        let ticket = try await cache.begin(currentKey)
+        let fresh = CachedTranslation(subject: "新译文", body: "已按当前配置翻译")
+        try await cache.put(fresh, for: ticket, validated: true)
+        let hit = try await cache.get(currentKey)
+        XCTAssertEqual(hit, fresh)
     }
 
     func testKeyDimensionsAndAccountIsolation() async throws {

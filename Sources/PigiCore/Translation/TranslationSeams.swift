@@ -39,20 +39,25 @@ public protocol TranslationPolicy: Sendable {
 }
 
 public struct TranslationCacheKey: Hashable, Sendable {
-    public var accountID: String
-    public var mailID: String
-    public var bodyHash: String
-    public var model: String
-    public var promptVersion: Int
-    public var targetLanguage: String
+    public let accountID: String
+    public let mailID: String
+    public let bodyHash: String
+    public let model: String
+    /// Includes the prompt contract version, provider, temperature and actual system prompt.
+    public let promptVersion: Int
+    public let targetLanguage: String
 
-    public init(accountID: String, mailID: String, bodyHash: String, model: String, promptVersion: Int, targetLanguage: String) {
+    /// Use the same configuration snapshot as the request. There is deliberately no raw-version
+    /// initializer: callers cannot omit the editable settings when constructing a cache key.
+    public init(accountID: String, mailID: String, bodyHash: String, configuration: TranslationConfig) {
         self.accountID = accountID
         self.mailID = mailID
         self.bodyHash = bodyHash
-        self.model = model
-        self.promptVersion = promptVersion
-        self.targetLanguage = targetLanguage
+        self.model = configuration.model
+        self.promptVersion = Self.promptFingerprint(version: TranslationConfig.promptVersion,
+            systemPrompt: configuration.systemPrompt, temperature: configuration.temperature,
+            endpoint: configuration.baseURL)
+        self.targetLanguage = configuration.targetLanguage
     }
 }
 

@@ -4,14 +4,30 @@ public struct TranslationPermissionError: Error, Sendable {
     public let permission: TranslationPermission
 }
 
+#if DEBUG
+struct TranslationDependencies {
+    let configStore: TranslationConfigStore
+    let keyStore: any KeyStore
+    let transport: any HTTPTransport
+    let privacy: TranslationPrivacySettings
+}
+#endif
+
 extension LocalEngine {
-    /// Application request boundary. The optional dependencies are internal test seams;
-    /// ArchiveClient uses persisted config, real account privacy, KeychainVault and URLSession.
-    func translateMail(account email: String, id: String,
-                       configStore: TranslationConfigStore = TranslationConfigStore(),
-                       keyStore: any KeyStore = KeychainKeyStore(),
-                       transport: any HTTPTransport = URLSessionTransport(),
-                       privacy: TranslationPrivacySettings? = nil) async throws -> CachedTranslation {
+    /// ArchiveClient always reaches this method on LocalEngine.shared.
+    func translateMail(account email: String, id: String) async throws -> CachedTranslation {
+        #if DEBUG
+        let dependencies = translationDependencies
+        let configStore = dependencies?.configStore ?? TranslationConfigStore()
+        let keyStore: any KeyStore = dependencies?.keyStore ?? KeychainKeyStore()
+        let transport: any HTTPTransport = dependencies?.transport ?? URLSessionTransport()
+        let privacy = dependencies?.privacy
+        #else
+        let configStore = TranslationConfigStore()
+        let keyStore = KeychainKeyStore()
+        let transport = URLSessionTransport()
+        let privacy: TranslationPrivacySettings? = nil
+        #endif
         try Task.checkCancellation()
         let email = email.lowercased()
         guard let account = try account(email) else { throw TranslationPermissionError(permission: .disabled) }

@@ -1,7 +1,27 @@
 import XCTest
 @testable import PigiCore
 
+private struct ProductionEngineState: @unchecked Sendable {
+    let store: Store?
+    let cache: SQLiteTranslationCache
+    let dependencies: TranslationDependencies?
+}
+
 private extension LocalEngine {
+    func saveProductionState() -> ProductionEngineState {
+        ProductionEngineState(store: store, cache: translationCache, dependencies: translationDependencies)
+    }
+
+    func installProductionDependencies(_ dependencies: TranslationDependencies) {
+        translationDependencies = dependencies
+    }
+
+    func restoreProductionState(_ state: ProductionEngineState) {
+        store = state.store
+        translationCache = state.cache
+        translationDependencies = state.dependencies
+    }
+
     func seedProductionMail(cache: SQLiteTranslationCache, html: Bool) throws {
         translationCache = cache
         let memory = try Store(path: ":memory:")
@@ -54,7 +74,8 @@ private actor ProductionTransport: HTTPTransport {
 
 @MainActor
 private final class ProductionFixture {
-    let engine = LocalEngine()
+    let engine = LocalEngine.shared
+    private var savedState: ProductionEngineState?
     let cache = SQLiteTranslationCache(path: ":memory:")
     let transport = ProductionTransport()
     let defaults: UserDefaults
@@ -70,15 +91,20 @@ private final class ProductionFixture {
             systemPrompt: "Translate faithfully."))
         privacy.setEnabled(true, accountID: "mail@example.invalid", isProton: false)
         privacy.grantServiceConsent(endpoint: configStore.load().baseURL)
+        savedState = await engine.saveProductionState()
         try await engine.seedProductionMail(cache: cache, html: html)
+        await engine.installProductionDependencies(TranslationDependencies(configStore: configStore,
+            keyStore: ProductionKeyStore(), transport: transport, privacy: privacy))
     }
 
-    func cleanup() { defaults.removePersistentDomain(forName: suite) }
+    func cleanup() async {
+        if let savedState { await engine.restoreProductionState(savedState) }
+        defaults.removePersistentDomain(forName: suite)
+    }
 
-    // Exercise the engine method used by ArchiveClient, never construct or query a cache key in these tests.
+    // Exercise the exact public application entry and its LocalEngine.shared dispatch.
     func request() async throws -> CachedTranslation {
-        try await engine.translateMail(account: "mail@example.invalid", id: "one", configStore: configStore,
-            keyStore: ProductionKeyStore(), transport: transport, privacy: privacy)
+        try await ArchiveClient().translateMail(account: "mail@example.invalid", id: "one")
     }
 }
 
@@ -86,7 +112,7 @@ final class ProductionTranslationTests: XCTestCase {
     @MainActor
     func testEngineRequestsUseConfigurationForCacheReadAndWrite() async throws {
         let fixture = try await ProductionFixture()
-        defer { fixture.cleanup() }
+        addTeardownBlock { await fixture.cleanup() }
         let original = fixture.configStore.load()
         let first = try await fixture.request()
         XCTAssertEqual(first, CachedTranslation(subject: "你好 主题", body: "你好 世界"))
@@ -129,7 +155,7 @@ final class ProductionTranslationTests: XCTestCase {
     @MainActor
     func testConfigurationEditDuringRequestDoesNotChangeSnapshotOrWriteKey() async throws {
         let fixture = try await ProductionFixture()
-        defer { fixture.cleanup() }
+        addTeardownBlock { await fixture.cleanup() }
         let original = fixture.configStore.load()
         var next = original; next.temperature = 0.7
         let store = fixture.configStore
@@ -154,7 +180,7 @@ final class ProductionTranslationTests: XCTestCase {
     @MainActor
     func testAlignmentFailureAndCancellationDoNotCacheProductionResults() async throws {
         let fixture = try await ProductionFixture()
-        defer { fixture.cleanup() }
+        addTeardownBlock { await fixture.cleanup() }
         await fixture.transport.setMalformed(true)
         do { _ = try await fixture.request(); XCTFail("accepted malformed translation") }
         catch let error as TranslationError { XCTAssertEqual(error, .misaligned) }
@@ -174,7 +200,7 @@ final class ProductionTranslationTests: XCTestCase {
     @MainActor
     func testClearDuringProductionRequestRejectsLateWrite() async throws {
         let fixture = try await ProductionFixture()
-        defer { fixture.cleanup() }
+        addTeardownBlock { await fixture.cleanup() }
         let cache = fixture.cache
         await fixture.transport.onNextSend { try await cache.clear() }
         do { _ = try await fixture.request(); XCTFail("wrote a late translation after clear") }
@@ -187,7 +213,7 @@ final class ProductionTranslationTests: XCTestCase {
     @MainActor
     func testHTMLUsesValidatedPipelineAndWholeMailCache() async throws {
         let fixture = try await ProductionFixture(html: true)
-        defer { fixture.cleanup() }
+        addTeardownBlock { await fixture.cleanup() }
         let first = try await fixture.request()
         XCTAssertTrue(first.body.contains("你好"))
         XCTAssertTrue(first.body.contains("<b>世界</b>"))

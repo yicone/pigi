@@ -93,11 +93,14 @@ struct MailDetailContent: View {
     }
 
     private var translationSource: TranslationSource {
-        TranslationSource(id: mail.id, body: mail.body, isHTML: mail.isHTML, loaded: mail.bodyLoaded)
+        TranslationSource(id: mail.id, account: mail.accountID, remoteID: mail.remoteID,
+                          body: mail.body, isHTML: mail.isHTML, loaded: mail.bodyLoaded)
     }
 
     private struct TranslationSource: Equatable {
         let id: String
+        let account: String
+        let remoteID: String
         let body: String
         let isHTML: Bool
         let loaded: Bool
@@ -157,7 +160,7 @@ struct MailDetailContent: View {
                 if translation.isTranslating { ProgressView().controlSize(.small) }
                 GlassPill(title: translation.isTranslating ? "翻译中…" : (translation.showingTranslation ? "原文" : "翻译"),
                           systemImage: "character.bubble") {
-                    translation.toggle(body: mail.body, isHTML: mail.isHTML)
+                    translation.toggle(account: mail.accountID, id: mail.remoteID)
                 }
                 .disabled(!mail.bodyLoaded || translation.isTranslating)
                 .accessibilityIdentifier("mail.translation.toggle")

@@ -1,8 +1,11 @@
 import Foundation
+import os
 
 /// Whole-mail request orchestration, used by LocalEngine's application API.
 /// One immutable request configuration drives both the OpenAI client and all cache operations.
 struct CachedMailTranslator: Sendable {
+    /// Fixed literals only: never mail ids, accounts, subjects, bodies or endpoints.
+    private let logger = Logger(subsystem: "one.yic.pigi", category: "translation")
     private let configuration: TranslationConfig
     private let cache: any TranslationCache
     private let translator: OpenAICompatibleTranslator
@@ -30,8 +33,10 @@ struct CachedMailTranslator: Sendable {
         let ticket = try await cache.begin(key)
         if let hit = try await cache.get(key) {
             try Task.checkCancellation()
+            logger.info("cache outcome=hit")
             return hit
         }
+        logger.info("cache outcome=miss")
         try Task.checkCancellation()
         let translatedSubject: String
         if TranslationLanguage.shouldTranslate(subject) {
@@ -46,6 +51,7 @@ struct CachedMailTranslator: Sendable {
         // Both the HTTP client's id/count checks and the complete document's alignment
         // validation have succeeded. Throws/cancellation above never reach this write.
         try await cache.put(value, for: ticket, validated: true)
+        logger.info("cache outcome=stored")
         return value
     }
 }

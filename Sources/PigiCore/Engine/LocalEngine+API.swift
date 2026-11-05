@@ -15,12 +15,13 @@ extension LocalEngine {
 
     func accounts() throws -> [ArchiveAccount] {
         try db().query("""
-            SELECT a.email,a.kind,a.backfill_done,a.total,a.last_sync,a.last_error,
+            SELECT a.email,a.kind,a.backfill_done,a.total,a.last_sync,a.last_error,a.last_error_kind,
             (SELECT count(*) FROM messages m WHERE m.account=a.email) AS stored FROM accounts a ORDER BY a.email
             """).map { r in
             ArchiveAccount(
                 email: r["email"]?.text ?? "", backfillDone: r["backfill_done"]?.int ?? 0, total: r["total"]?.int ?? 0,
-                lastSync: r["last_sync"]?.int, lastError: r["last_error"]?.text, stored: r["stored"]?.int ?? 0, kind: r["kind"]?.text)
+                lastSync: r["last_sync"]?.int, lastError: r["last_error"]?.text, stored: r["stored"]?.int ?? 0, kind: r["kind"]?.text,
+                lastErrorKind: r["last_error_kind"]?.text)
         }
     }
 

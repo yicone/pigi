@@ -460,6 +460,10 @@ struct AccountsPage: View {
                 Text(error).font(.system(size: 12)).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let summary = state.networkErrorSummary {
+                Text(summary).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -510,9 +514,15 @@ struct AccountsPage: View {
     @ViewBuilder
     private func syncState(_ item: ArchiveAccount?) -> some View {
         if let error = item?.lastError {
-            Label("出错", systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 11.5)).foregroundStyle(.red)
-                .help(error)
+            if item?.lastErrorKind == AccountErrorKind.network.rawValue {
+                Label("暂时无法连接", systemImage: "wifi.exclamationmark")
+                    .font(.system(size: 11.5)).foregroundStyle(.orange)
+                    .help(error)
+            } else {
+                Label("出错", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11.5)).foregroundStyle(.red)
+                    .help(error)
+            }
         } else if let item, item.backfillDone != 1 {
             HStack(spacing: 5) {
                 ProgressView().controlSize(.small)

@@ -98,11 +98,11 @@ extension LocalEngine {
             }
             let count = try s.query("SELECT count(*) AS n FROM messages WHERE account=?", [.text(email)]).first?["n"]?.int ?? 0
             let more = fresh.count > slice
-            try s.run("UPDATE accounts SET backfill_done=?,total=?,last_sync=?,last_error=NULL WHERE email=?",
+            try s.run("UPDATE accounts SET backfill_done=?,total=?,last_sync=?,last_error=NULL,last_error_kind=NULL WHERE email=?",
                       [.int(more ? 0 : 1), .int(count), .int(now()), .text(email)])
             return more ? 2 : pollSeconds
         } catch {
-            setError(email, error.localizedDescription)
+            setError(email, error.localizedDescription, kind: Self.syncErrorKind(error))
             return 300
         }
     }

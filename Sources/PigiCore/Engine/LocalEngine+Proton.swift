@@ -76,7 +76,7 @@ extension LocalEngine {
             }
             try await pullProton(email, remote: remote)
             try checkProton(email, remote)
-            try db().run("UPDATE accounts SET last_sync=?,last_error=NULL,total=(SELECT count(*) FROM messages WHERE account=? AND status!='deleted') WHERE email=?",
+            try db().run("UPDATE accounts SET last_sync=?,last_error=NULL,last_error_kind=NULL,total=(SELECT count(*) FROM messages WHERE account=? AND status!='deleted') WHERE email=?",
                          [.int(now()), .text(email), .text(email)])
             let done = try account(email)?["backfill_done"]?.int == 1
             return done ? pollSeconds : 2
@@ -86,12 +86,12 @@ extension LocalEngine {
             // Never save SDK, SQL or decoding diagnostics, which may carry content.
             let safe = (error as? CredentialPersistenceError)?.localizedDescription
                 ?? (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
-            setError(email, safe)
+            setError(email, safe, kind: Self.syncErrorKind(error))
             if error is CredentialPersistenceError {
                 (protonSessions[email] as? ProtonSession)?.deactivate()
                 protonSessions[email] = nil
                 announce()
-            } else if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
+            } else if let code = error as? ProtonHelperError, [.credentials, .notAuthenticated, .sessionMissing, .transport, .timeout, .key, .keyMissing, .keyFormat, .keyDecryption].contains(code) {
                 (protonSessions[email] as? ProtonSession)?.deactivate()
                 protonSessions[email] = nil
             }

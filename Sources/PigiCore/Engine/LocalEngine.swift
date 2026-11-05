@@ -33,7 +33,7 @@ public actor LocalEngine {
         """
         CREATE TABLE IF NOT EXISTS accounts(
           email TEXT PRIMARY KEY, history_id TEXT, page_token TEXT, backfill_done INTEGER DEFAULT 0,
-          total INTEGER DEFAULT 0, last_sync INTEGER, last_error TEXT, added_at INTEGER,
+          total INTEGER DEFAULT 0, last_sync INTEGER, last_error TEXT, last_error_kind TEXT, added_at INTEGER,
           kind TEXT DEFAULT 'gmail', imap_host TEXT, imap_port INTEGER)
         """,
         """
@@ -68,8 +68,53 @@ public actor LocalEngine {
         if !((try opened.query("PRAGMA table_info(messages)")).contains { $0["name"]?.text == "signature_status" }) {
             try opened.run("ALTER TABLE messages ADD COLUMN signature_status TEXT")
         }
+        try Self.migrate(opened)
         store = opened
         return opened
+    }
+
+    /// Adds `accounts.last_error_kind` to databases created before it existed
+    /// and classifies stored error texts into the new buckets. Idempotent.
+    static func migrate(_ store: Store) throws {
+        if (try store.query("PRAGMA table_info(accounts)")).contains(where: { $0["name"]?.text == "last_error_kind" }) { return }
+        try store.run("ALTER TABLE accounts ADD COLUMN last_error_kind TEXT")
+        for row in try store.query("SELECT email,last_error FROM accounts WHERE last_error IS NOT NULL") {
+            guard let email = row["email"]?.text, let message = row["last_error"]?.text else { continue }
+            try store.run("UPDATE accounts SET last_error_kind=? WHERE email=?",
+                          [.text(legacyErrorKind(message).rawValue), .text(email)])
+        }
+    }
+
+    /// Classifies an error text stored by an older build that had no kind column.
+    static func legacyErrorKind(_ message: String) -> AccountErrorKind {
+        let keychain = [CredentialPersistenceError.writeFailed.localizedDescription,
+                        CredentialPersistenceError.recoveryFailed.localizedDescription,
+                        CredentialPersistenceError.readFailed.localizedDescription]
+        if keychain.contains(message) { return .keychain }
+        if ["无法连接 Proton", "请求超时", "请求过于频繁", "代理需要认证", "将重试"].contains(where: message.contains) { return .network }
+        if ["会话失效", "账号、密码或验证码", "请重新登录"].contains(where: message.contains) { return .auth }
+        return .other
+    }
+
+    /// Classifies a live sync error. Only credential-store failures are keychain.
+    static func syncErrorKind(_ error: Error) -> AccountErrorKind {
+        if error is CredentialPersistenceError { return .keychain }
+        if let error = error as? ProtonHelperError { return error.kind }
+        if error is GmailRevoked { return .auth }
+        if let error = error as? ImapError {
+            if error.message.hasPrefix("登录失败") { return .auth }
+            if ["连接", "读取失败", "发送失败", "服务器关闭"].contains(where: error.message.hasPrefix) { return .network }
+            return .other
+        }
+        if let error = error as? URLError {
+            switch error.code {
+            case .notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost,
+                 .dnsLookupFailed, .internationalRoamingOff, .callIsActive, .dataNotAllowed, .secureConnectionFailed:
+                return .network
+            default: return .other
+            }
+        }
+        return .other
     }
 
     func nextSeq() throws -> Int {
@@ -136,8 +181,9 @@ public actor LocalEngine {
         try db().query("SELECT * FROM accounts WHERE email=?", [.text(email)]).first
     }
 
-    func setError(_ email: String, _ text: String?) {
-        _ = try? db().run("UPDATE accounts SET last_error=? WHERE email=?", [.opt(text), .text(email)])
+    func setError(_ email: String, _ text: String?, kind: AccountErrorKind?) {
+        _ = try? db().run("UPDATE accounts SET last_error=?,last_error_kind=? WHERE email=?",
+                          [.opt(text), .opt(text == nil ? nil : kind?.rawValue), .text(email)])
     }
 
     func announce() {
@@ -283,15 +329,15 @@ public actor LocalEngine {
             if (acct["backfill_done"]?.int ?? 0) == 0 {
                 try await backfill(gm, email, pageToken: acct["page_token"]?.text)
             }
-            try s.run("UPDATE accounts SET total=?,last_sync=?,last_error=NULL WHERE email=?",
+            try s.run("UPDATE accounts SET total=?,last_sync=?,last_error=NULL,last_error_kind=NULL WHERE email=?",
                       [.int(profile["messagesTotal"] as? Int ?? 0), .int(now()), .text(email)])
             let done = try account(email)?["backfill_done"]?.int ?? 0
             return done == 1 ? pollSeconds : 2
         } catch is GmailRevoked {
-            setError(email, GmailRevoked().errorDescription)
+            setError(email, GmailRevoked().errorDescription, kind: .auth)
             return 3600
         } catch {
-            setError(email, error.localizedDescription)
+            setError(email, error.localizedDescription, kind: Self.syncErrorKind(error))
             return 120
         }
     }

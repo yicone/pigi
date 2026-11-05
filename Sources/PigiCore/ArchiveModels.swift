@@ -8,9 +8,10 @@ public struct ArchiveAccount: Identifiable {
     public let lastError: String?
     public let stored: Int
     public let kind: String?
+    public let lastErrorKind: String?
     public var id: String { email }
 
-    public init(email: String, backfillDone: Int, total: Int, lastSync: Int?, lastError: String?, stored: Int, kind: String?) {
+    public init(email: String, backfillDone: Int, total: Int, lastSync: Int?, lastError: String?, stored: Int, kind: String?, lastErrorKind: String? = nil) {
         self.email = email
         self.backfillDone = backfillDone
         self.total = total
@@ -18,6 +19,7 @@ public struct ArchiveAccount: Identifiable {
         self.lastError = lastError
         self.stored = stored
         self.kind = kind
+        self.lastErrorKind = lastErrorKind
     }
 }
 

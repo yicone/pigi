@@ -33,12 +33,13 @@ Synthetic handshake (contains no account data):
 
 ```json
 {"version":1,"id":1,"method":"hello","params":{}}
-{"version":1,"id":1,"result":{"protocol":1,"helper_version":"0.2.0","max_frame_bytes":8388608,"methods":["login","list","decrypt","logout","snapshot","metadata","labels","latest","events","session","resume"]}}
+{"version":1,"id":1,"result":{"protocol":1,"helper_version":"0.4.0","max_frame_bytes":8388608,"methods":["configure_network","begin_login","continue_login","login","list","decrypt","logout","snapshot","metadata","labels","latest","events","session","resume"]}}
 ```
 
 | Method | Params | Result |
 | --- | --- | --- |
 | `hello` | `{}` | Version, limit, supported methods |
+| `configure_network` | `scheme` (`direct`, `http`, or `socks5`), `host`, `port` | `{"configured":true}` before authentication. `http` is an HTTP proxy used with CONNECT. No username, password, PAC body, or environment variable |
 | `login` | `username`, `password`; optional `mailbox_password`, `otp` strings | `{"authenticated":true}` |
 | `list` | `page` ≥ 0, `limit` 1–100 | Array of `{id,subject,time,unread}` for inbox, newest first; time is Unix seconds |
 | `decrypt` | `id` nonempty, ≤1024 bytes | `{body,mime_type,signature_status:"unverified"}`; UTF-8 plaintext decrypted locally with matching AddressID key |
@@ -50,6 +51,19 @@ Synthetic handshake (contains no account data):
 | `session` | `{}` | `{uid,access,refresh,salted,email}`; sensitive export for Keychain only; `salted` is base64 of the derived unlock secret |
 | `resume` | Fields from `session` | `{authenticated:true}` after restoring session and unlocking address keys |
 | `logout` | `{}` | `{"logged_out":true}` after remote revocation and local key clearing |
+
+Swift resolves the proxy and sends `configure_network` immediately after a compatible
+`hello`, before login or resume. The child starts with `Proxy` disabled, so it
+does not read `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`. `host` must not
+contain `@` or other userinfo. A call after authentication returns
+`already_authenticated` and leaves the transport unchanged. If `hello` does not
+list `configure_network`, Swift stops the child instead of continuing direct.
+System mode reads `CFNetworkCopyProxiesForURL` for `https://mail.proton.me/api`:
+HTTPS CONNECT, then SOCKS5, then direct. A PAC result is sent as `direct` and
+the settings page says the PAC proxy is not applied. Proxy dial failures stay
+on that proxy; they are `network`, or `proxy` for an API-formatted HTTP 407, and
+are not retried without the proxy. IMAP and WKWebView are outside this setting.
+The default mode is `system`.
 
 Login performs SRP, optional TOTP and key unlock. Failed post-auth login attempts
 revoke the provisional session. A failed revoke keeps the client available only

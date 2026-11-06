@@ -129,6 +129,7 @@ private struct GeneralPage: View {
                 Toggle("", isOn: $showFullEmail).labelsHidden().toggleStyle(.switch)
                     .onChange(of: showFullEmail) { layout.sidebarWidth = LayoutState.defaultWidth }
             }
+            ProtonNetworkSection()
             HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("在 Dock 中显示").font(.system(size: 13.5))
@@ -159,6 +160,91 @@ struct PageHeader: View {
                 .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct ProtonNetworkSection: View {
+    @AppStorage(ProtonNetworkSettings.modeKey) private var modeRaw = ProtonProxyMode.system.rawValue
+    @AppStorage(ProtonNetworkSettings.schemeKey) private var scheme = "http"
+    @AppStorage(ProtonNetworkSettings.hostKey) private var host = ""
+    @AppStorage(ProtonNetworkSettings.portKey) private var port = 0
+
+    private var mode: ProtonProxyMode { ProtonProxyMode.resolved(modeRaw) }
+    private var fingerprint: String { "\(modeRaw)|\(scheme)|\(host)|\(port)" }
+    private var selection: ProtonNetworkSelection {
+        ProtonNetworkSettings.selection(mode: mode, manualScheme: scheme, manualHost: host, manualPort: port)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Proton 网络").font(.system(size: 13.5))
+            Text("仅对 Proton 邮件同步生效。更改后会重新建立同步会话。不支持需要账号密码的代理，代理失败也不会改为直连。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Picker("Proton 网络", selection: $modeRaw) {
+                ForEach(ProtonProxyMode.allCases) { item in
+                    Text(item.title).tag(item.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            status
+            if mode == .manual { manualFields }
+        }
+        .onChange(of: fingerprint) {
+            Task { await LocalEngine.shared.resetProtonSessionsForNetworkChange() }
+        }
+    }
+
+    @ViewBuilder private var status: some View {
+        switch mode {
+        case .system:
+            switch selection.resolution {
+            case .pacIgnored:
+                Text("系统使用 PAC，Proton 未生效，可改为手动")
+                    .font(.system(size: 12)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            case let .proxy(_, host, port):
+                Text("当前跟随系统代理 \(host):\(port)。优先安全网页代理，其次 SOCKS5。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .direct:
+                Text("未发现适用于 Proton 的系统 HTTPS 或 SOCKS 代理，将直连。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .invalid:
+                Text("系统代理无法使用，Proton 不会改为直连。")
+                    .font(.system(size: 12)).foregroundStyle(.orange)
+            }
+        case .manual:
+            if case .invalid = selection.resolution {
+                Text("主机或端口无效。修正之前，Proton 不会改为直连。")
+                    .font(.system(size: 12)).foregroundStyle(.orange)
+            } else {
+                Text("安全网页代理由 helper 通过 HTTP CONNECT 连接。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+        case .direct:
+            Text("Proton 同步不使用代理。")
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var manualFields: some View {
+        HStack(spacing: 8) {
+            Picker("类型", selection: $scheme) {
+                Text("安全网页代理").tag("http")
+                Text("SOCKS5").tag("socks5")
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            TextField("主机", text: $host)
+                .textFieldStyle(.roundedBorder)
+            TextField("端口", value: $port, format: .number.grouping(.never))
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
         }
     }
 }

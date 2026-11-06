@@ -180,6 +180,20 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
     }
 }
 
+extension ProtonHelperError {
+    /// Network, timeout and proxy copy follow the proxy mode. Every other code
+    /// keeps the fixed text below so classification and stored wording stay paired.
+    func protonSyncMessage(defaults: UserDefaults = .standard) -> String {
+        switch self {
+        case .network, .timeout, .proxy:
+            let selection = ProtonNetworkSettings.current(defaults: defaults)
+            return protonSyncMessage(mode: selection.mode, resolution: selection.resolution)
+        default:
+            return errorDescription ?? "Proton 操作失败（\(rawValue)）"
+        }
+    }
+}
+
 extension ProtonHelperError: LocalizedError {
     public var errorDescription: String? {
         switch self {

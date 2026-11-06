@@ -202,6 +202,7 @@ public final class ProtonHelperClient: @unchecked Sendable {
     }
 
     private struct Empty: Encodable {}
+    private struct Configured: Decodable { let configured: Bool }
     private struct Request<P: Encodable>: Encodable {
         let version = 1
         let id: UInt64
@@ -221,6 +222,7 @@ public final class ProtonHelperClient: @unchecked Sendable {
             queue.async {
                 do { continuation.resume(returning: try work()) }
                 catch let error as ProtonHelperError { continuation.resume(throwing: error) }
+                catch let error as ProtonProxyConfigurationError { continuation.resume(throwing: error) }
                 catch { continuation.resume(throwing: ProtonHelperError.transport) }
             }
         }
@@ -228,6 +230,8 @@ public final class ProtonHelperClient: @unchecked Sendable {
 
     private func start() throws -> ProtonHelperInfo {
         if let info, process?.isRunning == true { return info }
+        let selection = ProtonNetworkSettings.current()
+        guard let wire = selection.wire else { throw ProtonProxyConfigurationError.make(selection) }
         stop()
         let child = Process()
         let stdin = Pipe(), stdout = Pipe()
@@ -248,8 +252,16 @@ public final class ProtonHelperClient: @unchecked Sendable {
         _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         let hello: ProtonHelperInfo = try exchange("hello", Empty())
         guard hello.protocol == 1, hello.maxFrameBytes == Self.maxFrame,
-              Set(["login", "list", "decrypt", "logout"]).isSubset(of: Set(hello.methods)) else {
+              Set(["login", "list", "decrypt", "logout", "configure_network"]).isSubset(of: Set(hello.methods)) else {
             stop(); throw ProtonHelperError.protocolViolation
+        }
+        do {
+            let configured: Configured = try exchange("configure_network", wire)
+            guard configured.configured else { throw ProtonHelperError.protocolViolation }
+        } catch {
+            // An old helper that omits the method must not keep running direct.
+            stop()
+            throw error
         }
         info = hello
         return hello

@@ -82,11 +82,14 @@ private final class TranslationDocument {
             for marker in markers.dropFirst() {
                 guard let range = remainder.range(of: marker) else { throw MailTranslationError.alignmentFailed }
                 let fragment = String(remainder[..<range.lowerBound])
-                guard !markers.contains(where: { fragment.contains($0) }) else { throw MailTranslationError.alignmentFailed }
+                guard !fragment.contains("⟦pigi:") else { throw MailTranslationError.alignmentFailed }
                 result.append(fragment)
                 remainder = remainder[range.upperBound...]
             }
-            guard remainder.isEmpty else { throw MailTranslationError.alignmentFailed }
+            // The closing boundary already ended the final text node. Providers
+            // sometimes append text outside it; discard that text, never render it.
+            // Extra or truncated markers still mean ambiguous/corrupt alignment.
+            guard !remainder.contains("⟦pigi:") else { throw MailTranslationError.alignmentFailed }
             return result
         }
     }

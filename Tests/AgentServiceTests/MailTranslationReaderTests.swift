@@ -95,6 +95,34 @@ final class MailTranslationReaderTests: XCTestCase {
         }
     }
 
+    func testAlignmentFailuresKeepOriginalAndUseDistinctRetryMessage() async {
+        let alignmentMessage = "译文与原文片段未能对齐，请重试翻译。"
+        for error in [MailTranslationError.alignmentFailed as Error, TranslationError.misaligned as Error] {
+            let recorder = TranslateRecorder(error: error)
+            let (reader, _, _) = fixture(recorder: recorder)
+            reader.toggle(account: account, id: mailID)
+            await reader.task?.value
+            XCTAssertEqual(reader.errorMessage, alignmentMessage)
+            XCTAssertNil(reader.translatedBody)
+            XCTAssertFalse(reader.showingTranslation)
+            XCTAssertFalse(reader.isTranslating)
+            await recorder.setError(nil)
+            reader.toggle(account: account, id: mailID)
+            await reader.task?.value
+            XCTAssertTrue(reader.showingTranslation)
+            XCTAssertNil(reader.errorMessage)
+        }
+        for (error, expected) in [
+            (TranslationError.timeout, "翻译超时，请重试或在设置中调大超时。"),
+            (.network("private-network-detail"), "翻译失败，请检查网络与服务设置后重试。"),
+            (.http(status: 502, message: "private-response"), "翻译服务返回 HTTP 502，请检查设置后重试。"),
+            (.notConfigured, "请检查翻译设置中的服务地址、模型和密钥。")
+        ] {
+            XCTAssertEqual(MailTranslationReader.message(for: error), expected)
+            XCTAssertNotEqual(expected, alignmentMessage)
+        }
+    }
+
     func testEngineFailuresMapWithoutLeakingDetailsAndCancellationStaysSilent() async {
         for (error, expected) in [
             (SQLiteTranslationCache.Failure.invalidated, "翻译缓存刚被清空或账号已变更，请重试。"),

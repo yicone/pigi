@@ -105,7 +105,7 @@ extension LocalEngine {
         app.setActivationPolicy(.accessory)
         UserDefaults.standard.setVolatileDomain([
             "gmailAccounts": [String](), "imapAccounts": [String](), "protonAccounts": ["fixture@example.test"],
-            "hiddenAccounts": [String](), "sidebarGroups": Data(),
+            "hiddenAccounts": [String](), "sidebarGroups": Data(), "protonProxyMode": "direct",
         ], forName: UserDefaults.argumentDomain)
         Task { @MainActor in
             do { try await run(); exit(0) }
@@ -122,6 +122,7 @@ extension LocalEngine {
         try await eventRecoveryCases()
         try await timeoutRecoveryCases()
         try await errorKindCases()
+        try await networkSettingCases()
         let email = "fixture@example.test", other = "other@example.test"
         let engine = LocalEngine(), remote = FixtureProton()
         await remote.put("one", signature: "verified")
@@ -303,7 +304,9 @@ extension LocalEngine {
         for line in sys.stdin:
             r=json.loads(line)
             if r['method']=='hello':
-                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session','resume','latest','labels','snapshot','metadata','events']}
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['configure_network','login','list','decrypt','logout','session','resume','latest','labels','snapshot','metadata','events']}
+            elif r['method']=='configure_network':
+                result={'configured':True}
             elif r['method']=='session':
                 print(json.dumps({'version':1,'id':r['id'],'error':{'code':'not_authenticated'}}),flush=True)
                 continue
@@ -348,7 +351,9 @@ extension LocalEngine {
             r=json.loads(line)
             if r['method']=='hello':
                 open('\(hellos.path)','a').write('hello\\n')
-                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session','labels']}
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['configure_network','login','list','decrypt','logout','session','labels']}
+            elif r['method']=='configure_network':
+                result={'configured':True}
             elif r['method']=='labels':
                 print(json.dumps({'version':1,'id':r['id'],'error':{'code':'timeout'}}),flush=True)
                 continue
@@ -477,6 +482,70 @@ extension LocalEngine {
         print("PASS: last_error_kind migration adds the column and backfills message-classified kinds idempotently")
     }
 
+    static func restoreProxyDefaults() {
+        UserDefaults.standard.setVolatileDomain([
+            "gmailAccounts": [String](), "imapAccounts": [String](), "protonAccounts": ["fixture@example.test"],
+            "hiddenAccounts": [String](), "sidebarGroups": Data(), "protonProxyMode": "direct",
+        ], forName: UserDefaults.argumentDomain)
+    }
+
+    static func networkSettingCases() async throws {
+        defer { restoreProxyDefaults(); Keychain.rejectWrites(false) }
+        precondition(LocalEngine.syncErrorKind(ProtonHelperError.credentials) == .auth)
+        precondition(LocalEngine.syncErrorKind(ProtonProxyConfigurationError.make(ProtonNetworkSelection(mode: .manual, resolution: .invalid))) == .network)
+        UserDefaults.standard.setVolatileDomain([
+            "gmailAccounts": [String](), "imapAccounts": [String](), "protonAccounts": ["fixture@example.test"],
+            "hiddenAccounts": [String](), "sidebarGroups": Data(),
+            "protonProxyMode": "manual", "protonProxyManualScheme": "http",
+            "protonProxyManualHost": "127.0.0.1", "protonProxyManualPort": 9,
+        ], forName: UserDefaults.argumentDomain)
+        let email = "proxy@example.test"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-proxy-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("helper")
+        let source = """
+        #!/usr/bin/python3
+        import json,sys
+        for line in sys.stdin:
+            r=json.loads(line)
+            if r['method']=='hello':
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['configure_network','login','list','decrypt','logout','labels','session']}
+            elif r['method']=='configure_network':
+                result={'configured':True}
+            elif r['method']=='labels':
+                print(json.dumps({'version':1,'id':r['id'],'error':{'code':'network'}}),flush=True)
+                continue
+            elif r['method']=='session':
+                result={'uid':'synthetic','access':'synthetic','refresh':'synthetic','salted':'c3ludGhldGlj','email':'\(email)'}
+            else:
+                result={'logged_out':True}
+            print(json.dumps({'version':1,'id':r['id'],'result':result}),flush=True)
+        """
+        try source.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let session = ProtonSession(client: ProtonHelperClient(executable: executable), email: email)
+        let engine = LocalEngine()
+        try await engine.fixture(email, remote: session)
+        let delay = await engine.syncProton(email)
+        let account = try await engine.inspect("SELECT last_error,last_error_kind FROM accounts WHERE email='\(email)'").first
+        let expected = ProtonHelperError.network.protonSyncMessage(mode: .manual, resolution: .proxy(scheme: "http", host: "127.0.0.1", port: 9))
+        precondition(delay == 120)
+        precondition(account?["last_error"]?.text == expected, "sync error: \(account?["last_error"]?.text ?? "nil")")
+        precondition(account?["last_error_kind"]?.text == AccountErrorKind.network.rawValue)
+        let state = AppState()
+        state.updateCredentialErrors(from: try await engine.accounts())
+        precondition(state.displayedCredentialError == nil && state.serverCredentialError == nil,
+                     "a dead proxy must not raise the credential banner")
+        try await session.saveSecret()
+        Keychain.rejectWrites(true)
+        await engine.resetProtonSessionsForNetworkChange()
+        let cached = await engine.protonSessions[email]
+        precondition(cached == nil, "network change kept the old Proton session")
+        try await session.saveSecret()
+        print("PASS: manual proxy failure names host:port, stays a network error, and drops the session")
+    }
+
     static func sessionPersistence() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("proton-fixture-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -488,7 +557,9 @@ extension LocalEngine {
         for line in sys.stdin:
             r=json.loads(line)
             if r['method']=='hello':
-                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','session']}
+                result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['configure_network','login','list','decrypt','logout','session']}
+            elif r['method']=='configure_network':
+                result={'configured':True}
             elif r['method']=='session':
                 result={'uid':'synthetic-uid','access':'synthetic-access','refresh':'synthetic-refresh','salted':'c3ludGhldGlj','email':'fixture@example.test'}
             elif r['method']=='resume':

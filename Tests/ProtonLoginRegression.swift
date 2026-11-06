@@ -10,7 +10,10 @@ import sys,json
 n=0
 for line in sys.stdin:
  r=json.loads(line); m=r['method']; result=None; error=None
- if m=='hello': result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['login','list','decrypt','logout','begin_login','continue_login']}
+ if m=='hello': result={'protocol':1,'helper_version':'fixture','max_frame_bytes':8388608,'methods':['configure_network','login','list','decrypt','logout','begin_login','continue_login']}
+ elif m=='configure_network':
+  assert r['params']=={'scheme':'direct','host':'','port':0} and 'password' not in r['params']
+  result={'configured':True}
  elif m=='begin_login':
   assert r['params']['username']=='fixture' and r['params']['password']=='synthetic'
   result={'stage':'captcha','web_url':'https://verify.proton.me/?methods=email,captcha&token=bound','challenge':'bound'}

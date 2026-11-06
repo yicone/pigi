@@ -40,15 +40,24 @@ type ProtonBackend struct {
 	persistent   bool
 	pending      *pendingLogin
 	loginAttempt func(context.Context, string, []byte, *proton.APIHVDetails) (*proton.Client, proton.Auth, error)
+	transport    *http.Transport
+	directDial   func(context.Context, string, string) (net.Conn, error)
 }
 
 func NewBackend() *ProtonBackend {
 	logrus.SetOutput(io.Discard)
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	// No credential-bearing proxy environment is inherited by the Swift child.
-	t.DialContext = (&net.Dialer{Timeout: 15 * time.Second}).DialContext
+	// Swift sends configure_network. Never read HTTP(S)_PROXY / ALL_PROXY, and
+	// never fall back to a direct dial after a proxy has been installed.
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	t.Proxy = nil
+	t.DialContext = dialer.DialContext
 	t.ResponseHeaderTimeout = 30 * time.Second
-	return &ProtonBackend{manager: proton.New(proton.WithAppVersion("Other"), proton.WithRetryCount(0), proton.WithDebug(false), proton.WithLogger(quietLogger{}), proton.WithTransport(identifiedTransport{t}))}
+	return &ProtonBackend{
+		transport:  t,
+		directDial: dialer.DialContext,
+		manager:    proton.New(proton.WithAppVersion("Other"), proton.WithRetryCount(0), proton.WithDebug(false), proton.WithLogger(quietLogger{}), proton.WithTransport(identifiedTransport{t})),
+	}
 }
 
 func classify(err error, fallback string) *Fault {
@@ -104,6 +113,8 @@ type loginParams struct {
 
 func (b *ProtonBackend) Call(ctx context.Context, method string, raw json.RawMessage) (any, *Fault) {
 	switch method {
+	case "configure_network":
+		return b.configureNetwork(raw)
 	case "begin_login", "continue_login":
 		return b.loginCall(ctx, method, raw)
 	case "login":

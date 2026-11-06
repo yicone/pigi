@@ -50,6 +50,22 @@ extension LocalEngine {
         return previous
     }
 
+    /// Drop live Proton children so the next sync sends `configure_network` again.
+    /// Keychain sessions stay; this does not revoke them.
+    public func resetProtonSessionsForNetworkChange() {
+        var emails = Set(protonSessions.keys)
+        for session in protonSessions.values {
+            (session as? ProtonSession)?.deactivate()
+        }
+        protonSessions.removeAll()
+        if store != nil, let rows = try? db().query("SELECT email FROM accounts WHERE kind='proton'") {
+            for row in rows {
+                if let email = row["email"]?.text { emails.insert(email) }
+            }
+        }
+        for email in emails { trigger(email) }
+    }
+
     func protonLabels(_ email: String) throws -> [ProtonLabel] {
         try db().query("SELECT * FROM account_labels WHERE account=? ORDER BY type,name", [.text(email)]).map {
             ProtonLabel(id: $0["id"]?.text ?? "", name: $0["name"]?.text ?? "", parent: $0["parent"]?.text ?? "", type: $0["type"]?.int ?? 1)
@@ -85,7 +101,9 @@ extension LocalEngine {
             if let attempted, protonSessions[email] !== attempted { return pollSeconds }
             // Never save SDK, SQL or decoding diagnostics, which may carry content.
             let safe = (error as? CredentialPersistenceError)?.localizedDescription
-                ?? (error as? ProtonHelperError)?.localizedDescription ?? "Proton 同步未完成，将重试"
+                ?? (error as? ProtonHelperError)?.protonSyncMessage()
+                ?? (error as? ProtonProxyConfigurationError)?.localizedDescription
+                ?? "Proton 同步未完成，将重试"
             setError(email, safe, kind: Self.syncErrorKind(error))
             if error is CredentialPersistenceError {
                 (protonSessions[email] as? ProtonSession)?.deactivate()

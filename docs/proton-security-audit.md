@@ -32,10 +32,8 @@ Proton helper 及其本地缓存路径，不代表 Proton 服务或整个操作�
   `event.go` 的事件响应结构；不依赖可变/本地化的 Error 文本。
   `Retry-After` 暂未透传；服务要求更长冷却时间时可能继续返回 429，不会忙循环。
 - 子进程环境为空，**不会导入 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 或凭据**。
-  Go 默认 transport 不读取 macOS PAC/系统代理；当前 app 没有显式代理配置入口。
-  回归中的代理成功路径通过注入 transport 验证 HTTP 转发，407 用 API 格式响应验证。
-  这不证明真实系统代理、HTTPS CONNECT 认证代理或 VPN 已通过实机验收；此类失败显示网络错误。
-  网络提示中的“系统代理”用于指导排查，不表示已经支持读取系统代理配置。
+  407 仍用 API 格式响应归为 `proxy`。系统代理、手动代理和直连的现行行为见文末
+  「ACM-888」。关 TUN 后的实机同步、需要密码的代理和 VPN 仍未在本审计中验证。
 
 ## 缓存与清理
 
@@ -212,3 +210,19 @@ WebKit 存储，主框架限制官方 HTTPS 来源及挑战绑定，但子资源
 `bash Tests/proton-helper-regression.sh`、
 `bash Tests/proton-sync-regression.sh .build/proton-signature-evidence`（含合成 UI 三态截图）、
 `bash tools/build-debug.sh`（Debug 编译及 app/helper codesign 校验）。
+
+## ACM-888 代理配置（2026-11-06）
+
+设置页提供跟随系统、手动代理、直连，默认跟随系统，文案写明只影响 Proton 邮件同步。
+Swift 用 `CFNetworkCopyProxiesForURL` 读取 `https://mail.proton.me/api` 的系统代理：
+安全网页代理（helper 里用 Go 的 `http` scheme 做 CONNECT）优先于 SOCKS5，再否则直连。
+PAC 不执行，按直连配置，并提示可改为手动。例外列表命中时直连。协议只传
+scheme、host、port；host 含 `@`、越界端口、未知 scheme、认证后再配置都会拒绝。
+不发送代理账号或密码，也不读取代理环境变量。代理拨号失败保持该代理，不改回直连；
+这类错误仍是网络类，不出现钥匙串横幅。手动代理失败的提示包含 host:port。
+配置变化后丢掉当前 Proton 子进程，下次同步在 hello 之后重新发送 `configure_network`。
+helper 版本 0.4.0。IMAP 与 WKWebView 未改。
+
+Go 回归在回环上断言 CONNECT、SOCKS5、direct 不走代理、以及失败不落到源站。
+Swift 用注入的系统代理字典覆盖 HTTPS、SOCKS、PAC、无代理和 ExceptionsList。
+这些都不等于关 TUN、只开系统代理时用真实账号同步成功。

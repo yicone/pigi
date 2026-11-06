@@ -7,6 +7,7 @@ require (
 	github.com/ProtonMail/go-proton-api v0.0.0
 	github.com/ProtonMail/gopenpgp/v2 v2.11.1-proton
 	github.com/sirupsen/logrus v1.9.4
+	golang.org/x/net v0.58.0
 )
 
 require (
@@ -28,7 +29,6 @@ require (
 	gitlab.com/c0b/go-ordered-json v0.0.0-20201030195603-febf46534d5a // indirect
 	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

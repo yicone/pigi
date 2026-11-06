@@ -107,6 +107,7 @@ public actor LocalEngine {
     /// Classifies a live sync error. Only credential-store failures are keychain.
     static func syncErrorKind(_ error: Error) -> AccountErrorKind {
         if error is CredentialPersistenceError { return .keychain }
+        if error is ProtonProxyConfigurationError { return .network }
         if let error = error as? ProtonHelperError { return error.kind }
         if error is GmailRevoked { return .auth }
         if let error = error as? ImapError {

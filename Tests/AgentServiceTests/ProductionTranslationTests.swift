@@ -27,14 +27,14 @@ private extension LocalEngine {
         translationCache = cache
     }
 
-    func seedProductionMail(cache: SQLiteTranslationCache, html: Bool) throws {
+    func seedProductionMail(cache: SQLiteTranslationCache, html: Bool, body: String? = nil) throws {
         translationCache = cache
         let memory = try Store(path: ":memory:")
         for sql in Self.schema { try memory.run(sql) }
         store = memory
         try memory.run("INSERT INTO accounts(email,kind) VALUES('mail@example.invalid','imap')")
         try memory.run("INSERT INTO messages(account,id,subject,html) VALUES('mail@example.invalid','one','Hello subject',?)",
-            [html ? compress("<p>Hello <b>world</b></p>") : .null])
+            [html ? compress(body ?? "<p>Hello <b>world</b></p>") : .null])
         try memory.run("INSERT INTO fts(rowid,subject,sender,body) SELECT rowid,subject,'sender','Hello world' FROM messages")
     }
 
@@ -53,10 +53,14 @@ private struct ProductionKeyStore: KeyStore {
 private actor ProductionTransport: HTTPTransport {
     private var requests: [URLRequest] = []
     private var malformed = false
+    private var markerSuffixes: [Int: String] = [:]
+    private var dropClosingMarker = false
     private var hook: (@Sendable () async throws -> Void)?
 
     func recorded() -> [URLRequest] { requests }
     func setMalformed(_ value: Bool) { malformed = value }
+    func setMarkerSuffixes(_ value: [Int: String]) { markerSuffixes = value }
+    func setDropClosingMarker(_ value: Bool) { dropClosingMarker = value }
     func onNextSend(_ action: @escaping @Sendable () async throws -> Void) { hook = action }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
@@ -68,8 +72,15 @@ private actor ProductionTransport: HTTPTransport {
         let source = messages[1]["content"] as! String
         var items = try JSONDecoder().decode([TranslationItem].self, from: Data(source.utf8))
         items = malformed ? [] : items.map {
-            TranslationItem(i: $0.i, t: $0.t.replacingOccurrences(of: "Hello", with: "你好")
-                .replacingOccurrences(of: "world", with: "世界").replacingOccurrences(of: "subject", with: "主题"))
+            var text = $0.t.replacingOccurrences(of: "Hello", with: "你好")
+                .replacingOccurrences(of: "world", with: "世界").replacingOccurrences(of: "subject", with: "主题")
+            if text.hasPrefix("⟦pigi:") {
+                if dropClosingMarker, let closing = text.range(of: "⟦pigi:", options: .backwards) {
+                    text = String(text[..<closing.lowerBound])
+                }
+                text += markerSuffixes[$0.i] ?? ""
+            }
+            return TranslationItem(i: $0.i, t: text)
         }
         let content = String(decoding: try JSONEncoder().encode(items), as: UTF8.self)
         let data = try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content]]]])
@@ -88,7 +99,7 @@ private final class ProductionFixture {
     let privacy: TranslationPrivacySettings
     let suite = "production-translation-" + UUID().uuidString
 
-    init(html: Bool = false) async throws {
+    init(html: Bool = false, body: String? = nil) async throws {
         defaults = UserDefaults(suiteName: suite)!
         configStore = TranslationConfigStore(defaults: defaults)
         privacy = TranslationPrivacySettings(defaults: defaults)
@@ -97,7 +108,7 @@ private final class ProductionFixture {
         privacy.setEnabled(true, accountID: "mail@example.invalid", isProton: false)
         privacy.grantServiceConsent(endpoint: configStore.load().baseURL)
         savedState = await engine.saveProductionState()
-        try await engine.seedProductionMail(cache: cache, html: html)
+        try await engine.seedProductionMail(cache: cache, html: html, body: body)
         await engine.installProductionDependencies(TranslationDependencies(configStore: configStore,
             keyStore: ProductionKeyStore(), transport: transport, privacy: privacy))
     }
@@ -263,5 +274,57 @@ final class ProductionTranslationTests: XCTestCase {
         XCTAssertEqual(first, second)
         let records = await fixture.transport.recorded()
         XCTAssertEqual(records.count, 2)
+    }
+
+    @MainActor
+    func testLongHTMLTrailingFiveAndFourCharactersWritesPersistentCache() async throws {
+        let body = (0..<19).map { "<p>Hello <b>world</b> paragraph \($0).</p>" }.joined()
+        let fixture = try await ProductionFixture(html: true, body: body)
+        addTeardownBlock { await fixture.cleanup() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("translations.db").path
+        await fixture.engine.installTranslationCache(SQLiteTranslationCache(path: path))
+        await fixture.transport.setMarkerSuffixes([7: "abcde", 11: "多余字符"])
+
+        let first = try await fixture.request()
+        let document = try XMLDocument(xmlString: first.body)
+        let paragraphs = try document.nodes(forXPath: "//p")
+        XCTAssertEqual(paragraphs.count, 19)
+        for (index, paragraph) in paragraphs.enumerated() {
+            XCTAssertEqual(paragraph.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), "你好 世界 paragraph \(index).")
+        }
+        XCTAssertEqual(try document.nodes(forXPath: "//p/b").map(\.stringValue), Array(repeating: "世界", count: 19))
+        XCTAssertFalse(first.body.contains("⟦pigi:"))
+        let rows = try Store(path: path).query("SELECT count(*) AS n FROM translations")
+        XCTAssertEqual(rows.first?["n"]?.int, 1)
+        await fixture.engine.installTranslationCache(SQLiteTranslationCache(path: path))
+        let second = try await fixture.request()
+        XCTAssertEqual(first, second)
+        let requests = await fixture.transport.recorded()
+        XCTAssertEqual(requests.count, 2, "reopened cache must avoid another service request")
+    }
+
+    @MainActor
+    func testBrokenClosingMarkerDoesNotCacheAndReaderCanRetry() async throws {
+        let fixture = try await ProductionFixture(html: true)
+        addTeardownBlock { await fixture.cleanup() }
+        await fixture.transport.setDropClosingMarker(true)
+        let reader = MailTranslationReader(store: fixture.configStore, keyStore: ProductionKeyStore())
+        reader.toggle(account: "mail@example.invalid", id: "one")
+        await reader.task?.value
+        XCTAssertEqual(reader.errorMessage, "译文与原文片段未能对齐，请重试翻译。")
+        XCTAssertNil(reader.translatedBody)
+        XCTAssertFalse(reader.showingTranslation)
+        await fixture.transport.setDropClosingMarker(false)
+        reader.toggle(account: "mail@example.invalid", id: "one")
+        await reader.task?.value
+        XCTAssertNil(reader.errorMessage)
+        XCTAssertTrue(reader.showingTranslation)
+        let requests = await fixture.transport.recorded()
+        XCTAssertEqual(requests.count, 4, "alignment failure must not write a whole-mail cache entry")
+        let intact = try await fixture.engine.originalProductionMailIsIntact()
+        XCTAssertTrue(intact)
     }
 }

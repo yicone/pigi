@@ -95,6 +95,9 @@ public final class MailTranslationReader {
         }
         if error is SQLiteTranslationCache.Failure { return "翻译缓存刚被清空或账号已变更，请重试。" }
         if error is ArchiveClient.Failure { return "邮件不存在或暂时无法读取，无法翻译。" }
+        if (error as? MailTranslationError) == .alignmentFailed || (error as? TranslationError) == .misaligned {
+            return "译文与原文片段未能对齐，请重试翻译。"
+        }
         switch error as? TranslationError {
         case .timeout: return "翻译超时，请重试或在设置中调大超时。"
         case .notConfigured, .invalidBaseURL: return "请检查翻译设置中的服务地址、模型和密钥。"

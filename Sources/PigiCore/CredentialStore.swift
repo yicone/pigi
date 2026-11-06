@@ -20,6 +20,18 @@ struct CredentialStore {
     var read: (String) throws -> String? = Keychain.get
     var write: (String, String) -> Bool = Keychain.set
 
+    /// Normalize local read failures without exposing backend details or sending empty credentials.
+    func readRequired(_ key: String) throws -> String {
+        do {
+            guard let value = try read(key), !value.isEmpty else {
+                throw CredentialPersistenceError.readFailed
+            }
+            return value
+        } catch {
+            throw CredentialPersistenceError.readFailed
+        }
+    }
+
     func save(_ key: String, _ value: String) throws {
         guard write(key, value) else { throw CredentialPersistenceError.writeFailed }
     }

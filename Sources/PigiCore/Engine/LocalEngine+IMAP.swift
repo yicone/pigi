@@ -6,10 +6,10 @@ extension LocalEngine {
     func imapConnect(_ email: String) async throws -> ImapConnection {
         guard let row = try account(email), let host = row["imap_host"]?.text else { throw ImapError(message: "没有这个邮箱") }
         let port = row["imap_port"]?.int ?? 993
+        let password = try credentials.readRequired("imap-\(email)")
         let connection = ImapConnection(host: host, port: port)
-        try await connection.open()
         do {
-            try await connection.login(user: email, password: try Keychain.get("imap-\(email)") ?? "")
+            try await imapAuthenticate(connection, email, password)
         } catch {
             connection.close()
             throw error

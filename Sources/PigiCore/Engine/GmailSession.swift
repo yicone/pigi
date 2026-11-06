@@ -25,16 +25,21 @@ actor GmailSession {
     // Internal seam for credential-free engine regression fixtures.
     typealias Fixture = @Sendable (String, [(String, String)]) async throws -> Data
     private let fixture: Fixture?
-    init(email: String, fixture: Fixture? = nil) {
+    private let credentials: CredentialStore
+    private let refreshToken: (String) async throws -> GmailAuth.Token
+    init(email: String, fixture: Fixture? = nil, credentials: CredentialStore = CredentialStore(),
+         refreshToken: @escaping (String) async throws -> GmailAuth.Token = GmailAuth.refresh) {
         self.email = email
         self.fixture = fixture
+        self.credentials = credentials
+        self.refreshToken = refreshToken
     }
 
     private func token(force: Bool = false) async throws -> String {
         if !force, let access, expires > Date() { return access }
-        guard let refresh = try Keychain.get(GmailStore.keychainKey(email)), !refresh.isEmpty else { throw GmailRevoked() }
+        let refresh = try credentials.readRequired(GmailStore.keychainKey(email))
         do {
-            let fresh = try await GmailAuth.refresh(refresh)
+            let fresh = try await refreshToken(refresh)
             access = fresh.accessToken
             expires = fresh.expiresAt
             return fresh.accessToken

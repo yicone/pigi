@@ -8,6 +8,12 @@ public actor LocalEngine {
 
     let credentials: CredentialStore
 
+    // Instance seam for offline authentication regression tests.
+    var imapAuthenticate: @Sendable (ImapConnection, String, String) async throws -> Void = { connection, user, password in
+        try await connection.open()
+        try await connection.login(user: user, password: password)
+    }
+
     init(credentials: CredentialStore = CredentialStore()) {
         self.credentials = credentials
     }
@@ -303,7 +309,7 @@ public actor LocalEngine {
 
     func session(_ email: String) -> GmailSession {
         if let existing = sessions[email] { return existing }
-        let created = GmailSession(email: email)
+        let created = GmailSession(email: email, credentials: credentials)
         sessions[email] = created
         return created
     }

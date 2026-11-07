@@ -58,7 +58,6 @@ sqlite3 "file:$COPY/translations.db?mode=ro" "PRAGMA query_only=ON; SELECT count
 Package.swift        PigiCore SwiftPM library
 Sources/PigiCore/    同步引擎、钥匙串、Gmail token refresh
 Pigi/                App 源码(界面、AppState、更新、AppKit 交互登录)
-landing/             官网(Cloudflare Workers Static Assets)
 docs/                文档
 ```
 

@@ -126,6 +126,22 @@ private final class ProductionFixture {
 
 final class ProductionTranslationTests: XCTestCase {
     @MainActor
+    func testEmptyVisibleContentDoesNotSendOrWriteCache() async throws {
+        let fixture = try await ProductionFixture()
+        addTeardownBlock { await fixture.cleanup() }
+        let translator = try CachedMailTranslator(configuration: fixture.configStore.load(), cache: fixture.cache,
+            keyStore: ProductionKeyStore(), transport: fixture.transport)
+        for (body, html) in [(" \n\t", false), ("", true), ("<html><head><style>p {color:red}</style></head><body><p> </p></body></html>", true)] {
+            do {
+                _ = try await translator.translate(accountID: "mail@example.invalid", mailID: "empty", subject: " ", body: body, isHTML: html)
+                XCTFail("accepted empty visible content")
+            } catch let error as MailTranslationError { XCTAssertEqual(error, .noContent) }
+        }
+        let records = await fixture.transport.recorded()
+        XCTAssertEqual(records.count, 0)
+    }
+
+    @MainActor
     func testEngineRequestsUseConfigurationForCacheReadAndWrite() async throws {
         let fixture = try await ProductionFixture()
         addTeardownBlock { await fixture.cleanup() }

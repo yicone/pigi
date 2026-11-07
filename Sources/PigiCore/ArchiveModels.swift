@@ -81,10 +81,12 @@ public struct ArchiveClient {
         public let html: String?
         public let text: String
         public let signatureStatus: String?
-        public init(html: String?, text: String, signatureStatus: String? = nil) {
+        public let inlineImages: [MailInlineImage]
+        public init(html: String?, text: String, signatureStatus: String? = nil, inlineImages: [MailInlineImage] = []) {
             self.signatureStatus = signatureStatus
             self.html = html
             self.text = text
+            self.inlineImages = inlineImages
         }
     }
 

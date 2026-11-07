@@ -119,6 +119,7 @@ extension LocalEngine {
             subject: mail.headers["subject"] ?? "", name: name, address: addr, to: mail.headers["to"] ?? "",
             snippet: snippet, labels: Self.imapLabels(item.flags),
             attachments: mail.attachments.enumerated().map { (String($0.offset), $0.element.name, $0.element.mime, $0.element.size, "") },
+            inlineImages: mail.inlineImages,
             size: raw.count, html: mail.html, text: text, headers: mail.headers))
     }
 

@@ -61,6 +61,11 @@ public actor LocalEngine {
           account TEXT, msg_id TEXT, part_id TEXT, filename TEXT, mime TEXT, size INTEGER, att_id TEXT,
           PRIMARY KEY(account, msg_id, part_id))
         """,
+        """
+        CREATE TABLE IF NOT EXISTS inline_images(
+          account TEXT NOT NULL, msg_id TEXT NOT NULL, cid TEXT NOT NULL, mime TEXT NOT NULL, bytes BLOB NOT NULL,
+          PRIMARY KEY(account, msg_id, cid))
+        """,
         "CREATE TABLE IF NOT EXISTS account_labels(account TEXT, id TEXT, name TEXT, parent TEXT, type INTEGER, PRIMARY KEY(account,id))",
         "CREATE TABLE IF NOT EXISTS proton_snapshot(account TEXT, id TEXT, PRIMARY KEY(account,id))",
         "CREATE TABLE IF NOT EXISTS muted(account TEXT, sender TEXT, PRIMARY KEY(account, sender))",
@@ -234,6 +239,7 @@ public actor LocalEngine {
         var snippet: String
         var labels: [String]
         var attachments: [(part: String, name: String, mime: String, size: Int, ref: String)]
+        var inlineImages: [MailInlineImage] = []
         var size: Int
         var html: String
         var text: String
@@ -276,6 +282,14 @@ public actor LocalEngine {
             for a in d.attachments {
                 try s.run("INSERT OR REPLACE INTO attachments VALUES(?,?,?,?,?,?,?)",
                           [.text(d.account), .text(d.id), .text(a.part), .text(a.name), .text(a.mime), .int(a.size), .text(a.ref)])
+            }
+            try s.run("DELETE FROM inline_images WHERE account=? AND msg_id=?", [.text(d.account), .text(d.id)])
+            var seenInline: Set<String> = []
+            for image in d.inlineImages {
+                let cid = InlineImages.normalizeContentID(image.contentID)
+                guard !cid.isEmpty, seenInline.insert(cid).inserted, !image.data.isEmpty, image.data.count <= InlineImages.maxBytes else { continue }
+                try s.run("INSERT INTO inline_images(account,msg_id,cid,mime,bytes) VALUES(?,?,?,?,?)",
+                          [.text(d.account), .text(d.id), .text(cid), .text(InlineImages.declaredMime(image.mime)), .blob(image.data)])
             }
         }
     }

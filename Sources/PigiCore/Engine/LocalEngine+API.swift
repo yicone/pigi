@@ -38,7 +38,12 @@ extension LocalEngine {
             throw ArchiveClient.Failure(message: "邮件不存在")
         }
         let text = try db().query("SELECT body FROM fts WHERE rowid=?", [row["rowid"] ?? .null]).first?["body"]?.text ?? ""
-        return ArchiveClient.Body(html: row["html"]?.blob.flatMap(inflate), text: text, signatureStatus: row["signature_status"]?.text)
+        let images = try db().query("SELECT cid,mime,bytes FROM inline_images WHERE account=? AND msg_id=? ORDER BY cid",
+                                    [.text(account), .text(id)]).compactMap { row -> MailInlineImage? in
+            guard let cid = row["cid"]?.text, let mime = row["mime"]?.text, let data = row["bytes"]?.blob else { return nil }
+            return MailInlineImage(contentID: cid, mime: mime, data: data)
+        }
+        return ArchiveClient.Body(html: row["html"]?.blob.flatMap(inflate), text: text, signatureStatus: row["signature_status"]?.text, inlineImages: images)
     }
 
     func search(_ term: String, account: String?) throws -> [ArchiveItem] {
@@ -156,6 +161,7 @@ extension LocalEngine {
         try s.transaction {
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
             try s.run("DELETE FROM attachments WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM inline_images WHERE account=?", [.text(email)])
             try s.run("DELETE FROM messages WHERE account=?", [.text(email)])
             try s.run("DELETE FROM muted WHERE account=?", [.text(email)])
             try s.run("DELETE FROM account_labels WHERE account=?", [.text(email)])

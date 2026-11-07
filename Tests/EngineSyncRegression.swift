@@ -88,9 +88,18 @@ actor GmailFixture {
                 precondition(rows[1]["subject"]?.text == "Second", "Tombstones must not suppress later backfill")
             }
             let attachments = try await imap.rows("SELECT filename FROM attachments WHERE msg_id='1'")
-            precondition(attachments.first?["filename"]?.text == "note.txt")
+            let names = Set(attachments.compactMap { $0["filename"]?.text })
+            precondition(names.contains("note.txt") && names.contains("inline-pixel@example.test"))
         }
-        print("PASS: IMAP initial, incremental flags/new UID, UIDVALIDITY reuse and MIME attachment")
+        let pixel = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!
+        let inline = try await imap.rows("SELECT cid,mime,bytes FROM inline_images WHERE msg_id='1'")
+        precondition(inline.count == 1 && inline[0]["cid"]?.text == "pixel@example.test" && inline[0]["bytes"]?.blob == pixel)
+        let opened = try await imap.body(account: email, id: "1")
+        precondition(opened.html?.contains("cid:pixel@example.test") == true)
+        precondition(opened.html?.contains("data:image") != true)
+        let shown = InlineImages.embed(opened.html ?? "", images: opened.inlineImages)
+        precondition(shown.contains("data:image/png;base64,") && !shown.contains("cid:"))
+        print("PASS: IMAP initial, incremental flags/new UID, UIDVALIDITY reuse, MIME attachment and cid image")
 
         // Rotating the password verifies the login against the fixture, then stores it;
         // the accounts row and every synced message stay untouched.

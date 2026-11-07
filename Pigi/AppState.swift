@@ -43,6 +43,13 @@ final class AppState {
     /// Mails read while the list shows only unread stay put until the list context changes.
     private(set) var stayVisible: Set<String> = []
     var selectedMailID: String?
+    /// Display cache for cid images of messages opened this session. Not written to the header cache.
+    private(set) var inlineImagesByMailID: [String: [MailInlineImage]] = [:]
+    #if PIGI_REGRESSION
+    func testingStoreInlineImages(_ id: String, _ images: [MailInlineImage]) {
+        inlineImagesByMailID[id] = images
+    }
+    #endif
     var groups: [AccountGroup] = AccountGroup.load() { didSet { AccountGroup.save(groups) } }
     var collapsedGroups: Set<String> = []
     /// Display names the user gave to mailboxes, by address.
@@ -361,6 +368,7 @@ final class AppState {
     /// Deletes a mailbox from the engine and from this Mac.
     func removeAccount(_ id: String) async throws {
         guard let account = allAccounts.first(where: { $0.id == id }) else { return }
+        inlineImagesByMailID = inlineImagesByMailID.filter { !$0.key.hasPrefix(id + "#") }
         try await ArchiveClient().deleteAccount(id)
         if account.kind == .gmail {
             removeGmailAccount(id)
@@ -582,6 +590,7 @@ final class AppState {
         do {
             let body = try await ArchiveClient().body(account: mail.accountID, id: mail.remoteID)
             let isHTML = body.html?.isEmpty == false
+            inlineImagesByMailID[id] = body.inlineImages
             update(id) {
                 $0.body = (isHTML ? body.html : nil) ?? body.text
                 $0.bodyLoaded = true

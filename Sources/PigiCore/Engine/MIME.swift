@@ -6,6 +6,8 @@ struct ParsedMail {
     var text = ""
     var html = ""
     var attachments: [(name: String, mime: String, size: Int)] = []
+    /// Raster and other `image/*` parts addressed by Content-ID. Bytes stay out of `html`.
+    var inlineImages: [MailInlineImage] = []
 }
 
 enum MIME {
@@ -52,7 +54,8 @@ enum MIME {
         return out
     }
 
-    private static func walk(_ data: Data, into result: inout ParsedMail, top: Bool) {
+    private static func walk(_ data: Data, into result: inout ParsedMail, top: Bool, depth: Int = 0) {
+        guard depth < 32 else { return }
         let (head, body) = split(data)
         let h = headers(head)
         if top { result.headers = h.mapValues(decodeWords) }
@@ -60,12 +63,23 @@ enum MIME {
         let mime = type.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? "text/plain"
         let params = parameters(type)
         if mime.hasPrefix("multipart/"), let boundary = params["boundary"] {
-            for part in parts(of: body, boundary: boundary) { walk(part, into: &result, top: false) }
+            for part in parts(of: body, boundary: boundary) { walk(part, into: &result, top: false, depth: depth + 1) }
             return
         }
         let disposition = h["content-disposition"] ?? ""
         let filename = parameters(disposition)["filename"] ?? params["name"]
         let decoded = transferDecoded(body, encoding: (h["content-transfer-encoding"] ?? "").lowercased())
+        // A decrypted PGP/MIME body can be the forwarded message itself.
+        if mime == "message/rfc822", !disposition.lowercased().hasPrefix("attachment"), !decoded.isEmpty {
+            walk(decoded, into: &result, top: false, depth: depth + 1)
+            return
+        }
+        let contentID = InlineImages.normalizeContentID(h["content-id"] ?? "")
+        let isImage = mime.hasPrefix("image/")
+        if isImage, !contentID.isEmpty, !decoded.isEmpty, decoded.count <= InlineImages.maxBytes,
+           !result.inlineImages.contains(where: { $0.contentID == contentID }) {
+            result.inlineImages.append(MailInlineImage(contentID: contentID, mime: InlineImages.declaredMime(mime), data: decoded))
+        }
         if disposition.lowercased().hasPrefix("attachment") || (filename != nil && !mime.hasPrefix("text/")) {
             result.attachments.append((decodeWords(filename ?? "attachment"), mime, decoded.count))
         } else if mime == "text/html" || mime == "text/plain" {
@@ -74,6 +88,9 @@ enum MIME {
             else { result.text += (result.text.isEmpty ? "" : "\n") + text }
         } else if let filename {
             result.attachments.append((decodeWords(filename), mime, decoded.count))
+        } else if isImage {
+            let name = contentID.isEmpty ? "inline-image" : "inline-\(contentID.prefix(48))"
+            result.attachments.append((name, mime, decoded.count))
         }
     }
 

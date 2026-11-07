@@ -216,7 +216,7 @@ extension LocalEngine {
         print("PASS: engine rejects modify, unsubscribe and mute before side effects")
 
         try await engine.deleteAccount(other)
-        for table in ["accounts", "messages", "attachments", "account_labels", "proton_snapshot", "muted"] {
+        for table in ["accounts", "messages", "attachments", "inline_images", "account_labels", "proton_snapshot", "muted"] {
             let column = table == "accounts" ? "email" : "account"
             let remaining = try await engine.inspect("SELECT count(*) AS n FROM \(table) WHERE \(column)='other@example.test'")
             precondition(remaining.first?["n"]?.int == 0)
@@ -260,8 +260,9 @@ extension LocalEngine {
         let mimeEngine = LocalEngine(), mimeRemote = FixtureProton()
         await mimeRemote.put("one")
         await mimeRemote.put("two")
+        let pixel = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!
         await mimeRemote.mimeBody("one", body: """
-        Content-Type: multipart/alternative; boundary="fixture-boundary"
+        Content-Type: multipart/related; boundary="fixture-boundary"
 
         --fixture-boundary
         Content-Type: text/plain; charset=utf-8
@@ -271,14 +272,26 @@ extension LocalEngine {
         --fixture-boundary
         Content-Type: text/html; charset=utf-8
 
-        <p>synthetic MIME HTML</p>
+        <p>synthetic MIME HTML</p><img src="cid:Pixel%40Example.Test">
+        --fixture-boundary
+        Content-Type: image/png
+        Content-ID: <Pixel@Example.Test>
+        Content-Transfer-Encoding: base64
+
+        iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=
         --fixture-boundary--
         """)
         try await mimeEngine.fixture(email, remote: mimeRemote)
         try await mimeEngine.pullProton(email, remote: mimeRemote)
         let mimeBody = try await mimeEngine.body(account: email, id: "one")
-        precondition(mimeBody.text == "synthetic MIME text" && mimeBody.html == "<p>synthetic MIME HTML</p>")
-        print("PASS: decrypted PGP/MIME maps decoded plaintext and HTML through the existing MIME parser")
+        precondition(mimeBody.text == "synthetic MIME text" && mimeBody.html == "<p>synthetic MIME HTML</p><img src=\"cid:Pixel%40Example.Test\">")
+        precondition(mimeBody.html?.contains("data:image") != true)
+        precondition(mimeBody.inlineImages.count == 1 && mimeBody.inlineImages[0].data == pixel)
+        let shown = InlineImages.embed(mimeBody.html ?? "", images: mimeBody.inlineImages)
+        precondition(shown.contains("data:image/png;base64,") && !shown.contains("cid:"))
+        let kept = try await mimeEngine.inspect("SELECT filename FROM attachments WHERE msg_id='one'")
+        precondition(kept.contains { $0["filename"]?.text == "inline-pixel@example.test" })
+        print("PASS: decrypted PGP/MIME maps decoded plaintext, HTML and cid image bytes")
         try await sessionPersistence()
         if CommandLine.arguments.count > 1 { try renderEvidence(state, to: URL(fileURLWithPath: CommandLine.arguments[1])) }
         #endif

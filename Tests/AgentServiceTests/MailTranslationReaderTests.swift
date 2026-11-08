@@ -15,6 +15,178 @@ final class MailTranslationReaderTests: XCTestCase {
         return (MailTranslationReader(store: store, keyStore: ReaderKeyStore(key: key), translate: recorder.action), store, recorder)
     }
 
+    private func policyFixture() -> (MailTranslationReader, TranslationConfigStore, TranslationPrivacySettings, TranslateRecorder) {
+        let (_, store, recorder) = fixture()
+        let defaults = UserDefaults(suiteName: "pigi-reader-privacy.\(UUID().uuidString)")!
+        let privacy = TranslationPrivacySettings(defaults: defaults)
+        let reader = MailTranslationReader(store: store, keyStore: ReaderKeyStore(key: "fixture-key"),
+                                           privacy: privacy, translate: recorder.action)
+        reader.refreshConfiguration()
+        return (reader, store, privacy, recorder)
+    }
+
+    func testBannerStatesAndSubjectFollowLocalToggle() async {
+        let (reader, _, recorder) = fixture()
+        XCTAssertEqual(reader.bannerTitle, "翻译成简体中文")
+        reader.toggle(account: account, id: mailID)
+        XCTAssertEqual(reader.bannerTitle, "正在翻译成简体中文…")
+        await reader.task?.value
+        XCTAssertEqual(reader.translatedSubject, "译文主题")
+        XCTAssertEqual(reader.bannerTitle, "已翻译为简体中文 · 显示原文")
+        reader.toggle(account: account, id: mailID)
+        XCTAssertEqual(reader.bannerTitle, "当前显示原文 · 显示译文")
+        reader.toggle(account: account, id: mailID)
+        XCTAssertEqual(reader.bannerTitle, "已翻译为简体中文 · 显示原文")
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+        XCTAssertTrue(reader.bannerMessage(signatureFailed: true).hasSuffix("签名未通过，译文同样不能当成原信"))
+        reader.reset()
+        XCTAssertNil(reader.translatedSubject)
+    }
+
+    func testDisabledAndNotConfiguredNeverOfferConsentOrSend() async {
+        let (reader, store, privacy, recorder) = policyFixture()
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: false)
+        XCTAssertNil(reader.pendingConsent)
+        XCTAssertEqual(reader.actionTitle(account: account, isProton: false), "翻译成简体中文")
+        XCTAssertTrue(reader.errorMessage?.contains("此邮箱未开启") == true)
+        privacy.setEnabled(true, accountID: account, isProton: false)
+        var config = store.load(); config.model = ""; store.save(config)
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: false)
+        XCTAssertNil(reader.pendingConsent)
+        XCTAssertTrue(reader.errorMessage?.contains("配置翻译服务") == true)
+        let count = await recorder.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testExplicitConsentThenTranslationAndDismissalDoesNotGrant() async {
+        let (reader, store, privacy, recorder) = policyFixture()
+        privacy.setEnabled(true, accountID: account, isProton: false)
+        XCTAssertEqual(reader.actionTitle(account: account, isProton: false), "同意并翻译…")
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: false)
+        XCTAssertEqual(reader.pendingConsent?.permission, .needsServiceConsent)
+        reader.dismissConsent()
+        XCTAssertFalse(privacy.hasServiceConsent(endpoint: store.load().baseURL))
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: false)
+        reader.confirmConsent()
+        await reader.task?.value
+        XCTAssertTrue(reader.showingTranslation)
+        XCTAssertTrue(privacy.hasServiceConsent(endpoint: store.load().baseURL))
+        XCTAssertEqual(reader.actionTitle(account: account, isProton: false), "显示原文")
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testConsentIsBoundToMailEndpointAndCurrentPolicy() async {
+        for change in ["mail", "endpoint", "disabled"] {
+            let (reader, store, privacy, recorder) = policyFixture()
+            privacy.setEnabled(true, accountID: account, isProton: false)
+            let originalEndpoint = store.load().baseURL
+            reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: false)
+            if change == "mail" { reader.select(mailID: "ui-two") }
+            if change == "endpoint" {
+                var config = store.load(); config.baseURL = "https://different.test"; store.save(config)
+            }
+            if change == "disabled" { privacy.setEnabled(false, accountID: account, isProton: false) }
+            reader.confirmConsent()
+            XCTAssertFalse(privacy.hasServiceConsent(endpoint: originalEndpoint))
+            XCTAssertFalse(privacy.hasServiceConsent(endpoint: store.load().baseURL))
+            let count = await recorder.count
+            XCTAssertEqual(count, 0)
+        }
+    }
+
+    func testProtonConsentIsSeparateFromServiceConsent() async {
+        let (reader, store, privacy, recorder) = policyFixture()
+        // Simulate an enabled account whose kind changed from IMAP to Proton.
+        privacy.setEnabled(true, accountID: account, isProton: false)
+        privacy.grantServiceConsent(endpoint: store.load().baseURL)
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: true)
+        XCTAssertEqual(reader.pendingConsent?.permission, .needsAccountConsent)
+        XCTAssertFalse(privacy.hasAccountConsent(accountID: account))
+        reader.confirmConsent()
+        await reader.task?.value
+        XCTAssertTrue(privacy.hasAccountConsent(accountID: account))
+        XCTAssertTrue(reader.showingTranslation)
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testCombinedServiceAndProtonConsentIsExplicitAndStartsOnce() async {
+        let (reader, store, privacy, recorder) = policyFixture()
+        privacy.setEnabled(true, accountID: account, isProton: false)
+        reader.activate(account: account, id: mailID, mailID: "ui-one", isProton: true)
+        XCTAssertEqual(reader.pendingConsent?.permission, .needsServiceConsent)
+        XCTAssertEqual(reader.pendingConsent?.requiresAccountConsent, true)
+        XCTAssertFalse(privacy.hasAccountConsent(accountID: account))
+        reader.confirmConsent()
+        await reader.task?.value
+        XCTAssertTrue(privacy.hasServiceConsent(endpoint: store.load().baseURL))
+        XCTAssertTrue(privacy.hasAccountConsent(accountID: account))
+        XCTAssertNil(reader.pendingConsent)
+        XCTAssertTrue(reader.showingTranslation)
+        let count = await recorder.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testSameMailInTwoWindowsHasIndependentCancellation() async {
+        let held = TranslateRecorder(hold: true)
+        let (main, _, _) = fixture(recorder: held)
+        let (panel, _, _) = fixture()
+        main.select(mailID: "same-ui-id")
+        panel.select(mailID: "same-ui-id")
+        main.toggle(account: account, id: mailID)
+        let pending = main.task
+        await held.waitUntilStarted()
+        panel.toggle(account: account, id: mailID)
+        await panel.task?.value
+        main.cancel(mailID: "another-mail")
+        XCTAssertTrue(main.isTranslating)
+        main.cancel(mailID: "same-ui-id")
+        await held.release()
+        await pending?.value
+        XCTAssertNil(main.translatedBody)
+        XCTAssertTrue(panel.showingTranslation)
+        XCTAssertEqual(panel.translatedSubject, "译文主题")
+        main.select(mailID: "new-mail")
+        main.cancel(mailID: "same-ui-id")
+        XCTAssertEqual(main.mailID, "new-mail")
+    }
+
+    func testActivateSwitchesMailAndLateOldResponseCannotReplaceNewResult() async {
+        let (_, store, privacy, _) = policyFixture()
+        privacy.setEnabled(true, accountID: account, isProton: false)
+        privacy.grantServiceConsent(endpoint: store.load().baseURL)
+        let old = TranslateRecorder(hold: true, result: CachedTranslation(subject: "old subject", body: "old body"))
+        let reader = MailTranslationReader(store: store, keyStore: ReaderKeyStore(key: "fixture-key"), privacy: privacy,
+            translate: { account, id in
+                if id == "old" { return try await old.action(account, id) }
+                return CachedTranslation(subject: "new subject", body: "new body")
+            })
+        reader.activate(account: account, id: "old", mailID: "ui-old", isProton: false)
+        let pending = reader.task
+        await old.waitUntilStarted()
+        reader.activate(account: account, id: "new", mailID: "ui-new", isProton: false)
+        await reader.task?.value
+        reader.cancel(mailID: "ui-old")
+        await old.release()
+        await pending?.value
+        XCTAssertEqual(reader.mailID, "ui-new")
+        XCTAssertEqual(reader.translatedSubject, "new subject")
+        XCTAssertEqual(reader.translatedBody, "new body")
+        XCTAssertTrue(reader.showingTranslation)
+    }
+
+    func testEmptyContentHasDistinctFailureWithSignatureSuffix() async {
+        let recorder = TranslateRecorder(error: MailTranslationError.noContent)
+        let (reader, _, _) = fixture(recorder: recorder)
+        reader.toggle(account: account, id: mailID)
+        await reader.task?.value
+        XCTAssertEqual(reader.errorMessage, "邮件没有可翻译的内容。")
+        XCTAssertTrue(reader.bannerMessage(signatureFailed: true).contains("签名未通过，译文同样不能当成原信"))
+        XCTAssertNil(reader.translatedSubject)
+    }
+
     func testGateRequiresEnabledURLModelAndNonemptyKey() async {
         for (enabled, key, base, model) in [
             (false, "key", "https://translation.test", "model"),

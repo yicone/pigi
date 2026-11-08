@@ -44,6 +44,9 @@ struct MailDetailContent: View {
                         Divider()
                         Button(mail.isUnread ? "标为已读" : "标为未读") { state.toggleUnread(mail.id) }
                         } else { Text("Proton 邮箱为只读") }
+                        Button(translation.actionTitle(account: mail.accountID, isProton: isProton)) { translate() }
+                            .disabled(!mail.bodyLoaded || translation.isTranslating)
+                            .accessibilityIdentifier("mail.translation.menu")
                         Button(allowRemoteContent ? "屏蔽远程图片" : "加载远程图片") { remoteOverride = !allowRemoteContent }
                     }
                 // A thin light-grey rule that stops short of both edges.
@@ -52,13 +55,8 @@ struct MailDetailContent: View {
                     .frame(height: 1)
                     .padding(.horizontal, inset)
                 VStack(spacing: 0) {
-                    if let error = translation.errorMessage {
-                        Text(error)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, inset)
-                            .padding(.vertical, 8)
-                            .accessibilityIdentifier("mail.translation.error")
+                    if shouldShowTranslationBanner {
+                        translationBanner
                     }
                     Group {
                         if mail.bodyLoaded {
@@ -78,7 +76,11 @@ struct MailDetailContent: View {
             .onChange(of: mail.id) { remoteOverride = nil }
             .onChange(of: translationSource, initial: true) {
                 translation.reset()
+                translation.select(mailID: mail.id)
                 translation.refreshConfiguration()
+            }
+            .onChange(of: translation.permission(account: mail.accountID, isProton: isProton)) { _, permission in
+                if permission == .disabled || permission == .notConfigured { translation.reset() }
             }
             .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
                 translation.refreshConfiguration()
@@ -90,18 +92,64 @@ struct MailDetailContent: View {
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 translation.refreshConfiguration()
             }
-            .onDisappear { translation.reset() }
+            .onDisappear { translation.cancel(mailID: mail.id) }
+            .alert("允许向翻译服务外发？", isPresented: Binding(
+                get: { translation.pendingConsent != nil },
+                set: { if !$0 { translation.dismissConsent() } })) {
+                    Button("取消", role: .cancel) { translation.dismissConsent() }
+                    Button("同意并翻译") { translation.confirmConsent() }
+                } message: {
+                    if let request = translation.pendingConsent {
+                        Text((request.requiresAccountConsent ? "此 Proton 邮箱的端到端邮件将交给外部翻译服务。" : "")
+                            + "将邮件主题和正文发送至 \(TranslationPrivacySettings.serviceIdentity(request.endpoint) ?? "")，不含收件人地址。正文中本来包含的地址仍会随正文发送。译文以明文保存在这台 Mac。")
+                    }
+                }
+    }
+
+    private var isProton: Bool { state.isReadOnly(mail.accountID) }
+
+    private var shouldShowTranslationBanner: Bool {
+        mail.bodyLoaded && (translation.isTranslating || translation.translatedBody != nil || translation.errorMessage != nil
+            || !TranslationLanguage.isPrimarilyChinese(String((mail.subject + "\n" + RemoteMapping.plainText(mail.body)).prefix(4_000))))
+    }
+
+    private func translate() {
+        translation.activate(account: mail.accountID, id: mail.remoteID, mailID: mail.id, isProton: isProton)
+    }
+
+    private var translationBanner: some View {
+        HStack(spacing: 8) {
+            if translation.isTranslating { ProgressView().controlSize(.small) }
+            Button(action: translate) {
+                Text(translation.bannerMessage(signatureFailed: mail.signatureStatus == "failed"))
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
+            }
+            .buttonStyle(.plain)
+            .disabled(!mail.bodyLoaded || translation.isTranslating)
+            if translation.isTranslating {
+                Button("取消") { translation.cancel(mailID: mail.id) }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("mail.translation.cancel")
+            }
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, inset)
+        .padding(.vertical, 8)
+        .accessibilityIdentifier(translation.errorMessage == nil ? "mail.translation.banner" : "mail.translation.error")
     }
 
     private var translationSource: TranslationSource {
         TranslationSource(id: mail.id, account: mail.accountID, remoteID: mail.remoteID,
-                          body: mail.body, isHTML: mail.isHTML, loaded: mail.bodyLoaded)
+                          subject: mail.subject, body: mail.body, isHTML: mail.isHTML, loaded: mail.bodyLoaded)
     }
 
     private struct TranslationSource: Equatable {
         let id: String
         let account: String
         let remoteID: String
+        let subject: String
         let body: String
         let isHTML: Bool
         let loaded: Bool
@@ -137,11 +185,19 @@ struct MailDetailContent: View {
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
-                Text(mail.subject)
+                Text(translation.showingTranslation ? (translation.translatedSubject ?? mail.subject) : mail.subject)
                     .font(.system(size: 17))
                     .lineLimit(3)
                     .textSelection(.enabled)
                     .padding(.top, 6)
+                if translation.showingTranslation, translation.translatedSubject != nil {
+                    Text(mail.subject)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("mail.translation.originalSubject")
+                }
             }
             Spacer(minLength: 12)
             actions(mail)
@@ -161,7 +217,7 @@ struct MailDetailContent: View {
                 if translation.isTranslating { ProgressView().controlSize(.small) }
                 GlassPill(title: translation.isTranslating ? "翻译中…" : (translation.showingTranslation ? "原文" : "翻译"),
                           systemImage: "character.bubble") {
-                    translation.toggle(account: mail.accountID, id: mail.remoteID)
+                    translate()
                 }
                 .disabled(!mail.bodyLoaded || translation.isTranslating)
                 .accessibilityIdentifier("mail.translation.toggle")

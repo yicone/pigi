@@ -2,7 +2,7 @@ import Foundation
 import NaturalLanguage
 
 public enum MailTranslationError: Error, Equatable {
-    case invalidLimits, alignmentFailed
+    case invalidLimits, alignmentFailed, noContent
 }
 
 public struct TranslationItem: Codable, Sendable, Equatable {

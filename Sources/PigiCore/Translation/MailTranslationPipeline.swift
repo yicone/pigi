@@ -1,6 +1,12 @@
 import Foundation
 
 public struct MailTranslationPipeline: Sendable {
+    static func hasContent(body: String, isHTML: Bool) throws -> Bool {
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        let document = try TranslationDocument(body: body, isHTML: isHTML, limit: 7_000)
+        return document.slots.contains { !$0.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
     public let maxCharacters: Int
     public let maxItems: Int
     public let concurrency: Int

@@ -25,6 +25,10 @@ struct CachedMailTranslator: Sendable {
 
     func translate(accountID: String, mailID: String, subject: String, body: String, isHTML: Bool) async throws -> CachedTranslation {
         try Task.checkCancellation()
+        if subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           try !MailTranslationPipeline.hasContent(body: body, isHTML: isHTML) {
+            throw MailTranslationError.noContent
+        }
         let key = TranslationCacheKey(accountID: accountID, mailID: mailID,
             bodyHash: TranslationCacheKey.sourceHash(subject: subject, body: body, isHTML: isHTML),
             configuration: configuration)

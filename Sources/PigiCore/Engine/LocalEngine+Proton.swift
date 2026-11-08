@@ -222,18 +222,25 @@ extension LocalEngine {
             let mime = body.mimeType.lowercased()
             let html: String
             let text: String
+            let attachments: [(String, String, String, Int, String)]
+            let inlineImages: [MailInlineImage]
             if mime.hasPrefix("multipart/") || mime == "message/rfc822" {
                 // PGP/MIME decrypts to a MIME entity with its own headers.
                 let parsed = MIME.parse(Data(body.body.utf8))
                 html = parsed.html
                 text = parsed.text.isEmpty ? Detect.stripTags(html) : parsed.text
+                attachments = parsed.attachments.enumerated().map { (String($0.offset), $0.element.name, $0.element.mime, $0.element.size, "") }
+                inlineImages = parsed.inlineImages
             } else {
                 html = mime.hasPrefix("text/html") ? body.body : ""
                 text = html.isEmpty ? body.body : Detect.stripTags(html)
+                attachments = []
+                inlineImages = []
             }
             try save(Draft(account: email, id: id, threadID: nil, date: meta.time * 1000, subject: meta.subject,
                            name: meta.sender_name, address: meta.sender_email, to: email,
-                           snippet: String(text.prefix(200)), labels: meta.mappedLabels, attachments: [], size: meta.size,
+                           snippet: String(text.prefix(200)), labels: meta.mappedLabels, attachments: attachments,
+                           inlineImages: inlineImages, size: meta.size,
                            html: html, text: text, headers: [:], signatureStatus: body.signatureStatus))
         } catch ProtonHelperError.notFound {
             try checkProton(email, remote)

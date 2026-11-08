@@ -77,7 +77,7 @@ extension ProtonSyncRegression {
         _ = try await engine.inspect("PRAGMA query_only=OFF")
         try await state.removeAccount(email)
         precondition(state.mails.count == 1 && MailCache.load().map(\.accountID) == [other])
-        for table in ["accounts", "messages", "attachments", "fts", "muted", "account_labels", "proton_snapshot"] {
+        for table in ["accounts", "messages", "attachments", "inline_images", "fts", "muted", "account_labels", "proton_snapshot"] {
             let rows: [SQLRow]
             if table == "fts" { rows = try await engine.inspect("SELECT count(*) AS n FROM fts WHERE body LIKE '%synthetic_deleted_body%'") }
             else { rows = try await engine.inspect("SELECT count(*) AS n FROM \(table) WHERE \(table == "accounts" ? "email" : "account")='fixture@example.test'") }

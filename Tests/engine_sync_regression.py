@@ -19,13 +19,20 @@ bodies = []
 
 
 def message(subject):
+    # 1x1 PNG. The image has no filename; only Content-ID ties it to the HTML.
+    png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
     return (f'From: Sender <sender@example.test>\r\nSubject: {subject}\r\n'
             'MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="mixed"\r\n\r\n'
             '--mixed\r\nContent-Type: text/plain; charset=utf-8\r\n'
             'Content-Transfer-Encoding: quoted-printable\r\n\r\nplain=20body\r\n'
+            '--mixed\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
+            '<p>plain body</p><img src="cid:pixel@example.test">\r\n'
             '--mixed\r\nContent-Type: text/plain; name="note.txt"\r\n'
             'Content-Disposition: attachment; filename="note.txt"\r\n'
-            'Content-Transfer-Encoding: base64\r\n\r\nbm90ZQ==\r\n--mixed--\r\n').encode()
+            'Content-Transfer-Encoding: base64\r\n\r\nbm90ZQ==\r\n'
+            '--mixed\r\nContent-Type: image/png\r\nContent-ID: <pixel@example.test>\r\n'
+            'Content-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\n'
+            f'{png}\r\n--mixed--\r\n').encode()
 
 
 def serve():

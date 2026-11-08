@@ -64,6 +64,7 @@ struct MailDetailContent: View {
                         if mail.bodyLoaded {
                             MailHTMLView(body: translation.showingTranslation ? (translation.translatedBody ?? mail.body) : mail.body,
                                          isHTML: mail.isHTML, allowRemoteContent: allowRemoteContent,
+                                         inlineImages: state.inlineImagesByMailID[mail.id] ?? [],
                                          horizontalInset: inset)
                         } else {
                             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)

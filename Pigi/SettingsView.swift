@@ -693,7 +693,7 @@ private struct GmailClientField: View {
                 .font(.system(size: 11.5)).foregroundStyle(Color.accentColor)
         }
         .onTapGesture {
-            if let url = URL(string: "https://pigi.xiezhaoye.site/gmail-api/") { NSWorkspace.shared.open(url) }
+            if let url = URL(string: "https://github.com/yicone/pigi/blob/main/docs/gmail-api.md") { NSWorkspace.shared.open(url) }
         }
     }
 }

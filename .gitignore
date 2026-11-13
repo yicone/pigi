@@ -3,8 +3,6 @@ build/
 .build/
 DerivedData/
 .DS_Store
-landing/dist/
-landing/_mock/
 部署.md
 
 .wrangler/

@@ -7,7 +7,7 @@
 
 <p align="center"><a href="https://github.com/xiezhaoye/pigi">上游仓库</a> · <a href="docs/gmail-api.md">Gmail 接入教程</a> · <a href="docs/architecture.md">架构</a></p>
 
-![pigi 多账号汇总](landing/assets/multi-account.png)
+![pigi 多账号汇总](docs/assets/multi-account.png)
 
 ## 特点
 
@@ -17,9 +17,9 @@
 - **界面与通知**:浅色、深色与跟随系统,主动刷新和当前列表全部已读,验证码通知可直接复制;菜单栏面板与主窗口保持一致。
 - **本地优先**:邮件存在本机 SQLite(FTS5 全文搜索),令牌和密码存在钥匙串,没有中转服务器。
 
-![验证码与退订标记](landing/assets/code-unsub.png)
+![验证码与退订标记](docs/assets/code-unsub.png)
 
-![全局快捷键唤起面板](landing/assets/hotkey.png)
+![全局快捷键唤起面板](docs/assets/hotkey.png)
 
 以上为示意界面，邮件均为虚构数据。
 

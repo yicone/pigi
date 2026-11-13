@@ -107,6 +107,16 @@ class SocketClient:
                     not isinstance(capabilities, list) or "filters" not in capabilities):
                 # Older v1 Apps ignore additive keys. Never silently broaden a filtered read.
                 raise ToolError("unsupported_server")
+            if method == "accounts" and "account" in params:
+                if not isinstance(capabilities, list) or "scoped_accounts" not in capabilities:
+                    raise ToolError("unsupported_server")
+                accounts = result.get("accounts")
+                if (not isinstance(accounts, list) or len(accounts) > 1
+                        or any(not isinstance(item, dict) or set(item) - {"account", "kind"}
+                               or item.get("account") != params["account"] for item in accounts)
+                        or set(result) - {"accounts", "nextOffset", "contentTrust", "capabilities"}
+                        or "nextOffset" in result):
+                    raise ToolError("invalid_response")
             if method == "accounts" and not isinstance(result.get("accounts"), list):
                 raise ToolError("unsupported_server")
             if method in {"list", "search"} and not isinstance(result.get("items"), list):

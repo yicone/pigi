@@ -111,7 +111,7 @@ Malformed requests can have no response `id`; never use IDs as authentication.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `accounts` | optional `limit`, `offset` | `accounts` (account identifier and provider `kind` only), optional `nextOffset`, `contentTrust` |
+| `accounts` | optional `account` (exact match), `limit`, `offset` | `accounts` (account identifier and provider `kind` only), optional `nextOffset`, `contentTrust` |
 | `list` | optional `account`, `since`, `status`, `limit` (default 50, 1–100), `offset` (default 0, 0–1,000,000) | `items`, optional `nextOffset`, `contentTrust` |
 | `search` | required nonblank `query` (up to 4096 UTF-8 bytes), optional `account`, `since`, `status`, `limit`, `offset` | same as list |
 | `get` | required nonempty `account` and `messageID`; no query/limit/offset | `message`, `text`, `contentTrust` |
@@ -299,10 +299,10 @@ and include configured accounts with no cached messages. Responses expose only
 account identifier and provider kind, never account errors or credentials.
 
 The v1 socket now additionally supports `accounts` and `since`/`status` on
-list/search. All successful results advertise `capabilities: ["accounts", "filters", "codes"]`.
+list/search. All successful results advertise `capabilities: ["accounts", "filters", "codes", "scoped_accounts"]`.
 The adapter rejects filtered results from an older App without `filters`, rather
 than silently ignoring these filters. Update/build the App separately with user
-approval. Existing list/search/get callers remain compatible. Accounts rejects
+approval. Existing list/search/get callers remain compatible. Accounts accepts only account/limit/offset and rejects
 mail filters; get rejects since/status. Bounds and literal-search rules above apply.
 
 `--socket` overrides the default socket for isolated fixtures. The adapter checks
@@ -373,14 +373,25 @@ introduced. The launcher works with a pre-authorized SSH destination; it does no
 install credentials, accept new host keys, register a connector, or modify SSH,
 agent, runtime, daemon, skills, or routing configuration.
 
-Scoped MCP exposes only `list_messages`, `search`, and `get_message`. List/search
+Scoped MCP exposes only `list_accounts`, `list_messages`, `search`, and `get_message`. List/search
 without an account inject the pinned account; explicit different accounts return
 `permission_denied` before socket access. Get still requires the exact account and
-message ID. Account discovery, verification codes, draft, organize, sending and
-management tools are unavailable. Every initialized tool call, including scope
+message ID. `list_accounts` takes only limit/offset; it injects the pinned account
+into the socket request, where the App checks read and filters the accounts SQL
+before pagination. It returns at most that one account and provider kind (including
+an account with no cached mail), no next page; offset >= 1 returns an empty page.
+Unknown or read-revoked targets return `permission_denied`, including at nonzero
+offsets. Other accounts never appear even when they have read permission.
+Caller-supplied account/mail filters on `list_accounts` are invalid arguments.
+The adapter requires the App's `scoped_accounts` capability and validates the
+returned scope; an older App fails closed, without an unscoped retry or account
+enumeration. This new discovery operation needs this revision's App service;
+it will not work against an older running App until an update is separately
+approved. Verification codes, draft, organize, sending and management tools remain
+unavailable. Every initialized tool call, including scope
 rejection, uses the existing content-free MCP audit on the Mac. Every forwarded
 call additionally uses App authorization and its action ledger. Revoking read in
-Settings → Agent denies list/search/get even if draft/organize remain enabled.
+Settings → Agent denies discovery and list/search/get even if draft/organize remain enabled.
 There is no cached permission decision or fallback to direct database reads.
 
 This is an account-scoped **session**, not new per-Bot authentication. The App still
@@ -403,7 +414,7 @@ Prerequisites (not performed by this change):
    user on `tr-mini-m4`. Do not paste keys or passwords into commands, docs or logs.
 2. Approve making this revision's adapter files available at a stable absolute
    path on mini and the launcher on Linux. The already-running App must implement
-   ACM-749/750/751 and have the user-specified account present with read enabled.
+   ACM-749/750/751 plus `scoped_accounts` and have the user-specified account present with read enabled.
    Updating/restarting the App remains a separate authorized action if needed.
 3. If Billing's host requires connector registration or agent/runtime changes,
    request that numbered action separately from the platform owner. This issue
@@ -428,6 +439,13 @@ sets bounded connection/liveness checks. The remote Python may be selected with
 SSH diagnostics go to stderr. Do not enable session payload logging in the host.
 The Mac audit defaults to `~/Library/Application Support/pigi-mcp/audit.sqlite3`.
 Transport failure is an error, never an empty successful mailbox result.
+
+After initialization, start with `list_accounts {}` in this same restricted session to discover the
+approved target; never switch to an unrestricted session for discovery. For example:
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"list_accounts","arguments":{}}}
+```
 
 Send the MCP initialization request, then initialized notification (one JSON per
 line); a stdio MCP host normally does this itself:
@@ -457,15 +475,16 @@ The `Cursor` query is a literal cache search, not proof of sender authenticity.
 `python3 -B -m unittest discover -s tools/pigi-mcp -v` tests scoped tool selection,
 account injection, cross-account rejection, audit failures, permission errors,
 SSH argument quoting and safe launch options without network access.
-`swift test --filter AgentServiceTests` includes
+`bash Tests/isolate-support.sh swift test --disable-sandbox --skip LoginKeychainIntegrationTests`
+runs with project data-write isolation and skips login-keychain integration. It includes
 `testAccountScopedMCPOverAppSocket`: the production stdio adapter reads synthetic
 mail through a real Swift socket, then the same running engine revokes read and
-all three methods return `permission_denied`. It checks both audit layers and
+all four methods (including discovery at offset 0 and 1) return `permission_denied`. It checks both audit layers and
 unchanged mail state. Other existing tests cover framing, trust and audit privacy.
 
 These are author self-tests, not independent acceptance. No real Linux host,
 Billing runtime, SSH session, production mailbox, Cursor mail or running App
 upgrade has been verified by these synthetic checks. Once the platform owner
 approves and provisions the items above, run the exact host invocation, check
-list/search/get and audit completion without retaining mail bodies, revoke read
+list_accounts/list/search/get and audit completion without retaining mail bodies, revoke read
 in the App and confirm denial, then restore only with the user's authorization.

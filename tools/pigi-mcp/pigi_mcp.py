@@ -69,8 +69,8 @@ class MCPServer:
     def __init__(self, client, audit, account=None):
         self.client, self.audit = client, audit
         self.account = account
-        # A remote reader needs only these three operations, never account discovery/codes.
-        self.tools = [s for s in TOOLS if s["name"] in {"search", "list_messages", "get_message"}] if account else TOOLS
+        # Remote account discovery is scoped by the App, never an unscoped enumeration.
+        self.tools = [s for s in TOOLS if s["name"] in {"list_accounts", "search", "list_messages", "get_message"}] if account else TOOLS
         self.state = "new"
 
     def call_tool(self, params):
@@ -189,7 +189,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--audit-db", default=DEFAULT_AUDIT)
-    parser.add_argument("--account", help="Restrict this session to list/search/get for this exact account.")
+    parser.add_argument("--account", help="Restrict discovery and list/search/get to this exact account.")
     args = parser.parse_args()
     if args.account is not None and (not args.account.strip() or len(args.account.encode("utf-8")) > 1024):
         parser.error("Invalid account scope.")

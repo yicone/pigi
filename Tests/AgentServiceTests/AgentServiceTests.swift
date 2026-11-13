@@ -115,6 +115,17 @@ final class AgentServiceTests: XCTestCase {
         XCTAssertEqual(accounts.result?.nextOffset, 2)
         let emptyAccount = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["offset": 2])))
         XCTAssertEqual(emptyAccount.result?.accounts?.first?.account, "empty@example.invalid")
+        // Filter before pagination; even a readable second account must not escape.
+        for account in ["a@example.invalid", "b@example.invalid", "empty@example.invalid"] {
+            let scoped = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["account": account, "limit": 1])))
+            XCTAssertEqual(scoped.result?.accounts?.map(\.account), [account])
+            XCTAssertNil(scoped.result?.nextOffset)
+            XCTAssertTrue(scoped.result?.capabilities.contains("scoped_accounts") == true)
+            let pastEnd = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["account": account, "offset": 1])))
+            XCTAssertEqual(pastEnd.result?.accounts?.count, 0)
+            XCTAssertNil(pastEnd.result?.nextOffset)
+        }
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("accounts", ["account": "unknown@example.invalid"]))?.error?.code, "permission_denied")
         let filtered = try XCTUnwrap(Self.exchange(url.path, Self.request("list", ["since": 20, "status": "inbox", "account": "a@example.invalid"])))
         XCTAssertEqual(filtered.result?.items?.map(\.messageID), ["same"])
         let noMatch = try XCTUnwrap(Self.exchange(url.path, Self.request("list", ["since": 11, "status": "archived"])))
@@ -153,7 +164,7 @@ final class AgentServiceTests: XCTestCase {
             (try Self.request("list", ["offset": -1]), "invalid_request"),
             (try Self.request("list", ["since": -1]), "invalid_request"),
             (try Self.request("list", ["status": "deleted"]), "invalid_request"),
-            (try Self.request("accounts", ["account": "a@example.invalid"]), "invalid_request"),
+            (try Self.request("accounts", ["account": "a@example.invalid", "query": "invalid"]), "invalid_request"),
             (try Self.request("get", ["account": "a@example.invalid", "messageID": "same", "since": 0]), "invalid_request"),
             (try Self.request("search", ["query": "  "]), "invalid_request"),
             (try Self.request("get", ["messageID": "same"]), "invalid_request"),
@@ -341,8 +352,8 @@ extension AgentServiceTests {
             XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
         }
         let actions = try await engine.agentActions()
-        XCTAssertEqual(actions.count, 6) // Cross-account/unsupported calls stop at MCP audit.
-        XCTAssertEqual(actions.filter { $0.result == "permission_denied" }.count, 3)
+        XCTAssertEqual(actions.count, 10) // Five scoped calls per phase; other calls stop at MCP audit.
+        XCTAssertEqual(actions.filter { $0.result == "permission_denied" }.count, 5)
         let unchanged = try await engine.assertAgentReadDidNotMutate()
         XCTAssertTrue(unchanged)
     }

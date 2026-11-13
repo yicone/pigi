@@ -64,7 +64,7 @@ public enum AgentProtocol {
     public struct Result: Codable, Sendable {
         public var codes: [VerificationCode]? = nil
         public var accounts: [Account]? = nil
-        public var capabilities: [String] = ["accounts", "filters", "codes"]
+        public var capabilities: [String] = ["accounts", "filters", "codes", "scoped_accounts"]
         public let items: [Message]?
         public let nextOffset: Int?
         public let message: Message?
@@ -141,8 +141,12 @@ extension LocalEngine {
             throw Failure.make("invalid_request")
         }
         if request.method == "accounts" {
-            guard p?.account == nil, p?.messageID == nil, p?.query == nil, p?.since == nil, p?.status == nil else { throw Failure.make("invalid_request") }
-            let rows = try db().query("SELECT email,kind FROM accounts WHERE \(Self.agentReadableAccountSQL) ORDER BY email LIMIT ? OFFSET ?", [.int(limit + 1), .int(offset)])
+            guard p?.messageID == nil, p?.query == nil, p?.since == nil, p?.status == nil else { throw Failure.make("invalid_request") }
+            var conditions = [Self.agentReadableAccountSQL]
+            var values: [SQLValue] = []
+            if let account = p?.account { conditions.append("email=?"); values.append(.text(account)) }
+            values += [.int(limit + 1), .int(offset)]
+            let rows = try db().query("SELECT email,kind FROM accounts WHERE " + conditions.joined(separator: " AND ") + " ORDER BY email LIMIT ? OFFSET ?", values)
             var result = AgentProtocol.Result(items: nil, nextOffset: rows.count > limit ? offset + limit : nil,
                                                message: nil, text: nil, contentTrust: "untrusted")
             result.accounts = rows.prefix(limit).map { .init(account: $0["email"]?.text ?? "", kind: $0["kind"]?.text) }

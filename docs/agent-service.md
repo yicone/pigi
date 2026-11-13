@@ -189,6 +189,96 @@ manual; no pruning is performed.
    Do not launch/restart the user's App or use real accounts. Deliver on a fork branch
    and PR; merging/deployment remains separately authorized.
 
+## Synthetic settings interaction fixture (ACM-751 / ACM-954 follow-up)
+
+On a logged-in macOS desktop with the repository's existing Xcode tools, run:
+
+```sh
+bash Tests/agent-settings-ui.sh --test
+bash Tests/agent-settings-ui.sh --manual
+```
+
+No dependencies are installed. This compiles a standalone, unsigned executable in a
+random `/tmp/pigi-agent-settings.*` directory. It links the **production**
+`AgentSettingsPage`, `PageHeader`, LocalEngine and Store; it does NOT compile
+`PigiApp.swift`, AppDelegate, MailCache, or the production Keychain implementation.
+The page receives an explicit fixture engine; the normal App still defaults to shared.
+The test's keychain replacement immediately fails on any accidental access. Sync is
+never started. All accounts end in `.invalid`; SQLite, preferences and HOME are disposable.
+
+Compilation uses the existing write-isolation wrapper. Before any GUI is created,
+the executable proves that its runtime profile denies the entire canonical passwd
+home (including real pigi data, Containers and keychains), tests actual read/write
+denial on a **synthetic** canary (`EPERM`), tests IP network denial (`EPERM`), and checks
+AppSupport isolation. No real DB or keychain is opened as a probe. GUI modes deny all
+network access and securityd lookup. These checks fail closed; there is no unsandboxed
+fallback. `sandbox-exec` is required. Nothing is installed, signed, launched as the
+real App, or written into the user's normal app data/configuration.
+
+Automatic mode activates the actual native accessibility press actions of the SwiftUI
+controls, not their Binding closures or backend save methods. Fixture toolbar buttons
+use their native `NSButton.performClick` actions. It reads control values/messages
+and verifies temporary DB persistence after the view AND engine/connection are destroyed
+and recreated. Accessibility is enabled only inside this process via AppKit's legacy
+accessibility attribute API (deprecated SDK warnings are expected); no system AX/TCC
+permission or global preference is changed. The log distinguishes each `PRESS` from
+the resulting `PASS`. Unsupported control access or missing UI changes fails the run;
+a compile or backend-only success cannot pass these checks.
+
+Manual mode shows a window titled **Pigi Agent Settings — SYNTHETIC ONLY**. Its toolbar
+belongs to the test host, not the product. Repeat these operations with the mouse:
+
+1. Toggle read/draft off and organize on. Click **关闭重开**; verify all three values
+   survive (a new engine reads the same temporary file). Sending has no toggle.
+2. Scroll to audit pagination. The 205 synthetic records span three pages: click
+   next/previous and check boundary buttons. **追加审计** adds a record; **刷新** in
+   the production page reveals it. Toolbar actions alone do not refresh that page.
+3. Click **保存失败**, then a permission toggle: check the error message and retained
+   prior value. Click **恢复** and retry the toggle: error clears and value saves.
+4. Click **加载失败**, then page **刷新**: check the load error. Click **恢复**, then
+   **刷新**: the existing audit records return and the error clears.
+5. Click **空数据**: check **暂无邮箱**, **暂无记录** and disabled pagination. Click
+   **合成数据** to restore the normal state. Close the window to exit and delete the
+   temporary directory. Automatic mode exits and cleans up without user interaction.
+
+This is repeatable author/self-test infrastructure, not independent acceptance or
+proof of the production App's packaging, launch, real-mail integration or historical logs.
+
+### Cross-UID probe: additional authorization required
+
+The following smoke test needs no additional identity and **does not prove cross-UID rejection**:
+
+```sh
+bash Tests/agent-settings-ui.sh --peer-smoke
+```
+
+For a future explicitly authorized cross-UID test, run the following as the ordinary
+owner in terminal A; it opens only an empty synthetic engine, never a GUI or real App:
+
+```sh
+bash Tests/agent-settings-ui.sh --peer-server
+```
+
+It prints `SYNTHETIC_SOCKET=...` and waits at most 45 seconds. Peer modes allow AF_UNIX
+for that fixture but still prove IP networking is denied and use the same home/keychain
+guards. In terminal B, **only after the user approves this single privileged probe**:
+
+```sh
+sudo /usr/bin/python3 -B Tests/agent-peer-probe.py '<printed SYNTHETIC_SOCKET path>'
+```
+
+Minimum extra authorization: execute this inspected standard-library Python probe as
+the already-existing root identity, while the server remains the ordinary owner. The
+probe only connects to a private `/private/tmp/pigi-agent-settings.*/peer/agent.sock`,
+asserts different UIDs and mode 0600, and requires `unauthorized` without a result.
+Root can traverse the unchanged private directory, so this tests the real `getpeereid`
+branch rather than only filesystem refusal. The server verifies the synthetic audit
+row is `unauthorized`, exits and cleans up. No user is created, no chmod/ownership is
+changed, and neither script invokes sudo automatically. An unprivileged existing second
+user would normally be blocked by directory/socket permissions before reaching the UID
+guard; that is a different test and cannot replace this evidence. If privilege is not
+approved, or the endpoint cannot be reached, keep cross-UID verification **unverified**.
+
 ## ACM-750 stdio MCP adapter
 
 Run `python3 -B /absolute/path/to/pigi/tools/pigi-mcp/pigi_mcp.py` from an MCP host

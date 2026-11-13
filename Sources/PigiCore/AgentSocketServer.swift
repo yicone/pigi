@@ -153,6 +153,7 @@ public final class AgentSocketServer: @unchecked Sendable {
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout.size(ofValue: one)))
         _ = fcntl(fd, F_SETFL, O_NONBLOCK)
         var response: AgentProtocol.Response
+        var dispatched = false
         do {
             var uid: uid_t = 0, gid: gid_t = 0
             guard getpeereid(fd, &uid, &gid) == 0, uid == geteuid() else { throw AgentProtocol.Failure.make("unauthorized") }
@@ -165,6 +166,7 @@ public final class AgentSocketServer: @unchecked Sendable {
             // Block this bounded transport worker, never the engine actor or main thread.
             let completion = DispatchSemaphore(value: 0)
             let box = ReadCompletion()
+            dispatched = true
             Task { [engine] in
                 do { box.value = .success(try await engine.agentRead(request)) }
                 catch let failure as AgentProtocol.Failure { box.value = .failure(failure) }
@@ -178,7 +180,20 @@ public final class AgentSocketServer: @unchecked Sendable {
             response = .init(version: 1, id: id, result: result, error: nil)
             outcome = "ok"
         } catch {
-            let failure = (error as? AgentProtocol.Failure) ?? .make("internal_error")
+            var failure = (error as? AgentProtocol.Failure) ?? .make("internal_error")
+            if !dispatched {
+                let completion = DispatchSemaphore(value: 0)
+                let box = TransportAuditCompletion()
+                let code = failure.code
+                Task { [engine] in
+                    do { try await engine.auditAgentTransportFailure(code); box.succeeded = true }
+                    catch { box.succeeded = false }
+                    completion.signal()
+                }
+                if completion.wait(timeout: .now() + 1) != .success || !box.succeeded {
+                    failure = .make("audit_unavailable")
+                }
+            }
             outcome = failure.code
             response = .init(version: 1, id: id, result: nil, error: failure)
         }
@@ -199,6 +214,10 @@ public final class AgentSocketServer: @unchecked Sendable {
                 else if errno != EINTR && errno != EAGAIN { break }
             }
         }
+    }
+
+    private final class TransportAuditCompletion: @unchecked Sendable {
+        var succeeded = false // Published by the completion semaphore.
     }
 
     private final class ReadCompletion: @unchecked Sendable {

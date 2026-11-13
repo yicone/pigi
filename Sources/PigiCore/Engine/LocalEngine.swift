@@ -40,6 +40,9 @@ public actor LocalEngine {
 
     static let schema = [
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE IF NOT EXISTS agent_permissions(account TEXT PRIMARY KEY, read INTEGER NOT NULL, draft INTEGER NOT NULL, organize INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS agent_audit_key(id INTEGER PRIMARY KEY CHECK(id=1), key BLOB NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS agent_actions(ts INTEGER NOT NULL, tool TEXT NOT NULL, account TEXT, target TEXT, args_hash TEXT NOT NULL, result TEXT NOT NULL)",
         "INSERT OR IGNORE INTO meta VALUES('seq', 0)",
         """
         CREATE TABLE IF NOT EXISTS accounts(

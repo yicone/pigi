@@ -104,6 +104,41 @@ def integration(socket_path, audit_path):
     print("MCP stdio -> real Swift socket -> synthetic LocalEngine: passed")
 
 
+def permissions_integration(socket_path, audit_path):
+    # The Swift fixture revokes read for a but grants draft/organize to catch implication bugs.
+    responses = subprocess_calls(socket_path, audit_path, handshake() + [
+        call(2, "list_accounts", {"limit": 1}), call(3, "list_messages", {"limit": 1}),
+        call(4, "search", {"query": "secrets"}), call(5, "get_verification_code"),
+        call(6, "get_message", {"account": "a@example.invalid", "messageID": "same"}),
+        call(7, "list_messages", {"account": "a@example.invalid"}),
+        call(8, "search", {"account": "a@example.invalid", "query": "secrets"}),
+        call(9, "get_verification_code", {"account": "a@example.invalid"}),
+        call(10, "get_message", {"account": "b@example.invalid", "messageID": "same"}),
+        call(11, "send"), call(12, "deleteAccount"), call(13, "getCredentials"),
+        call(14, "setOAuthClient"), call(15, "setAgentPermissions"),
+        call(16, "list_messages", {"account": "a@example.invalid", "read": True}),
+    ])
+    def value(id):
+        return json.loads(responses[id]["result"]["content"][0]["text"])
+    assert value(2)["accounts"][0]["account"] == "b@example.invalid"
+    assert value(3)["items"][0]["account"] == "b@example.invalid"
+    assert "nextOffset" not in value(3)
+    assert value(4)["items"] == []
+    assert value(5)["codes"] == []
+    for id in range(6, 10):
+        assert responses[id]["result"]["isError"]
+        assert value(id) == {"error": "permission_denied"}, responses[id]
+    assert value(10)["message"]["account"] == "b@example.invalid"
+    for id in range(11, 17):
+        assert responses[id]["error"]["code"] == -32602
+    with sqlite3.connect(audit_path) as db:
+        rows = db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id").fetchall()
+    assert len(rows) == 15, rows
+    assert [outcome for _, outcome in rows].count("permission_denied") == 4
+    assert "a@example.invalid" not in str(rows)
+    print("MCP stdio permission denial and filtered aggregates over real Swift socket: passed")
+
+
 class MCPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pmcp-", dir="/tmp")
@@ -267,6 +302,16 @@ class MCPTests(unittest.TestCase):
                 self.exchange(send_result(result), method="codes")
             self.assertEqual(error.exception.code, expected)
 
+    def test_permission_and_audit_errors_preserved_without_content(self):
+        for code in ("permission_denied", "audit_unavailable"):
+            def send(connection, req):
+                connection.sendall(json.dumps({"version": 1, "id": req["id"],
+                    "error": {"code": code, "message": "PRIVATE_SENTINEL"}}).encode() + b"\n")
+            with self.assertRaises(ToolError) as error:
+                self.exchange(send)
+            self.assertEqual(error.exception.code, code)
+            self.assertNotIn("PRIVATE_SENTINEL", str(error.exception))
+
     def test_old_app_filters_fail_closed(self):
         # Simulate the old App's valid v1 response, which ignores unknown params.
         endpoint = str(self.path / "agent.sock")
@@ -320,5 +365,7 @@ class MCPTests(unittest.TestCase):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--integration":
         integration(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--permissions-integration":
+        permissions_integration(*sys.argv[2:])
     else:
         unittest.main()

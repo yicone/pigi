@@ -12,7 +12,7 @@ DEFAULT_SOCKET = Path.home() / "Library/Application Support/pigi/agent.sock"
 MAX_REQUEST = 65_536
 MAX_RESPONSE = 2_097_152
 ERRORS = {"invalid_request", "unsupported_version", "method_not_found", "not_found",
-          "unauthorized", "too_large", "timeout", "internal_error"}
+          "unauthorized", "permission_denied", "audit_unavailable", "too_large", "timeout", "internal_error"}
 
 
 class ToolError(Exception):

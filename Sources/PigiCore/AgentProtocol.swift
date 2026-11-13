@@ -6,7 +6,7 @@ public enum AgentProtocol {
     public static let maxRequestBytes = 65_536
     public static let maxResponseBytes = 2_097_152
 
-    public struct Request: Codable {
+    public struct Request: Codable, Sendable {
         public let version: Int
         public let id: String
         public let method: String
@@ -17,7 +17,7 @@ public enum AgentProtocol {
         }
     }
 
-    public struct Params: Codable {
+    public struct Params: Codable, Sendable {
         public let account: String?
         public let messageID: String?
         public let query: String?
@@ -34,7 +34,7 @@ public enum AgentProtocol {
         }
     }
 
-    public struct Message: Codable {
+    public struct Message: Codable, Sendable {
         public let account: String
         public let messageID: String
         public let date: Int
@@ -47,7 +47,7 @@ public enum AgentProtocol {
         public let status: String
     }
 
-    public struct VerificationCode: Codable {
+    public struct VerificationCode: Codable, Sendable {
         public let code: String
         public let fromName: String?
         public let fromEmail: String?
@@ -56,12 +56,12 @@ public enum AgentProtocol {
         public let messageID: String
     }
 
-    public struct Account: Codable {
+    public struct Account: Codable, Sendable {
         public let account: String
         public let kind: String?
     }
 
-    public struct Result: Codable {
+    public struct Result: Codable, Sendable {
         public var codes: [VerificationCode]? = nil
         public var accounts: [Account]? = nil
         public var capabilities: [String] = ["accounts", "filters", "codes"]
@@ -72,19 +72,20 @@ public enum AgentProtocol {
         public let contentTrust: String
     }
 
-    public struct Failure: Codable, Error {
+    public struct Failure: Codable, Error, Sendable {
         public let code: String
         public let message: String
         static func make(_ code: String) -> Self {
             let messages = ["invalid_request": "Invalid request", "unsupported_version": "Unsupported protocol version",
                             "method_not_found": "Only accounts, list, search, get and codes are supported", "not_found": "Message not found",
                             "internal_error": "Local mail store unavailable", "too_large": "Frame exceeds size limit",
+                            "permission_denied": "Account capability is not granted", "audit_unavailable": "Action audit unavailable",
                             "unauthorized": "Peer user is not authorized", "timeout": "Connection deadline exceeded"]
             return Self(code: code, message: messages[code] ?? "Request failed")
         }
     }
 
-    public struct Response: Codable {
+    public struct Response: Codable, Sendable {
         public let version: Int
         public let id: String?
         public let result: Result?
@@ -92,7 +93,7 @@ public enum AgentProtocol {
     }
 
     /// Deliberately excludes request IDs, accounts, queries, message IDs and content.
-    public struct AuditEvent {
+    public struct AuditEvent: Sendable {
         public let method: String
         public let outcome: String
         public let durationMilliseconds: Int
@@ -100,13 +101,36 @@ public enum AgentProtocol {
 }
 
 extension LocalEngine {
-    /// Runs entirely on the same actor and SQLite connection used by UI and sync.
+    /// Sole agent dispatch entry: audit intent before access and fail closed on ledger errors.
     func agentRead(_ request: AgentProtocol.Request) throws -> AgentProtocol.Result {
+        let row: Int64
+        do { row = try beginAgentAction(request) }
+        catch { throw AgentProtocol.Failure.make("audit_unavailable") }
+        do {
+            let result = try agentReadAuthorized(request)
+            let response = AgentProtocol.Response(version: 1, id: request.id, result: result, error: nil)
+            guard try JSONEncoder().encode(response).count <= AgentProtocol.maxResponseBytes else {
+                throw AgentProtocol.Failure.make("too_large")
+            }
+            try finishAgentAction(row, result: "allowed")
+            return result
+        } catch {
+            let failure = (error as? AgentProtocol.Failure) ?? .make("internal_error")
+            do { try finishAgentAction(row, result: failure.code) }
+            catch { throw AgentProtocol.Failure.make("audit_unavailable") }
+            throw failure
+        }
+    }
+
+    /// Runs entirely on the same actor and SQLite connection used by UI and sync.
+    private func agentReadAuthorized(_ request: AgentProtocol.Request) throws -> AgentProtocol.Result {
         typealias Failure = AgentProtocol.Failure
         guard request.version == AgentProtocol.version else { throw Failure.make("unsupported_version") }
         guard !request.id.isEmpty, request.id.utf8.count <= 128 else { throw Failure.make("invalid_request") }
         guard ["accounts", "list", "search", "get", "codes"].contains(request.method) else { throw Failure.make("method_not_found") }
         let p = request.params
+        // Check explicit scopes before looking up any message or querying FTS.
+        if let account = p?.account { try requireAgentCapability(.read, account: account) }
         let limit = p?.limit ?? 50, offset = p?.offset ?? 0
         guard (1...100).contains(limit), (0...1_000_000).contains(offset),
               (p?.account?.utf8.count ?? 0) <= 1024,
@@ -118,7 +142,7 @@ extension LocalEngine {
         }
         if request.method == "accounts" {
             guard p?.account == nil, p?.messageID == nil, p?.query == nil, p?.since == nil, p?.status == nil else { throw Failure.make("invalid_request") }
-            let rows = try db().query("SELECT email,kind FROM accounts ORDER BY email LIMIT ? OFFSET ?", [.int(limit + 1), .int(offset)])
+            let rows = try db().query("SELECT email,kind FROM accounts WHERE \(Self.agentReadableAccountSQL) ORDER BY email LIMIT ? OFFSET ?", [.int(limit + 1), .int(offset)])
             var result = AgentProtocol.Result(items: nil, nextOffset: rows.count > limit ? offset + limit : nil,
                                                message: nil, text: nil, contentTrust: "untrusted")
             result.accounts = rows.prefix(limit).map { .init(account: $0["email"]?.text ?? "", kind: $0["kind"]?.text) }
@@ -128,7 +152,7 @@ extension LocalEngine {
             guard p?.messageID == nil, p?.query == nil else { throw Failure.make("invalid_request") }
             let now = Int(Date().timeIntervalSince1970 * 1000)
             let since = p?.since ?? max(0, now - 600_000)
-            var conditions = ["m.status!='deleted'", "m.code IS NOT NULL", "length(trim(m.code))>0",
+            var conditions = [Self.agentReadableMessageSQL, "m.status!='deleted'", "m.code IS NOT NULL", "length(trim(m.code))>0",
                               "m.date>=?", "m.date<=?"]
             var values: [SQLValue] = [.int(since), .int(now)]
             if let account = p?.account { conditions.append("m.account=?"); values.append(.text(account)) }
@@ -165,7 +189,7 @@ extension LocalEngine {
         }
         guard p?.messageID == nil else { throw Failure.make("invalid_request") }
         var sql = "SELECT \(columns) FROM messages m"
-        var conditions = ["m.status!='deleted'"]
+        var conditions = [Self.agentReadableMessageSQL, "m.status!='deleted'"]
         var values: [SQLValue] = []
         if request.method == "search" {
             guard let query = p?.query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty,

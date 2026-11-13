@@ -113,6 +113,7 @@ class SocketClient:
                 accounts = result.get("accounts")
                 if (not isinstance(accounts, list) or len(accounts) > 1
                         or any(not isinstance(item, dict) or set(item) - {"account", "kind"}
+                               or (item.get("kind") is not None and not isinstance(item["kind"], str))
                                or item.get("account") != params["account"] for item in accounts)
                         or set(result) - {"accounts", "nextOffset", "contentTrust", "capabilities"}
                         or "nextOffset" in result):

@@ -350,6 +350,25 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(error.exception.code, code)
             self.assertNotIn("PRIVATE_SENTINEL", str(error.exception))
 
+    def test_scoped_accounts_kind_contract(self):
+        account = "a@example.invalid"
+        def exchange(item):
+            def send(connection, req):
+                connection.sendall(json.dumps({"version": 1, "id": req["id"], "result": {
+                    "accounts": [item], "contentTrust": "untrusted",
+                    "capabilities": ["scoped_accounts"]}}).encode() + b"\n")
+            return self.exchange(send, method="accounts", params={"account": account})
+        for item in ({"account": account}, {"account": account, "kind": None},
+                     {"account": account, "kind": "imap"}):
+            with self.subTest(accepted=item):
+                self.assertEqual(exchange(item)["accounts"], [item])
+        for kind in ({"body": "PRIVATE_SENTINEL"}, ["PRIVATE_SENTINEL"], {}, [], 1, 1.5, True, False):
+            with self.subTest(rejected=kind):
+                with self.assertRaises(ToolError) as error:
+                    exchange({"account": account, "kind": kind})
+                self.assertEqual(error.exception.code, "invalid_response")
+                self.assertNotIn("PRIVATE_SENTINEL", str(error.exception))
+
     def test_codes_transport_rejects_missing_capability_and_body(self):
         item = {"code": "123456", "date": 123, "account": "a@example.invalid", "messageID": "same"}
         def send_result(result):

@@ -66,13 +66,16 @@ def tool_result(value, error=False):
 
 
 class MCPServer:
-    def __init__(self, client, audit):
+    def __init__(self, client, audit, account=None):
         self.client, self.audit = client, audit
+        self.account = account
+        # A remote reader needs only these three operations, never account discovery/codes.
+        self.tools = [s for s in TOOLS if s["name"] in {"search", "list_messages", "get_message"}] if account else TOOLS
         self.state = "new"
 
     def call_tool(self, params):
         name = params.get("name")
-        spec = next((s for s in TOOLS if s["name"] == name), None)
+        spec = next((s for s in self.tools if s["name"] == name), None)
         start = time.monotonic()
         # Commit intent before touching the socket; a crash leaves a 'started' row.
         try:
@@ -85,6 +88,10 @@ class MCPServer:
                 raise RPCError(-32602, "Unknown tool.")
             args = params.get("arguments", {})
             validate(spec, args)
+            if self.account is not None:
+                if args.get("account", self.account) != self.account:
+                    raise ToolError("permission_denied")
+                args = {**args, "account": self.account}
             result = self.client.call(METHODS[name], args)
             result["trustNotice"] = TRUST_NOTICE
             response = tool_result(result)
@@ -124,7 +131,7 @@ class MCPServer:
         if method == "tools/list":
             if params.get("cursor") is not None:
                 raise RPCError(-32602, "Invalid cursor.")
-            return {"tools": TOOLS}
+            return {"tools": self.tools}
         if method == "tools/call":
             return self.call_tool(params)
         raise RPCError(-32601, "Method not found.")
@@ -182,14 +189,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--audit-db", default=DEFAULT_AUDIT)
+    parser.add_argument("--account", help="Restrict this session to list/search/get for this exact account.")
     args = parser.parse_args()
+    if args.account is not None and (not args.account.strip() or len(args.account.encode("utf-8")) > 1024):
+        parser.error("Invalid account scope.")
     # SQLite journal files inherit a private process umask too.
     import os
     os.umask(0o077)
     audit = None
     try:
         audit = Audit(args.audit_db)
-        serve(MCPServer(SocketClient(args.socket), audit), sys.stdin.buffer, sys.stdout.buffer)
+        serve(MCPServer(SocketClient(args.socket), audit, args.account), sys.stdin.buffer, sys.stdout.buffer)
         return 0
     except (OSError, sqlite3.Error):
         print("pigi-mcp: transport or audit unavailable.", file=sys.stderr)

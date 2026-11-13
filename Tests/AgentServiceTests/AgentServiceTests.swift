@@ -315,6 +315,38 @@ private extension LocalEngine {
 }
 
 extension AgentServiceTests {
+    func testAccountScopedMCPOverAppSocket() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-scope-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        let socket = directory.appendingPathComponent("agent.sock")
+        let server = AgentSocketServer(engine: engine, url: socket)
+        try server.start()
+        defer { server.stop() }
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for denied in [false, true] {
+            try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: !denied, draft: true, organize: true))
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", "-B", root.appendingPathComponent("tools/pigi-mcp/test_pigi_mcp.py").path,
+                                 "--scoped-integration", socket.path,
+                                 directory.appendingPathComponent(denied ? "denied.sqlite3" : "allowed.sqlite3").path,
+                                 denied ? "denied" : "allowed"]
+            let output = Pipe()
+            process.standardOutput = output; process.standardError = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        }
+        let actions = try await engine.agentActions()
+        XCTAssertEqual(actions.count, 6) // Cross-account/unsupported calls stop at MCP audit.
+        XCTAssertEqual(actions.filter { $0.result == "permission_denied" }.count, 3)
+        let unchanged = try await engine.assertAgentReadDidNotMutate()
+        XCTAssertTrue(unchanged)
+    }
+
     func testMCPStdioPermissionBoundary() async throws {
         let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-grants-\(UUID().uuidString.prefix(8))")
         defer { try? FileManager.default.removeItem(at: directory) }

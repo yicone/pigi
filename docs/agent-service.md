@@ -35,11 +35,28 @@ handled on the next start. Start/stop calls are serialized.
 
 Each accepted connection must pass macOS `getpeereid`: peer effective UID must equal
 the App effective UID. Filesystem permissions are the first boundary; peer UID is
-the second. There is no bearer token, password or credential exchange. **Any process
-running as the same user can read all cached accounts.** This is not per-process
-consent, per-account authorization, protection against compromised same-user code,
-or protection from root. Consumers must not expose this socket through a network
+the second. There is no bearer token, password or credential exchange. Any process
+running as the same user can call the socket; the engine additionally applies the
+account grants below. These grants constrain the service, not direct database/file
+access by compromised same-user code or root, and do not provide per-process consent.
+Consumers must not expose this socket through a network
 proxy or share its results with another user without separate authorization.
+
+### Account capabilities (ACM-751)
+
+Settings → Agent owns independent `read`, `draft`, and `organize` grants per account,
+defaulting to read + draft. Grants persist in `agent_permissions`; existing and newly
+added accounts use these defaults. Removing an account also removes its grants.
+Sending is a fixed false constant with no setting. Draft/organize are reserved grants:
+this read-only protocol does not implement those operations even when granted.
+
+`LocalEngine.agentRead` checks read before scoped access; unknown or revoked accounts
+return `permission_denied` without looking up messages. Unscoped accounts/list/search/
+codes queries filter unreadable accounts in SQL before sorting and pagination, so
+revoked accounts cannot leak through discovery, snippets, FTS, codes or page offsets.
+Revocation takes effect for subsequent calls on the running service. Draft/organize
+do not imply read. The method whitelist never dispatches account deletion, credential
+read/export, OAuth client changes, permission changes, audit access, or sending.
 
 All mail fields, including subjects, senders, snippets and bodies, are attacker
 controlled. Every successful result includes `contentTrust: "untrusted"`. `get`
@@ -126,6 +143,8 @@ are bound values, never interpolated SQL or raw FTS expressions.
 | `method_not_found` | operation outside the read-only allowlist |
 | `not_found` | no matching nondeleted account/message pair |
 | `unauthorized` | UID check failed; do not retry as another identity |
+| `permission_denied` | scoped account is unknown or read is revoked |
+| `audit_unavailable` | durable action audit could not begin/finish; no mail returned |
 | `too_large` | frame/response too large; reduce page size or report oversized message |
 | `timeout` | connection/engine deadline; bounded retry is safe for reads |
 | `internal_error` | local store failure; generic message, no SQL/path/error details |
@@ -140,6 +159,24 @@ records accounts, request IDs, queries, message IDs, subjects, bodies, passwords
 tokens. Callbacks should be fast and thread-safe. Capacity rejection and startup failure
 have no request event; successful dispatch does not prove response delivery. This is
 a diagnostic hook, not a durable or tamper-proof access ledger.
+
+The engine now persists `agent_actions(ts, tool, account, target, args_hash, result)`
+on its existing SQLite connection, also for direct socket clients that bypass MCP.
+Settings → Agent shows paginated records. Intent is written before dispatch;
+completion records `allowed` or a fixed protocol error code before data is returned.
+A crash or failed completion can leave `started` (outcome unknown). Malformed/oversized
+frames, peer-auth errors and read timeouts are recorded without retaining input bytes.
+`allowed` describes engine execution, not proof that a client received the response.
+
+Account, target and canonical arguments use domain-separated HMAC-SHA256 digests with
+a random per-database key in `agent_audit_key`. This avoids plaintext identifiers and
+unsalted hashes of guessable queries/codes; request IDs, mail content, arbitrary method
+names, credentials and raw errors are never stored in the ledger. The key and ledger
+share the mail database's 0600 protection; neither is tamper-proof against the same
+user. The existing OSLog callback and MCP `tool_calls` remain transport diagnostics,
+including tools rejected by MCP before any socket call, rather than a second App
+action ledger. The App does not open the adapter's separate database. Retention is
+manual; no pruning is performed.
 
 ## Implementation and validation plan
 

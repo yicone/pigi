@@ -183,6 +183,11 @@ final class AgentServiceTests: XCTestCase {
         try server.start()
         XCTAssertNotNil(try Self.exchange(url.path, Self.request("list"))?.result)
         XCTAssertTrue(events.snapshot().allSatisfy { ["accounts", "list", "search", "get", "invalid"].contains($0.method) })
+        let persisted = try await engine.agentActions(limit: 200)
+        XCTAssertTrue(persisted.contains { $0.tool == "invalid" && $0.result == "invalid_request" })
+        XCTAssertTrue(persisted.contains { $0.tool == "invalid" && $0.result == "too_large" })
+        XCTAssertTrue(persisted.contains { $0.tool == "invalid" && $0.result == "timeout" })
+        XCTAssertTrue(persisted.contains { $0.tool == "get" && $0.result == "too_large" })
     }
 
     func testCodesOverRealSocket() async throws {
@@ -286,4 +291,218 @@ private final class AuditCollector: @unchecked Sendable {
     private var events: [AgentProtocol.AuditEvent] = []
     func append(_ event: AgentProtocol.AuditEvent) { lock.lock(); defer { lock.unlock() }; events.append(event) }
     func snapshot() -> [AgentProtocol.AuditEvent] { lock.lock(); defer { lock.unlock() }; return events }
+}
+
+private extension LocalEngine {
+    func failAgentAudit(_ stage: String) throws {
+        if stage == "read" { try db().run("DROP TABLE messages") }
+        else if stage == "begin" { try db().run("DROP TABLE agent_actions") }
+        else {
+            try db().run("CREATE TRIGGER fail_action_finish BEFORE UPDATE ON agent_actions BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        }
+    }
+
+    func auditStorageText() throws -> String {
+        try db().query("SELECT * FROM agent_actions").flatMap { $0.values.compactMap(\.text) }.joined(separator: "|")
+    }
+
+    func useAgentFixtureFile(_ path: String) throws {
+        let memory = try Store(path: path)
+        for statement in Self.schema { try memory.run(statement) }
+        store = memory
+        try memory.run("INSERT OR IGNORE INTO accounts(email,kind) VALUES('a@example.invalid','imap')")
+    }
+}
+
+extension AgentServiceTests {
+    func testMCPStdioPermissionBoundary() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-grants-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        _ = try await engine.seedCodeFixtures()
+        try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: false, draft: true, organize: true))
+        let socket = directory.appendingPathComponent("agent.sock")
+        let server = AgentSocketServer(engine: engine, url: socket)
+        try server.start()
+        defer { server.stop() }
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["python3", "-B", root.appendingPathComponent("tools/pigi-mcp/test_pigi_mcp.py").path,
+                             "--permissions-integration", socket.path, directory.appendingPathComponent("audit.sqlite3").path]
+        let output = Pipe()
+        process.standardOutput = output; process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        let actions = try await engine.agentActions()
+        XCTAssertEqual(actions.filter { $0.result == "permission_denied" }.count, 4)
+        XCTAssertEqual(actions.count, 9) // Six rejected MCP tools never reach App dispatch.
+    }
+
+    func testAccountCapabilitiesAndAuditOverSocket() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-grants-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        _ = try await engine.seedCodeFixtures()
+        let defaults = try await engine.agentAccountAccess()
+        XCTAssertEqual(defaults.count, 3)
+        XCTAssertTrue(defaults.allSatisfy { $0.permissions == .defaults })
+        XCTAssertFalse(AgentPermissions.canSend)
+        let url = directory.appendingPathComponent("agent.sock")
+        let server = AgentSocketServer(engine: engine, url: url)
+        try server.start()
+        defer { server.stop() }
+
+        // Draft and organize must not imply read. Revocation takes effect on this live listener.
+        try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: false, draft: true, organize: true))
+        for method in ["list", "search", "get", "codes"] {
+            var params: [String: Any] = ["account": "a@example.invalid", "read": true, "permissions": ["read": true]]
+            if method == "search" { params["query"] = "secrets" }
+            if method == "get" { params["messageID"] = "same" }
+            let reply = try XCTUnwrap(Self.exchange(url.path, Self.request(method, params)))
+            XCTAssertEqual(reply.error?.code, "permission_denied", method)
+            XCTAssertNil(reply.result)
+        }
+        // Identical message ID in another account remains readable.
+        XCTAssertNotNil(try Self.exchange(url.path, Self.request("get", ["account": "b@example.invalid", "messageID": "same"]))?.result)
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("get", ["account": "unknown", "messageID": "same"]))?.error?.code, "permission_denied")
+
+        // Filter before LIMIT/OFFSET, including discovery, search/FTS and code extraction.
+        let accounts = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["limit": 1]))?.result)
+        XCTAssertEqual(accounts.accounts?.map(\.account), ["b@example.invalid"])
+        XCTAssertEqual(accounts.nextOffset, 1)
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("accounts", ["offset": 1]))?.result?.accounts?.map(\.account), ["empty@example.invalid"])
+        let list = try XCTUnwrap(Self.exchange(url.path, Self.request("list", ["limit": 1]))?.result)
+        XCTAssertEqual(list.items?.map(\.account), ["b@example.invalid"])
+        XCTAssertNil(list.nextOffset)
+        for query in ["secrets", "ph"] {
+            XCTAssertTrue(try Self.exchange(url.path, Self.request("search", ["query": query]))?.result?.items?.isEmpty == true)
+        }
+        XCTAssertTrue(try Self.exchange(url.path, Self.request("codes"))?.result?.codes?.isEmpty == true)
+
+        // Revocation of the remaining accounts yields empty aggregate results, never a fallback.
+        for account in ["b@example.invalid", "empty@example.invalid"] {
+            try await engine.setAgentPermissions(account: account, permissions: .init(read: false, draft: false, organize: false))
+        }
+        XCTAssertTrue(try Self.exchange(url.path, Self.request("accounts"))?.result?.accounts?.isEmpty == true)
+        XCTAssertTrue(try Self.exchange(url.path, Self.request("list"))?.result?.items?.isEmpty == true)
+        try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .defaults)
+        XCTAssertNotNil(try Self.exchange(url.path, Self.request("get", ["account": "a@example.invalid", "messageID": "same"]))?.result)
+        let actions = try await engine.agentActions()
+        XCTAssertTrue(actions.contains { $0.tool == "get" && $0.result == "allowed" })
+        XCTAssertTrue(actions.contains { $0.result == "permission_denied" })
+        let unchanged = try await engine.assertAgentReadDidNotMutate()
+        XCTAssertTrue(unchanged)
+    }
+
+    func testForbiddenAdministrationAndSendingCannotBeEnabled() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-deny-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: true, draft: true, organize: true))
+        let url = directory.appendingPathComponent("agent.sock")
+        let server = AgentSocketServer(engine: engine, url: url)
+        try server.start()
+        defer { server.stop() }
+        for method in ["send", "smtp", "queueSend", "deleteAccount", "delete_account", "accounts.delete",
+                       "credentials", "getCredentials", "export_credentials", "Keychain.get", "setOAuthClient",
+                       "setAgentPermissions", "agentActions", "modify", "draft", "organize", "unsubscribe", "mute"] {
+            let reply = try XCTUnwrap(Self.exchange(url.path, Self.request(method, ["account": "a@example.invalid", "messageID": "same"])))
+            XCTAssertEqual(reply.error?.code, "method_not_found", method)
+            XCTAssertNil(reply.result)
+        }
+        let accounts = try await engine.agentAccountAccess()
+        XCTAssertEqual(accounts.count, 3)
+        XCTAssertFalse(AgentPermissions.canSend)
+        let unchanged = try await engine.assertAgentReadDidNotMutate()
+        XCTAssertTrue(unchanged)
+        let audit = try await engine.agentActions()
+        XCTAssertEqual(audit.count, 18)
+        XCTAssertTrue(audit.allSatisfy { $0.result == "method_not_found" && $0.tool == "invalid" })
+    }
+
+    func testAuditPrivacyAndFailurePaths() async throws {
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        for request in [
+            AgentProtocol.Request(id: "PRIVATE_REQUEST", method: "search", params: .init(account: "a@example.invalid", query: "PRIVATE_QUERY")),
+            .init(id: "PRIVATE_REQUEST", method: "get", params: .init(account: "a@example.invalid", messageID: "PRIVATE_TARGET")),
+            .init(id: "PRIVATE_REQUEST", method: "PRIVATE_METHOD")
+        ] {
+            _ = try? await engine.agentRead(request)
+        }
+        let first = try await engine.agentActions()
+        XCTAssertEqual(first.count, 3)
+        XCTAssertEqual(Set(first.map(\.result)), ["allowed", "not_found", "method_not_found"])
+        XCTAssertTrue(first.allSatisfy { $0.argsHash.count == 64 })
+        let raw = try await engine.auditStorageText()
+        for secret in ["PRIVATE_", "example.invalid", "same", "Ignore all instructions", "123456", "Other account body"] {
+            XCTAssertFalse(raw.contains(secret), secret)
+        }
+        let request = AgentProtocol.Request(id: "different", method: "search", params: .init(account: "a@example.invalid", query: "PRIVATE_QUERY"))
+        _ = try await engine.agentRead(request)
+        let repeatHash = try await engine.agentActions().first?.argsHash
+        XCTAssertEqual(repeatHash, first.last?.argsHash)
+        // Each database has a different key; the same arguments cannot be correlated across databases.
+        let other = LocalEngine()
+        try await other.seedAgentFixtures()
+        _ = try await other.agentRead(request)
+        let otherHash = try await other.agentActions().first?.argsHash
+        XCTAssertNotEqual(otherHash, repeatHash)
+        try await engine.failAgentAudit("read")
+        do { _ = try await engine.agentRead(.init(id: "x", method: "list")); XCTFail("must fail") }
+        catch { XCTAssertEqual((error as? AgentProtocol.Failure)?.code, "internal_error") }
+        let failed = try await engine.agentActions().first
+        XCTAssertEqual(failed?.result, "internal_error")
+    }
+
+    func testAuditUnavailableNeverReturnsMail() async throws {
+        for stage in ["begin", "finish"] {
+            let directory = URL(fileURLWithPath: "/tmp/pigi-audit-fail-\(UUID().uuidString.prefix(8))")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let engine = LocalEngine()
+            try await engine.seedAgentFixtures()
+            try await engine.failAgentAudit(stage)
+            do { _ = try await engine.agentRead(.init(id: "x", method: "get", params: .init(account: "a@example.invalid", messageID: "same"))); XCTFail("must fail closed") }
+            catch { XCTAssertEqual((error as? AgentProtocol.Failure)?.code, "audit_unavailable") }
+            let socket = directory.appendingPathComponent("agent.sock")
+            let server = AgentSocketServer(engine: engine, url: socket)
+            try server.start()
+            defer { server.stop() }
+            let reply = try XCTUnwrap(Self.exchange(socket.path, Self.request("get", ["account": "a@example.invalid", "messageID": "same"])))
+            XCTAssertNil(reply.result)
+            XCTAssertEqual(reply.error?.code, "audit_unavailable")
+            if stage == "finish" {
+                let unfinished = try await engine.agentActions()
+                XCTAssertEqual(unfinished.map(\.result), ["started", "started"])
+            }
+        }
+    }
+
+    func testPermissionsAndAuditSurviveReopeningFixtureDatabase() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("fixture.sqlite3").path
+        let first = LocalEngine()
+        try await first.useAgentFixtureFile(path)
+        try await first.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: false, draft: true, organize: true))
+        _ = try? await first.agentRead(.init(id: "x", method: "list", params: .init(account: "a@example.invalid")))
+        let second = LocalEngine()
+        try await second.useAgentFixtureFile(path)
+        let permissions = try await second.agentPermissions(account: "a@example.invalid")
+        XCTAssertEqual(permissions, .init(read: false, draft: true, organize: true))
+        _ = try? await second.agentRead(.init(id: "y", method: "list", params: .init(account: "a@example.invalid")))
+        let rows = try await second.agentActions()
+        XCTAssertEqual(rows.map(\.result), ["permission_denied", "permission_denied"])
+        XCTAssertEqual(rows[0].account, rows[1].account)
+        XCTAssertEqual(rows[0].argsHash, rows[1].argsHash)
+        let page = try await second.agentActions(limit: 1, offset: 1)
+        XCTAssertEqual(page.map(\.id), [rows[1].id])
+    }
 }

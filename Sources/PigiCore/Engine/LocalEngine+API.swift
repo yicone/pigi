@@ -166,6 +166,7 @@ extension LocalEngine {
             try s.run("DELETE FROM muted WHERE account=?", [.text(email)])
             try s.run("DELETE FROM account_labels WHERE account=?", [.text(email)])
             try s.run("DELETE FROM proton_snapshot WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM agent_permissions WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
         _ = Keychain.set("imap-\(email)", "")

@@ -10,6 +10,7 @@ struct SettingsView: View {
         case accounts = "邮箱管理"
         case notifications = "通知"
         case translation = "翻译"
+        case agent = "Agent"
         case archive = "同步"
         case shortcuts = "快捷键"
         case about = "关于"
@@ -20,6 +21,7 @@ struct SettingsView: View {
             case .accounts: "tray.2"
             case .notifications: "bell"
             case .translation: "character.bubble"
+            case .agent: "checkmark.shield"
             case .archive: "externaldrive.badge.icloud"
             case .shortcuts: "keyboard"
             case .about: "info.circle"
@@ -59,6 +61,7 @@ struct SettingsView: View {
                 case .accounts: AccountsPage()
                 case .notifications: NotificationsPage()
                 case .translation: TranslationPage()
+                case .agent: AgentSettingsPage()
                 case .archive: SyncSettingsPage()
                 case .shortcuts: ShortcutsPage()
                 case .about: AboutPage()

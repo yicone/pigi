@@ -44,8 +44,8 @@ was absent before.
 | --- | --- | --- | --- |
 | `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
 | `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
-| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | record existence/type/owner/mode before any write — a content hash does not apply to directories; record the child listing instead. If absent and auto-created, log that fact — rollback removes it only if it was created by this rollout, is empty, AND the rollback approval names it — a directory holding retained objects (below) is never deleted |
-| `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | record existence/type/owner/mode/child-listing. If absent at rollout the script creates it: log that. Rollback removes it only if it was created by this rollout, is empty, AND the rollback approval names it — a directory holding retained audit objects (below) is never deleted |
+| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | record existence/type/owner/mode before any write — a content hash does not apply to directories; record the child listing instead. **RETAIN by default** — any deletion, including a rollout-created empty dir, requires an explicit named decision in the rollback approval |
+| `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | record existence/type/owner/mode/child-listing. **RETAIN by default** — any deletion, including a rollout-created empty dir, requires an explicit named decision in the rollback approval; a directory holding retained audit objects (below) is never deleted |
 | `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | **audit object — never overwritten or blindly deleted.** Expected absent today — if present, STOP and inventory it; if created by this rollout, rollback *retains* it by default as an audit record — deleting it is a decision the rollback approval must name explicitly |
 | `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout it is retained with the DB it contains |
 | `~/Library/Application Support/pigi-mcp/audit.sqlite3` (+ transient `-journal`) | adapter `tool_calls` ledger, auto-created 0600 at `Audit()` init on every adapter start | 0600 | **audit object — never overwritten or blindly deleted.** If present at rollout, STOP and inventory (existence/type/owner/mode/hash). If created by this rollout, rollback *retains* it by default as an audit record — deleting it is itself a decision the rollback approval must name explicitly. The `-journal` file is transient (created on write, removed on commit) and inherits the same policy — a crash-residue journal found later is treated as an audit object, not auto-deleted; its crash-recovery lifecycle is **unverified** offline |
@@ -242,13 +242,13 @@ recorded; nothing pre-existing is destroyed:
   OFF — but the rollout log's recorded value is authoritative, not this doc's
   snapshot; a system admin may have enabled it for other reasons in between,
   and blindly disabling it would break that).
-- Forced-command ledger and adapter audit objects (`pigi/` and `pigi-mcp/`
-  dirs, `forced-command.log`, `audit.sqlite3`, transient `-journal`): if
-  created by this rollout they are audit records — RETAIN by default;
-  deletion requires an explicit named decision in the rollback approval —
-  and that includes removing a rollout-created directory once empty. A
-  directory that still holds retained objects is never deleted.
-  Pre-existing ones are never touched.
+- Audit objects and their parent directories (`~/Library`,
+  `~/Library/Application Support`, `pigi/` and `pigi-mcp/` dirs,
+  `forced-command.log`, `audit.sqlite3`, transient `-journal`): RETAIN by
+  default — ANY deletion, including a rollout-created directory or file,
+  requires an explicit named decision in the rollback approval. A directory
+  that still holds retained objects is never deleted. Pre-existing objects
+  are never touched.
 - Linux side: restore each backed-up file or remove only the added
   stanza/entry; delete the keypair and launcher copy only if they did not
   exist before.
@@ -273,10 +273,13 @@ recorded; nothing pre-existing is destroyed:
   actually used rather than a path snapshot. A component swap between its
   `lstat` and open fails the fstat compare; only the leaf dir may be
   created, inside its pinned parent; the ledger file is created with
-  `O_NOFOLLOW` inside the pinned leaf dir; and a post-create re-resolution
-  of the canonical path unlinks only provably-self-created objects via the
-  pinned parent when the path no longer resolves to them — a refusal never
-  creates in, or deletes, an unvalidated object. Append binding: the emit
+  `O_CREAT|O_EXCL|O_NOFOLLOW` inside the pinned leaf dir — a name swapped in
+  between the `lstat` and the open fails the syscall rather than being
+  overwritten or misattributed to this run. A refusal never deletes
+  anything: objects of unclear identity are retained, and a file/dir this
+  run created may be left inside the validated object at a moved path
+  (accepted safety-first residue — see residual (d)). Append binding: the
+  emit
   statement re-checks the descriptor's real fstat *and* (for `allow`) the
   full canonical path inside the same command — a staged change refuses
   before any byte is written, and a full gate re-runs immediately before
@@ -293,24 +296,31 @@ recorded; nothing pre-existing is destroyed:
   (c) history integrity is not protected at all: a same-UID truncate of the
   same inode between checks preserves every gate's metadata (dev/ino/uid/
   mode/nlink) while deleting prior records — the append fd does not see it;
-  (d) microsecond-scale gaps inside the single perl traversal (e.g. between
-  its post-verify `lstat` and exit) can leave a self-created empty dir or
-  file inside the *validated* object at a moved path — never inside an
-  unvalidated substitute; and (e) a same-UID writer can substitute a
-  policy-identical object (same owner/mode/type) before validation — the
-  object legitimately passes and is indistinguishable; only its inode
-  differs, and no prior inode was ever authoritative.
-  The checks bind each operation to a policy-valid object at operation
-  time; they do NOT prove a trusted-writer environment, and nothing here
-  establishes that the required conditions hold. Required rollout
-  preconditions — pending verification and separate numbered approval, not
-  asserted as satisfied: no other same-UID process writes under
-  `~/Library/Application Support/pigi*`; ledger rotation, truncation, and
-  manual edits are prohibited operationally; any such maintenance needs its
-  own numbered approval. No residual is a remote or cross-UID attack
-  (cross-UID unverified). The fstat, traversal and O_NOFOLLOW-create checks
-  require `/usr/bin/perl` (stock macOS) — listed as a rollout dependency
-  below. Retention is manual, matching the App's audit model.
+  (d) a self-created file or leaf dir can be left inside the *validated*
+  object at a moved path when a same-UID swap lands between an in-perl
+  operation and the shell path gate — accepted safety-first residue
+  (reported, never inside an unvalidated substitute); the script never
+  deletes by name, so an injected pre-existing object is preserved; and
+  (e) a same-UID writer can substitute a policy-identical object (same
+  owner/mode/type) before validation — the object legitimately passes and
+  is indistinguishable; only its inode differs, and no prior inode was
+  ever authoritative.
+  (a)–(c) are open, unresolved residuals: no userspace primitive on macOS
+  closes a same-UID check→use window on a shared filesystem object, and
+  the owner-removable flags (`uappnd`/`uchg`) don't help while
+  `sappend`/`schg` need root. Options needing a user decision: accept them
+  as documented risk; run the ledger under a dedicated UID so no other
+  process shares write access; or have a root-owned install step set
+  `sappend` on the ledger (each a system-level change — not in offline
+  scope). Required rollout preconditions — pending verification and
+  separate numbered approval, not asserted as satisfied: no other same-UID
+  process writes under `~/Library/Application Support/pigi*`; ledger
+  rotation, truncation, and manual edits are prohibited operationally; any
+  such maintenance needs its own numbered approval. No residual is a
+  remote or cross-UID attack (cross-UID unverified). The fstat, traversal
+  and O_EXCL-create checks require `/usr/bin/perl` (stock macOS) — listed
+  as a rollout dependency below. Retention is manual, matching the App's
+  audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`
   ledger (tool name + outcome only).
 - App `agent_actions` table + OSLog hook: engine-level durable audit.

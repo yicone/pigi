@@ -594,17 +594,34 @@ run "$hfc" "$EXPECTED"
 check 'creation: swapped-in invalid dir refused, object preserved' $?
 
 # 16u. Inside-perl injection: rename the pinned leaf dir away after
-# validation, before chdir — the file is still created inside the pinned
-# (moved) object, but the post-verify lstat catches the moved canonical
-# path and unlinks our file via the pinned cwd. No residue, refuse.
+# validation, before chdir. The create still lands inside the pinned
+# (moved) validated object; the shell path gate then refuses. Accepted
+# residue: our self-created file stays inside the moved validated dir —
+# nothing is ever deleted by name. Assert refusal + no stub + residue
+# report (file present in the moved object, nothing removed).
 ru_="$rdir/u-anc"; mkdir -m 700 "$ru_" "$ru_/leaf"
 rulog="$ru_/leaf/forced-command.log"
 hfc="$(render_hook u "$rulog" 'chdir($F[$#F])' \
     "            rename(\"$ru_/leaf\",\"$ru_/ours\") or die;")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
-    && [ -d "$ru_/ours" ] && [ ! -e "$ru_/ours/forced-command.log" ]; }
-check 'creation: moved dir gets no residue file (post-verify undo)' $?
+    && [ -d "$ru_/ours" ] && [ -f "$ru_/ours/forced-command.log" ]; }
+residue="none"; [ -f "$ru_/ours/forced-command.log" ] \
+    && residue="self-created file retained inside moved validated dir"
+check "creation: moved dir — refuse, self-created residue retained ($residue)" $?
+
+# 16v. Inside-perl injection: after our create, rename our file aside and
+# plant a pre-existing file at the leaf name — nothing is unlinked; the
+# victim survives and our file stays as reported residue.
+rv_="$rdir/v-anc"; mkdir -m 700 "$rv_" && mkdir -m 700 "$rv_/leaf"
+rvlog="$rv_/leaf/forced-command.log"
+printf 'VICTIM\n' > "$rv_/victim"; chmod 644 "$rv_/victim"
+hfc="$(render_hook v "$rvlog" 'exit 0' \
+    "            chdir(\"$rv_/leaf\"); rename(\"forced-command.log\",\"$rv_/ours-log\"); rename(\"$rv_/victim\",\"forced-command.log\");")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rvlog")" = 'VICTIM' ] && [ -f "$rv_/ours-log" ]; }
+check 'creation: substitute file never unlinked, self-created kept as residue' $?
 
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and

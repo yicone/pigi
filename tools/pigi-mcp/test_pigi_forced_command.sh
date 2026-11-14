@@ -536,20 +536,22 @@ run "$hfc" "$EXPECTED"
     && [ ! -e "$ro_/leaf" ]; }
 check 'creation: refused ancestor never gains a created dir' $?
 
-# 16p. Ancestor swapped in the check→mkdir window: mkdir is cleaned up on
-# refusal (rmdir of our own empty dir), leaving no residue.
+# 16p. Ancestor swapped before the bound traversal: perl's lstat sees the
+# link and refuses — no mkdir side effect anywhere.
 rp_="$rdir/p-anc"; mkdir -m 700 "$rp_"
-hfc="$(render_hook p "$rp_/leaf/forced-command.log" 'mkdir -m 700' \
+hfc="$(render_hook p "$rp_/leaf/forced-command.log" "/usr/bin/perl -e 'use Fcntl;" \
     "    mv \"$rp_\" \"$rdir/p-old\"; ln -s \"$rdir/p-old\" \"$rp_\"")"
 run "$hfc" "$EXPECTED"
-{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
-check 'creation: check→mkdir ancestor swap refused' $?
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ ! -e "$rdir/p-old/leaf" ]; }
+check 'creation: ancestor swap before traversal refused, nothing created' $?
 
-# 16q. Dangling link planted between -L check and atomic create: O_NOFOLLOW
-# refuses the open — target never materializes.
+# 16q. Dangling link planted before the bound traversal: perl's lstat sees
+# the link at the leaf path and refuses — target never materializes.
 rq_="$rdir/q"; mkdir -m 700 "$rq_"; rlogq="$rq_/forced-command.log"
 qtarget="$rq_/should-not-exist"
-hfc="$(render_hook q "$rlogq" 'O_NOFOLLOW' "    ln -s \"$qtarget\" \"$rlogq\"")"
+hfc="$(render_hook q "$rlogq" "/usr/bin/perl -e 'use Fcntl;" \
+    "    ln -s \"$qtarget\" \"$rlogq\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
     && [ ! -e "$qtarget" ]; }
@@ -566,32 +568,43 @@ run "$hfc" "$EXPECTED"
     && [ "$(cat "$rlogr")" = 'orig' ]; }
 check 'race: ancestor swap at emit refused, nothing written' $?
 
-# 16s. Directory swapped for a symlink to another 0700 dir between validation
-# and the dirfd-bound create: fstat compare refuses — the substitute dir must
-# not gain a file, and neither must the moved-away original.
+# 16s. Directory swapped for a symlink to another 0700 dir before the bound
+# traversal: lstat sees the link and refuses — nothing created anywhere.
 rs_="$rdir/s-real"; mkdir -m 700 "$rs_"
 rssub="$rdir/s-sub"; mkdir -m 700 "$rssub"
 rslog="$rdir/s-real/forced-command.log"
-hfc="$(render_hook s "$rslog" 'sysopen(D' \
+hfc="$(render_hook s "$rslog" "/usr/bin/perl -e 'use Fcntl;" \
     "    mv \"$rs_\" \"$rdir/s-moved\"; ln -s \"$rssub\" \"$rs_\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
     && [ ! -e "$rssub/forced-command.log" ] \
     && [ ! -e "$rdir/s-moved/forced-command.log" ]; }
-check 'creation: dir swap before create refused, no file anywhere' $?
+check 'creation: dir swap before traversal refused, no file anywhere' $?
 
-# 16t. Self-created leaf dir swapped out for a pre-existing empty 0755 dir
-# before revalidation: refusal must NOT delete the pre-existing dir, and the
-# self-created one stays as residue where it was moved.
+# 16t. A pre-existing 0755 dir placed at the missing-leaf position before the
+# traversal: validation refuses on mode and nothing is created or deleted.
 rt_="$rdir/t-anc"; mkdir -m 700 "$rt_"
 prex="$rdir/t-preex"; mkdir "$prex"; chmod 755 "$prex"
 rtlog="$rt_/leaf/forced-command.log"
-hfc="$(render_hook t "$rtlog" 'ledger_dirs_ok "$dir" ||' \
-    "    mv \"$rt_/leaf\" \"$rdir/t-mine\"; mv \"$prex\" \"$rt_/leaf\"")"
+hfc="$(render_hook t "$rtlog" "/usr/bin/perl -e 'use Fcntl;" \
+    "    mv \"$prex\" \"$rt_/leaf\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
-    && [ -d "$rt_/leaf" ] && [ -d "$rdir/t-mine" ]; }
-check 'cleanup: pre-existing dir preserved, created dir residue only' $?
+    && [ -d "$rt_/leaf" ] && [ ! -e "$rtlog" ]; }
+check 'creation: swapped-in invalid dir refused, object preserved' $?
+
+# 16u. Inside-perl injection: rename the pinned leaf dir away after
+# validation, before chdir — the file is still created inside the pinned
+# (moved) object, but the post-verify lstat catches the moved canonical
+# path and unlinks our file via the pinned cwd. No residue, refuse.
+ru_="$rdir/u-anc"; mkdir -m 700 "$ru_" "$ru_/leaf"
+rulog="$ru_/leaf/forced-command.log"
+hfc="$(render_hook u "$rulog" 'chdir($F[$#F])' \
+    "            rename(\"$ru_/leaf\",\"$ru_/ours\") or die;")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ -d "$ru_/ours" ] && [ ! -e "$ru_/ours/forced-command.log" ]; }
+check 'creation: moved dir gets no residue file (post-verify undo)' $?
 
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and

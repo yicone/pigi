@@ -80,7 +80,6 @@ ledger_dirs_ok() {
         cur=${cur%/*}
         [ -n "$cur" ] || cur=/
     done
-    dir_id=$(stat -f %d:%i "$dir" 2>/dev/null) || return 1
 }
 
 # Full path validation; prints the ledger's dev:inode on success. Run before
@@ -117,21 +116,25 @@ ledger_gate() {
     ledger_fd_ok && ledger_bound
 }
 
-# Refusal cleanup inside ledger_prepare: remove the leaf dir only when the
-# path still names the fd-pinned object this run created (dev:inode of fd 8)
-# and it is empty. Never deletes a swapped-in pre-existing directory by path
-# alone; a swapped-out self-created dir is left as harmless residue.
-prep_cleanup() {
-    [ -n "$made_dir" ] || return 0
-    exec 8<&-
-    [ "$(stat -f %d:%i "$dir" 2>/dev/null)" = "$made_id" ] || return 0
-    rmdir "$dir" 2>/dev/null
-}
-
 # The ledger is a precondition for serving: if it cannot be validated, opened,
 # or appended, refuse — the same fail-closed rule as the adapter's
 # audit_unavailable. On success fd 9 is an append descriptor pinned to the
 # fully validated inode, and dir/LEDGER_ID name it for later gates.
+#
+# Traversal, validation, mkdir and create run inside ONE perl process: each
+# path component is lstat-validated, pinned on a descriptor, and re-checked
+# on that descriptor before descending — so validation always binds the
+# object actually used, never a shell-captured path snapshot. A swap of any
+# component between its lstat and open fails the fstat compare; a swap before
+# perl runs means the substitute itself must pass the same policy. Only the
+# leaf dir may be created, inside its pinned parent; the ledger file is
+# created with O_NOFOLLOW inside the pinned leaf dir. After create, the
+# canonical path is re-resolved and compared to the pinned object — on
+# mismatch only objects this run provably created are unlinked, via the
+# pinned parent, never by unbound path. Residuals are the microsecond-scale
+# gaps inside this single process plus the documented same-UID substitution
+# case (a policy-identical object swapped in before validation is
+# indistinguishable from a legitimate one).
 ledger_prepare() {
     case $PIGI_FC_LOG in
         /*) ;;
@@ -140,55 +143,56 @@ ledger_prepare() {
     dir=${PIGI_FC_LOG%/*}
     leaf=${PIGI_FC_LOG##*/}
     [ -n "$dir" ] && [ -n "$leaf" ] || return 1
-    made_dir= ; made_id=
-    if [ ! -d "$dir" ]; then
-        # Ancestors of the missing leaf must pass BEFORE mkdir — a refused
-        # ancestor must never gain a created directory as a side effect.
-        anc=${dir%/*}
-        [ -n "$anc" ] || anc=/
-        cur=$anc
-        while :; do
-            dir_component_ok "$cur" || return 1
-            [ "$cur" = / ] && break
-            cur=${cur%/*}
-            [ -n "$cur" ] || cur=/
-        done
-        mkdir -m 700 "$dir" 2>/dev/null || return 1
-        # Pin the just-created dir on fd 8 immediately; the mkdir→pin gap is
-        # the only instruction-scale residual where a swap could pin the wrong
-        # object — every later check compares against this fstat.
-        made_dir=1
-        { exec 8<"$dir" || return 1; } 2>/dev/null
-        made_id=$(fd_meta 8 | cut -d: -f1,2)
-        [ -n "$made_id" ] || { prep_cleanup; return 1; }
-    fi
-    # Leaf dir + ancestors must pass BEFORE any file creation; dir_id is the
-    # validated object's identity captured inside the same pass.
-    ledger_dirs_ok "$dir" || { prep_cleanup; return 1; }
-    # If this run created the leaf dir, the path must still name exactly that
-    # object — a same-UID swap in the pin→validate window refuses here, and
-    # cleanup then sees the substitute (inode differs) and never rmdir's it.
-    [ -z "$made_dir" ] || [ "$dir_id" = "$made_id" ] || { prep_cleanup; return 1; }
-    # A link at the ledger path is refused before ANY create attempt.
-    [ -L "$PIGI_FC_LOG" ] && { prep_cleanup; return 1; }
-    if [ ! -e "$PIGI_FC_LOG" ]; then
-        # The create is bound to the validated directory OBJECT, not its
-        # path: pin the dir with an fd, fstat the fd against the validated
-        # dev:inode captured by ledger_dirs_ok, fchdir into it, then create
-        # the leaf relative to that cwd. A path swap before the pin fails the
-        # fstat compare; a swap after the pin cannot redirect the create.
-        # O_NOFOLLOW still covers a leaf-level link planted in the remaining
-        # instruction-scale gap.
-        /usr/bin/perl -e 'use Fcntl;
-            sysopen(D,$ARGV[0],O_RDONLY|O_DIRECTORY) or exit 1;
-            my @s=stat(D); ($s[0]==$ARGV[2] && $s[1]==$ARGV[3]) or exit 2;
-            chdir(D) or exit 3;
-            sysopen(F,$ARGV[1],O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW,0600) or exit 4;
-            close F' \
-            "$dir" "$leaf" "${dir_id%%:*}" "${dir_id##*:}" 2>/dev/null \
-            || { prep_cleanup; return 1; }
-    fi
-    exec 8<&-  # release the mkdir pin if one was taken
+    /usr/bin/perl -e 'use Fcntl;
+        my($dir,$leaf,$euid)=@ARGV;
+        my @c=grep {length} split m{/},$dir; @c or exit 1;
+        my(@F,@made);
+        sysopen($F[0],q{/},O_RDONLY|O_DIRECTORY) or exit 1;
+        for my $i (0..$#c) {
+            chdir($F[$i]) or exit 2;
+            my $comp=$c[$i]; my $last=($i==$#c);
+            my @l=lstat($comp);
+            if (!@l) {
+                $last or exit 3;
+                mkdir($comp,0700) or exit 4;
+                $made[$i]=1;
+                @l=lstat($comp) or exit 3;
+            }
+            ($l[2]&0170000)==0040000 or exit 5;
+            if ($last) {
+                $l[4]==$euid or exit 6;
+                ($l[2]&07777)==0700 or exit 7;
+            } else {
+                ($l[4]==$euid || $l[4]==0) or exit 8;
+                my $m=$l[2]&07777;
+                ($m&022)==0 or ($m&01000) or exit 9;
+            }
+            sysopen($F[$i+1],$comp,O_RDONLY|O_DIRECTORY) or exit 10;
+            my @s=stat($F[$i+1]);
+            ($s[0]==$l[0] && $s[1]==$l[1]) or exit 11;
+            $s[4]==$l[4] && ($s[2]&07777)==($l[2]&07777) or exit 12;
+        }
+        chdir($F[$#F]) or exit 13;
+        my $created=0;
+        my @f=lstat($leaf);
+        (@f && ($f[2]&0170000)==0120000) and exit 14;
+        if (@f) {
+            ($f[2]&0170000)==0100000 or exit 15;
+            $f[4]==$euid or exit 16;
+            ($f[2]&07777)==0600 or exit 17;
+            $f[3]==1 or exit 18;
+        } else {
+            sysopen(F,$leaf,O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW,0600) or exit 19;
+            close F;
+            $created=1;
+        }
+        my @ds=stat($F[$#F]); my @t=lstat($dir);
+        if (!@t || $t[0]!=$ds[0] || $t[1]!=$ds[1]) {
+            unlink($leaf) if $created;
+            if ($made[$#c]) { chdir($F[$#c]); rmdir($c[$#c]); }
+            exit 20;
+        }
+        exit 0' "$dir" "$leaf" "$euid" 2>/dev/null || return 1
     LEDGER_ID=$(ledger_path_ok "$dir") || return 1
     # A bare `exec 9>>... 2>/dev/null` would also send fd 2 to /dev/null for
     # the rest of the script; the group confines the suppression to open errors.

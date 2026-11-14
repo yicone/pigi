@@ -44,7 +44,7 @@ was absent before.
 | --- | --- | --- | --- |
 | `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
 | `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
-| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | record existence/type/owner/mode before any write — a content hash does not apply to directories; record the child listing instead. If absent and auto-created, log that fact — deletion only if created by this rollout AND empty of every retained object below |
+| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | record existence/type/owner/mode before any write — a content hash does not apply to directories; record the child listing instead. If absent and auto-created, log that fact — rollback removes it only if it was created by this rollout, is empty, AND the rollback approval names it — a directory holding retained objects (below) is never deleted |
 | `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | record existence/type/owner/mode/child-listing. If absent at rollout the script creates it: log that. Rollback removes it only if it was created by this rollout, is empty, AND the rollback approval names it — a directory holding retained audit objects (below) is never deleted |
 | `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | **audit object — never overwritten or blindly deleted.** Expected absent today — if present, STOP and inventory it; if created by this rollout, rollback *retains* it by default as an audit record — deleting it is a decision the rollback approval must name explicitly |
 | `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout it is retained with the DB it contains |
@@ -266,16 +266,17 @@ recorded; nothing pre-existing is destroyed:
   length, and a truncated SHA-256 of the request for correlation. The raw
   request is never written; the ledger itself is fail-closed (invalid
   directory/file type, ownership, mode, links, or any write failure =
-  refuse). Creation binding: a missing leaf dir's ancestors are validated
-  before `mkdir`, and the created dir is immediately pinned on a descriptor —
-  refusal cleanup `rmdir`s only while the path still names that exact
-  dev:inode, so a swapped-in pre-existing directory is never deleted and a
-  swapped-out self-created one is left as harmless residue (the mkdir→pin gap
-  is residual below). The create itself is bound to the validated directory
-  *object*: it pins the dir with an fd, fstats the fd against the validated
-  dev:inode, `fchdir`s into it, and creates the leaf with `O_NOFOLLOW` —
-  a swapped dir path fails the fstat compare and can never redirect the
-  create into a substitute object. Append binding: the emit
+  refuse). Creation binding: ancestor traversal, validation, `mkdir`, and
+  file create all run inside a single `/usr/bin/perl` process — each path
+  component is `lstat`-validated, pinned on a descriptor, and re-checked on
+  that descriptor before descending, so every check binds the object
+  actually used rather than a path snapshot. A component swap between its
+  `lstat` and open fails the fstat compare; only the leaf dir may be
+  created, inside its pinned parent; the ledger file is created with
+  `O_NOFOLLOW` inside the pinned leaf dir; and a post-create re-resolution
+  of the canonical path unlinks only provably-self-created objects via the
+  pinned parent when the path no longer resolves to them — a refusal never
+  creates in, or deletes, an unvalidated object. Append binding: the emit
   statement re-checks the descriptor's real fstat *and* (for `allow`) the
   full canonical path inside the same command — a staged change refuses
   before any byte is written, and a full gate re-runs immediately before
@@ -291,14 +292,23 @@ recorded; nothing pre-existing is destroyed:
   state degrades with no second gate;
   (c) history integrity is not protected at all: a same-UID truncate of the
   same inode between checks preserves every gate's metadata (dev/ino/uid/
-  mode/nlink) while deleting prior records — the append fd does not see it.
-  The checks bind each append to a policy-valid object at check time; they
-  do NOT prove a trusted-writer environment. Required rollout preconditions,
-  each separately verified and approved: no other same-UID process writes
-  under `~/Library/Application Support/pigi*`; ledger rotation, truncation,
-  and manual edits are prohibited operationally; any such maintenance needs
-  its own numbered approval. Neither residual is a remote or cross-UID
-  attack (cross-UID unverified). The fstat and O_NOFOLLOW-create checks
+  mode/nlink) while deleting prior records — the append fd does not see it;
+  (d) microsecond-scale gaps inside the single perl traversal (e.g. between
+  its post-verify `lstat` and exit) can leave a self-created empty dir or
+  file inside the *validated* object at a moved path — never inside an
+  unvalidated substitute; and (e) a same-UID writer can substitute a
+  policy-identical object (same owner/mode/type) before validation — the
+  object legitimately passes and is indistinguishable; only its inode
+  differs, and no prior inode was ever authoritative.
+  The checks bind each operation to a policy-valid object at operation
+  time; they do NOT prove a trusted-writer environment, and nothing here
+  establishes that the required conditions hold. Required rollout
+  preconditions — pending verification and separate numbered approval, not
+  asserted as satisfied: no other same-UID process writes under
+  `~/Library/Application Support/pigi*`; ledger rotation, truncation, and
+  manual edits are prohibited operationally; any such maintenance needs its
+  own numbered approval. No residual is a remote or cross-UID attack
+  (cross-UID unverified). The fstat, traversal and O_NOFOLLOW-create checks
   require `/usr/bin/perl` (stock macOS) — listed as a rollout dependency
   below. Retention is manual, matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`

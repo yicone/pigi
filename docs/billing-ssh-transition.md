@@ -305,22 +305,40 @@ recorded; nothing pre-existing is destroyed:
   owner/mode/type) before validation — the object legitimately passes and
   is indistinguishable; only its inode differs, and no prior inode was
   ever authoritative.
-  (a)–(c) are open, unresolved residuals: no userspace primitive on macOS
-  closes a same-UID check→use window on a shared filesystem object, and
-  the owner-removable flags (`uappnd`/`uchg`) don't help while
-  `sappend`/`schg` need root. Options needing a user decision: accept them
-  as documented risk; run the ledger under a dedicated UID so no other
-  process shares write access; or have a root-owned install step set
-  `sappend` on the ledger (each a system-level change — not in offline
-  scope). Required rollout preconditions — pending verification and
-  separate numbered approval, not asserted as satisfied: no other same-UID
-  process writes under `~/Library/Application Support/pigi*`; ledger
-  rotation, truncation, and manual edits are prohibited operationally; any
-  such maintenance needs its own numbered approval. No residual is a
-  remote or cross-UID attack (cross-UID unverified). The fstat, traversal
-  and O_EXCL-create checks require `/usr/bin/perl` (stock macOS) — listed
-  as a rollout dependency below. Retention is manual, matching the App's
-  audit model.
+
+  **(a)–(c) are ACCEPTED RESIDUALS, not closed risks.** The user approved
+  accepting them for candidate `6174035fc655997fad408cd55714c3015832c5a3`
+  via ACM-963 comment `01a1dacc-1bcc-705d-9b54-d4db9ed0a97e`
+  (2026-11-15 00:02 SGT), against the non-author ACM-974 re-verification
+  report `01a1d8e8-ac49-73fe-a84c-d19a5f3bad4e` which independently
+  reproduced all three: (a) a chmod between the emit's last check and the
+  write lands a sanitized record on a then-0644 inode — the run ultimately
+  refused (final rc=1, stub never executed) but the record was already
+  written; (b) a chmod/detach between the final gate and `exec` let the
+  approved command run once anyway (rc=0, stub executed); (c) a same-inode
+  truncate deleted prior audit history while every metadata gate still
+  passed (rc=0). This is a risk-acceptance decision, not a technical fix:
+  no userspace primitive on macOS closes a same-UID check→use window on a
+  shared filesystem object — `uappnd`/`uchg` are owner-removable and
+  `sappend`/`schg` need root. The acceptance is bounded:
+  - Scope: `tr-mini-m4` only, single user, Billing read-only access to the
+    one approved mailbox only — no sending, no write-back.
+  - Owner of the accepted risk: Yicone Wang.
+  - Validity: until ACM-962 token authentication ships, or 90 days from
+    approval — whichever comes first. No automatic renewal: scope
+    expansion, expiry, or any implementation change beyond this acceptance
+    requires fresh numbered approval.
+  - Future reviews must keep reporting these three risks as present and
+    must not be reworked window-by-window on this account; this does not
+    certify "no risk" or live/remote verification.
+  Operationally the trusted-writer conditions remain standing
+  requirements, not assumptions: no other same-UID process writes under
+  `~/Library/Application Support/pigi*`; ledger rotation, truncation, and
+  manual edits are prohibited; any such maintenance needs its own numbered
+  approval. No residual is a remote or cross-UID attack (cross-UID
+  unverified). The fstat, traversal and O_EXCL-create checks require
+  `/usr/bin/perl` (stock macOS) — listed as a rollout dependency below.
+  Retention is manual, matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`
   ledger (tool name + outcome only).
 - App `agent_actions` table + OSLog hook: engine-level durable audit.

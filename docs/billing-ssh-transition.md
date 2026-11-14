@@ -19,7 +19,9 @@ Billing MCP host (shared Linux box)
             └─ tr-mini-m4 sshd, user tr
                  └─ authorized_keys: from=<billing-src>,restrict,command="…"
                       └─ pigi_forced_command.sh  (never executes the client command)
-                           └─ execs ONLY: python3 -B pigi_mcp.py --account adhielgona@gmail.com
+                           └─ wire contract: <python> -B <script> --account <acct>
+                           └─ execs ONLY: python3 -B -E -S -X utf8 pigi_mcp.py
+                                          --account adhielgona@gmail.com
                                 └─ agent.sock (0600, getpeereid same-UID)
                                      └─ App LocalEngine.agentRead (read grant + scoped_accounts + audit)
 ```
@@ -30,11 +32,19 @@ it. Confinement therefore happens at the forced command, not at the UID.
 
 ## Server-side objects (tr-mini-m4)
 
+Before any write to an object below, record its **prior existence, type,
+owner, mode, and content hash** (or full content where safe) plus the relevant
+service state. If an object exists unexpectedly — anything not predicted in
+this table — STOP and report; never overwrite a pre-existing object and then
+delete it on rollback. Rollback always means *restore the recorded prior
+state*: bring back a backed-up file byte-for-byte, or leave absent only what
+was absent before.
+
 | Object | Content | Mode | Backup/rollback |
 | --- | --- | --- | --- |
-| `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | none today; rollback = delete file |
-| `~/.ssh/authorized_keys` | single line below | 0600 | does not exist today — if it ever does, `cp -p` to `authorized_keys.bak-<ts>` first; rollback = remove only this line or restore backup |
-| `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | rollback = delete file |
+| `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
+| `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
+| `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | expected absent today — if present, STOP and inventory it; rollback = delete only if created by this rollout |
 
 `authorized_keys` line (exact):
 
@@ -60,8 +70,10 @@ The pinned pipeline uses the deployed checkout
 3.10+; the system `/usr/bin/python3` is 3.9.6 and is NOT used. The interpreter
 path must be a real executable, not a pyenv shim. If the checkout moves, update
 the installed script's `PIGI_MCP_SCRIPT` literal and redeploy it; the
-`SSH_ORIGINAL_COMMAND` comparison is a byte-exact match against
-`<python> -B <script> --account <account>`.
+`SSH_ORIGINAL_COMMAND` comparison is a byte-exact match against the wire
+contract `<python> -B <script> --account <account>` — the remote launcher sends
+exactly that string, and the forced command adds its own `-E -S -X utf8`
+hardening flags when it re-execs the interpreter.
 
 ## Trust conditions verified at rollout (before authorized_keys is installed)
 
@@ -70,13 +82,31 @@ the installed script's `PIGI_MCP_SCRIPT` literal and redeploy it; the
 - `~/.ssh/environment` absent; `~/.ssh/rc` absent or individually vetted
   (`PermitUserRC`-reachable owner code).
 - The script pins `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, unsets
-  `BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT`, and
-  re-execs the interpreter via `env -i` (only `HOME`, `PATH`, `PYTHONUTF8`), so
-  no inherited variable can alter the pinned pipeline or its imports
-  (`pigi_mcp.py` resolves `audit`/`transport` from its own directory).
+  `BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT`,
+  and re-execs the interpreter via `env -i` carrying only `HOME` (the pinned
+  `PIGI_FC_HOME` literal, never the caller's) and `PATH`. The interpreter then
+  runs `-B -E -S -X utf8`: `-E` ignores any `PYTHON*` variable that survives,
+  `-B` stops `.pyc` writes, and `-S` skips the `site` module entirely — no
+  global or per-user site-packages, no `.pth` file execution, no
+  `sitecustomize`/`usercustomize`. `PYTHONSTARTUP` only affects interactive
+  sessions and is moot here. With `-S`, `sys.path` is the script's own
+  directory plus the stdlib, which is exactly what `pigi_mcp.py` needs
+  (`audit`/`transport` are siblings of the script). A hostile `.pth` planted
+  under the *passed* HOME's user-site is proven inert by the offline probe
+  test — but the passed HOME is still a trust surface for the script's own
+  future use, which is why `PIGI_FC_HOME` is a literal and the ledger path is
+  a literal rather than `$HOME`-derived.
 - Authorization inputs are `readonly` literals; environment overrides were
   removed. The offline harness reproduced the old env-override path — that
   proved only the script honored env, not that sshd would pass client env.
+  Whether sshd passes client-supplied environment at all is an sshd-side
+  property verified at rollout via the checks above — offline tests do not
+  prove the online injection path.
+- The script directory, interpreter, stdlib, the pinned HOME, and the deployed
+  checkout must all be owner-writable only; an attacker who can write
+  `pigi_mcp.py`, its sibling modules, the interpreter, or a stdlib file wins
+  regardless of flags. These paths are inventoried and their modes recorded
+  during rollout.
 
 ## Host key pinning (one canonical identifier)
 
@@ -98,11 +128,11 @@ argument, the ssh config `Host`/`HostKeyAlias`, and the `known_hosts` key.
 
 | Object | Content | Mode | Backup/rollback |
 | --- | --- | --- | --- |
-| `~billing/.ssh/pigi_billing_ed25519` (+`.pub`) | dedicated ed25519 pair, generated on the box, never leaves it | 0600/0644 | rollback = delete pair |
-| `~billing/.ssh/known_hosts` | `tr-mini-m4-pigi ssh-ed25519 <pubkey>` | 0600 | `cp -p` backup before edit if file exists; rollback restores backup or removes the added line |
-| `~billing/.ssh/config` | stanza below | 0600 | same backup-then-append rule; rollback removes only this stanza |
-| `/opt/pigi-mcp/remote_pigi_mcp.py` (or Billing-local path) | copy of the launcher | 0755 | rollback = delete file |
-| Billing MCP host config | stdio server entry below | per Billing convention | backup config file first; rollback removes the added entry |
+| `~billing/.ssh/pigi_billing_ed25519` (+`.pub`) | dedicated ed25519 pair, generated on the box, never leaves it | 0600/0644 | same-name pair must NOT exist before generation — if it does, STOP (do not clobber someone's key); rollback = delete only the newly generated pair |
+| `~billing/.ssh/known_hosts` | `tr-mini-m4-pigi ssh-ed25519 <pubkey>` | 0600 | `cp -p` backup before edit if file exists; rollback restores the backup (or deletes only if the file was absent) |
+| `~billing/.ssh/config` | stanza below | 0600 | same backup-then-append rule; rollback restores backup or removes only this stanza; an existing `Host tr-mini-m4-pigi` stanza = STOP |
+| `/opt/pigi-mcp/remote_pigi_mcp.py` (or Billing-local path) | copy of the launcher | 0755 | expected absent — if present, STOP and identify its origin; rollback = delete only if installed by this rollout |
+| Billing MCP host config | stdio server entry below | per Billing convention | backup config file first; rollback removes only the added entry, restoring any prior `pigi-*` entries |
 
 Isolation requirements on the shared box:
 
@@ -145,10 +175,20 @@ forced command's pinned string verbatim, or the request is logged and refused.
 
 0. **Code gate**: this change set passes independent offline re-review, then
    the author is separately approved to push/PR and DevOps is separately
-   approved to merge to `yicone/pigi` `main`. Nothing installs from the task
-   worktree — deployment installs only from the merged checkout after
-   verifying `git rev-parse HEAD` equals the accepted SHA and
-   `git merge-base --is-ancestor <accepted> origin/main` succeeds.
+   approved to merge to `yicone/pigi` `main`. **The deployment object is the
+   merged `main` HEAD, never the feature candidate** — a normal merge commit
+   gives `main` a new SHA, so `git rev-parse HEAD` will NOT equal the accepted
+   candidate and must not be required to. Verification before installing:
+   - `git merge-base --is-ancestor <accepted> origin/main` — the reviewed
+     candidate is contained in the merge; and
+   - `git diff --exit-code <accepted> origin/main -- tools/pigi-mcp
+     docs/billing-ssh-transition.md` — the deployed tree for every path this
+     change touches is identical to the reviewed tree.
+   Ancestor relation alone is not the safety claim: if the merged tree of the
+   affected paths differs from the reviewed tree in any way, STOP — the merge
+   changed what was reviewed and a new independent re-review is required
+   before deploying. (Fast-forward acceptance is also fine: there `main` HEAD
+   *is* the reviewed SHA.)
    **Preconditions that must be confirmed before any deploy approval**:
    Billing dedicated UID (evidence), key passphrase decision, Billing stable
    source address for `from=`. Any of them unconfirmed → STOP; do not omit
@@ -160,11 +200,15 @@ forced command's pinned string verbatim, or the request is logged and refused.
    table. Produces the public key step 3 needs. No mail data touched.
 2. **Remote Login on the mini**: user enables it in System Settings → Sharing →
    Remote Login, restricted to user `tr` (system-layer step; belongs to the
-   user or the macOS bot, not this run).
-3. **Mini owner-side writes**: run the trust-condition checks above;
+   user or the macOS bot, not this run). First RECORD the prior Remote Login
+   state (`sudo systemsetup -getremotelogin` or the Sharing pane) in the
+   rollout log — rollback restores that recorded state, not a blind "off".
+3. **Mini owner-side writes**: run the trust-condition checks above; record
+   each object's prior existence/type/owner/mode/hash per the inventory rule;
    `install -m 0700 tools/pigi-mcp/pigi_forced_command.sh ~/.ssh/` from the
    merged checkout; create `~/.ssh/authorized_keys` (0600) with the single
-   pinned line (backup first if the file exists).
+   pinned line (backup first if the file exists; STOP if an existing file
+   already contains a `pigi_forced_command` line).
 4. **Negative + handshake verification** (no mail data): a wrong command is
    refused, written to the ledger as `deny/mismatch`, and the stub path never
    runs; then MCP `initialize` + `tools/list` through Billing's connector
@@ -175,14 +219,22 @@ forced command's pinned string verbatim, or the request is logged and refused.
    account, then a Cursor-support `search`/`get_message` example): separate
    numbered approval — this is the "real mailbox" boundary ACM-963 defers.
 
-## Rollback (all steps reversible)
+## Rollback (restore recorded prior state — never "delete everything")
 
-- Remove the `authorized_keys` line (today: delete the whole new file; if a
-  backup was taken, restore it).
-- `rm ~/.ssh/pigi_forced_command.sh` and the ledger if desired.
-- Disable Remote Login (back to today's OFF state).
-- Linux side: restore each backed-up file or remove the added stanza/entry;
-  delete the keypair and launcher copy.
+Rollback replays the pre-write inventory in reverse and restores what was
+recorded; nothing pre-existing is destroyed:
+
+- `authorized_keys`: restore the `cp -p` backup byte-for-byte; if the file did
+  not exist before this rollout, delete it. Never `rm` a file that existed.
+- `pigi_forced_command.sh` and ledger: delete only if the inventory shows they
+  were absent before this rollout; otherwise restore the recorded backup.
+- Remote Login: return to the recorded prior state (today's verified state is
+  OFF — but the rollout log's recorded value is authoritative, not this doc's
+  snapshot; a system admin may have enabled it for other reasons in between,
+  and blindly disabling it would break that).
+- Linux side: restore each backed-up file or remove only the added
+  stanza/entry; delete the keypair and launcher copy only if they did not
+  exist before.
 - No App restart, mail data, keychain, or repo state is touched at any point,
   so rollback leaves nothing behind on the mail side.
 

@@ -419,11 +419,12 @@ run "$hfc" "$EXPECTED"
     && [ "$(cat "$rrepl/forced-command.log")" = 'repl' ]; }
 check 'race: ancestor symlink swap before open refused, target untouched' $?
 
-# 16e. Path detached after the open (pre-emit): bound check demotes to deny.
+# 16e. Path detached after the open (pre-emit): gate demotes to deny/detached
+# and the record still lands on the pinned inode only.
 re_="$rdir/e"; mkdir -m 700 "$re_"; rloge="$re_/forced-command.log"
 echo orig > "$rloge"; chmod 600 "$rloge"
 saved="$re_/saved"
-hfc="$(render_hook e "$rloge" 'if ! ledger_bound' \
+hfc="$(render_hook e "$rloge" 'if ! ledger_gate' \
     "    mv \"$rloge\" \"$saved\"; printf 'decoy\\\\n' > \"$rloge\"; chmod 600 \"$rloge\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
@@ -431,28 +432,91 @@ run "$hfc" "$EXPECTED"
     && grep -q 'deny' "$saved" && grep -q 'detached' "$saved"; }
 check 'race: post-open detach refused, record on pinned inode only' $?
 
-# 16f. Detach between bound check and emit: post-emit gate still refuses.
+# 16f. chmod between pre-emit gate and emit: refused BEFORE any byte written —
+# the emit statement's own fd check catches it, so nothing reaches the file.
 rf_="$rdir/f"; mkdir -m 700 "$rf_"; rlogf="$rf_/forced-command.log"
 echo orig > "$rlogf"; chmod 600 "$rlogf"
-savedf="$rf_/saved"
-hfc="$(render_hook f "$rlogf" 'if ! printf' \
-    "    mv \"$rlogf\" \"$savedf\"; printf 'decoy\\\\n' > \"$rlogf\"; chmod 600 \"$rlogf\"")"
+hfc="$(render_hook f "$rlogf" 'if ! { ledger_fd_ok' "    chmod 644 \"$rlogf\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
-    && [ "$(cat "$rlogf")" = 'decoy' ] \
-    && grep -q 'allow' "$savedf"; }
-check 'race: post-bound detach refused, event only on pinned inode' $?
+    && [ "$(cat "$rlogf")" = 'orig' ]; }
+check 'race: chmod before emit refused, nothing written to wide file' $?
 
-# 16g. Detach at the final gate (post-emit): allow never reaches the stub.
+# 16g. Hard link added between prepare and the first gate: nlink=2 refused.
 rg_="$rdir/g"; mkdir -m 700 "$rg_"; rlogg="$rg_/forced-command.log"
 echo orig > "$rlogg"; chmod 600 "$rlogg"
 savedg="$rg_/saved"
-hfc="$(render_hook g "$rlogg" 'ledger_bound || refuse' \
-    "    mv \"$rlogg\" \"$savedg\"; printf 'decoy\\\\n' > \"$rlogg\"; chmod 600 \"$rlogg\"")"
+hfc="$(render_hook g "$rlogg" 'if ! ledger_gate' "    ln \"$rlogg\" \"$savedg\"")"
 run "$hfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
-    && [ "$(cat "$rlogg")" = 'decoy' ]; }
+    && [ "$(cat "$rlogg")" = 'orig' ]; }
+check 'race: hard link before first gate refused, nothing appended' $?
+
+# 16h. Leaf dir moved aside then symlinked to the SAME directory (identity
+# unchanged, ancestor trust violated): refused.
+rh_="$rdir/h"; mkdir -m 700 "$rh_"; rlogh="$rh_/forced-command.log"
+echo orig > "$rlogh"; chmod 600 "$rlogh"
+hfc="$(render_hook h "$rlogh" 'if ! ledger_gate' \
+    "    mv \"$rh_\" \"$rdir/h-old\"; ln -s \"$rdir/h-old\" \"$rh_\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
+check 'race: leaf-dir-to-symlink same inode refused (ancestor trust)' $?
+
+# 16i. Hard link added before the final gate (post-emit): record was written
+# while the inode still met policy; the gate refuses before serving.
+ri_="$rdir/i"; mkdir -m 700 "$ri_"; rlogi="$ri_/forced-command.log"
+echo orig > "$rlogi"; chmod 600 "$rlogi"
+savedi="$ri_/saved"
+hfc="$(render_hook i "$rlogi" '# Final gate immediately before exec:' \
+    "    ln \"$rlogi\" \"$savedi\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && grep -q 'allow' "$rlogi"; }
+check 'race: hard link at final gate refused' $?
+
+# 16j. chmod at the final gate (post-emit): record written while valid; refuse.
+rj_="$rdir/j"; mkdir -m 700 "$rj_"; rlogj="$rj_/forced-command.log"
+echo orig > "$rlogj"; chmod 600 "$rlogj"
+hfc="$(render_hook j "$rlogj" '# Final gate immediately before exec:' \
+    "    chmod 644 \"$rlogj\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && grep -q 'allow' "$rlogj"; }
+check 'race: chmod at final gate refused' $?
+
+# 16k. Detach at the final gate: refuse, decoy untouched.
+rk_="$rdir/k"; mkdir -m 700 "$rk_"; rlogk="$rk_/forced-command.log"
+echo orig > "$rlogk"; chmod 600 "$rlogk"
+savedk="$rk_/saved"
+hfc="$(render_hook k "$rlogk" 'ledger_gate || refuse' \
+    "    mv \"$rlogk\" \"$savedk\"; printf 'decoy\\\\n' > \"$rlogk\"; chmod 600 \"$rlogk\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogk")" = 'decoy' ]; }
 check 'race: detach at final gate refused' $?
+
+# 16l. A dangling symlink at the ledger path must refuse WITHOUT creating its
+# target (no side effects on refusal).
+rl_="$rdir/l"; mkdir -m 700 "$rl_"; rlogl="$rl_/forced-command.log"
+dangle="$rl_/should-not-exist"; ln -s "$dangle" "$rlogl"
+hfc="$(render dangle "$rlogl")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" && [ ! -e "$dangle" ]; }
+check 'fail-closed: dangling symlink refused, target never created' $?
+
+# 16m. Missing fstat dependency (/usr/bin/perl): fail closed.
+rm_="$rdir/m"; mkdir -m 700 "$rm_"; rlogm="$rm_/forced-command.log"
+pfc="$TMP/fc-rm.sh"
+sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
+    -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
+    -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
+    -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
+    -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$rlogm'|" \
+    -e 's|/usr/bin/perl|/nonexistent-synthetic-perl|g' \
+    "$FC" > "$pfc"; chmod 700 "$pfc"
+run "$pfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
+check 'fail-closed: missing fstat helper refuses' $?
 
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and
@@ -471,8 +535,14 @@ if [ -n "$TESTPY" ]; then
     adfc="$(render adapter "$adlog" "$TESTPY" "$ROOT/pigi_mcp.py" "$adhome")"
     EXPAD="$TESTPY -B $ROOT/pigi_mcp.py --account $ACCOUNT"
     run "$adfc" "$EXPAD" </dev/null
-    created=$(cd "$adhome" && find . -type f | sort)
-    { [ "$created" = './Library/Application Support/pigi-mcp/audit.sqlite3' ] \
+    created_f=$(cd "$adhome" && find . -type f | sort)
+    created_d=$(cd "$adhome" && find . -type d | sort)
+    expected_d='.
+./Library
+./Library/Application Support
+./Library/Application Support/pigi-mcp'
+    { [ "$created_f" = './Library/Application Support/pigi-mcp/audit.sqlite3' ] \
+        && [ "$created_d" = "$expected_d" ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp")" = 700 ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp/audit.sqlite3")" = 600 ]; }
     check 'runtime-objects: adapter auto-creates only the inventoried audit set' $?

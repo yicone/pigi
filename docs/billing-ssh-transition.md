@@ -44,10 +44,11 @@ was absent before.
 | --- | --- | --- | --- |
 | `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
 | `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
+| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | pre-existing (record existence/mode only); if absent and auto-created, log that fact — deletion only if created by this rollout |
 | `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | exists today — record mode/owner; if absent at rollout the script creates it: log that; rollback deletes it only if it was created by this rollout |
-| `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | expected absent today — if present, STOP and inventory it; rollback = delete only if created by this rollout |
-| `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout, rollback removes it only together with the DB it contains |
-| `~/Library/Application Support/pigi-mcp/audit.sqlite3` (+ transient `-journal`) | adapter `tool_calls` ledger, auto-created 0600 at `Audit()` init on every adapter start | 0600 | **audit object — never overwritten or blindly deleted.** If present at rollout, STOP and inventory (existence/type/owner/mode/hash). If created by this rollout, rollback *retains* it by default as an audit record — deleting it is itself a decision the rollback approval must name explicitly. The `-journal` file is transient and inherits the same policy |
+| `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | **audit object — never overwritten or blindly deleted.** Expected absent today — if present, STOP and inventory it; if created by this rollout, rollback *retains* it by default as an audit record — deleting it is a decision the rollback approval must name explicitly |
+| `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout it is retained with the DB it contains |
+| `~/Library/Application Support/pigi-mcp/audit.sqlite3` (+ transient `-journal`) | adapter `tool_calls` ledger, auto-created 0600 at `Audit()` init on every adapter start | 0600 | **audit object — never overwritten or blindly deleted.** If present at rollout, STOP and inventory (existence/type/owner/mode/hash). If created by this rollout, rollback *retains* it by default as an audit record — deleting it is itself a decision the rollback approval must name explicitly. The `-journal` file is transient (created on write, removed on commit) and inherits the same policy — a crash-residue journal found later is treated as an audit object, not auto-deleted; its crash-recovery lifecycle is **unverified** offline |
 
 `authorized_keys` line (exact):
 
@@ -110,6 +111,11 @@ hardening flags when it re-execs the interpreter.
   `pigi_mcp.py`, its sibling modules, the interpreter, or a stdlib file wins
   regardless of flags. These paths are inventoried and their modes recorded
   during rollout.
+- Rollout dependency: `/usr/bin/perl` (stock macOS) must exist and be the
+  unmodified system tool — the forced command uses it for `fstat(2)` on the
+  pinned descriptor, and refuses (fail-closed) if it is absent. On the mini
+  verify `ls -l /usr/bin/perl` and `perl -v` once during trust-condition
+  checks; other deployment hosts must confirm equivalent availability.
 
 ## Host key pinning (one canonical identifier)
 
@@ -235,13 +241,11 @@ recorded; nothing pre-existing is destroyed:
   OFF — but the rollout log's recorded value is authoritative, not this doc's
   snapshot; a system admin may have enabled it for other reasons in between,
   and blindly disabling it would break that).
-- Ledger parent `~/Library/Application Support/pigi/` and the forced-command
-  ledger: delete only if created by this rollout; the directory exists today
-  as App data and is normally left alone.
-- Adapter audit objects (`pigi-mcp/` dir, `audit.sqlite3`, transient
-  `-journal`): if created by this rollout they are audit records — RETAIN by
-  default; deletion requires an explicit named decision in the rollback
-  approval. Pre-existing ones are never touched.
+- Forced-command ledger and adapter audit objects (`pigi/` and `pigi-mcp/`
+  dirs, `forced-command.log`, `audit.sqlite3`, transient `-journal`): if
+  created by this rollout they are audit records — RETAIN by default;
+  deletion requires an explicit named decision in the rollback approval.
+  Pre-existing ones are never touched.
 - Linux side: restore each backed-up file or remove only the added
   stanza/entry; delete the keypair and launcher copy only if they did not
   exist before.
@@ -259,14 +263,22 @@ recorded; nothing pre-existing is destroyed:
   length, and a truncated SHA-256 of the request for correlation. The raw
   request is never written; the ledger itself is fail-closed (invalid
   directory/file type, ownership, mode, links, or any write failure =
-  refuse). Append binding: the full path is validated before *and* after the
-  append descriptor is opened, the descriptor's fstat device/inode/uid/
-  mode/nlink must match the validated object, and a path-detach check runs
-  immediately before emit and again before exec — a same-UID swap at any
-  staged window refuses (denied as `detached`) and never appends to the
-  wrong object. The instruction-scale residual between the final check and
-  `exec` cannot redirect the already fd-written record. Retention is manual,
-  matching the App's audit model.
+  refuse). Append binding: full path validation (ancestors, leaf dir, file
+  policy) runs before *and* after the append descriptor is opened; the
+  descriptor's real fstat dev/inode/uid/mode/nlink must match the validated
+  object at every gate; the emit statement itself re-checks the descriptor
+  in the same command so a change staged before it refuses *before* any byte
+  is written; and a full gate re-runs immediately before exec — staged
+  same-UID changes at the boundaries the offline probes covered refuse
+  (`deny/detached`) without appending to a wrong object. Honest residuals:
+  (a) the instruction-scale window between the last fstat inside the emit
+  statement and the write syscall, and (b) between the final gate and
+  `exec` — neither can redirect a record to a wrong object, only
+  theoretically detach the canonical path for a nanosecond-scale interval.
+  All demonstrated windows are same-UID synthetic probes, not remote or
+  cross-UID attacks; cross-UID is unverified. The fstat checks require
+  `/usr/bin/perl` (stock macOS) — listed as a rollout dependency below.
+  Retention is manual, matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`
   ledger (tool name + outcome only).
 - App `agent_actions` table + OSLog hook: engine-level durable audit.

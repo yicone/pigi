@@ -87,10 +87,31 @@ ledger_path_ok() {
     id_of "$PIGI_FC_LOG"
 }
 
+# Descriptor policy on fd 9: fstat must name the validated object and its
+# real owner/mode/link count must still meet ledger policy. Used inside the
+# emit statement itself so no check→write gap exists between them.
+ledger_fd_ok() {
+    fdinfo=$(fd_meta 9) || return 1
+    [ "$(printf %s "$fdinfo" | cut -d: -f1,2)" = "$LEDGER_ID" ] || return 1
+    [ "$(printf %s "$fdinfo" | cut -d: -f3-)" = "$euid:600:1" ] || return 1
+}
+
+# Canonical-path policy: every ancestor, the leaf directory, and the ledger
+# file must still validate, and the path must still name the pinned inode.
+# Run at every gate — a same-UID change anywhere (swap, chmod, hard link,
+# dir-to-symlink) fails one of these checks.
+ledger_bound() {
+    [ "$(ledger_path_ok "$dir")" = "$LEDGER_ID" ]
+}
+
+ledger_gate() {
+    ledger_fd_ok && ledger_bound
+}
+
 # The ledger is a precondition for serving: if it cannot be validated, opened,
 # or appended, refuse — the same fail-closed rule as the adapter's
 # audit_unavailable. On success fd 9 is an append descriptor pinned to the
-# fully validated inode.
+# fully validated inode, and dir/LEDGER_ID name it for later gates.
 ledger_prepare() {
     case $PIGI_FC_LOG in
         /*) ;;
@@ -101,34 +122,23 @@ ledger_prepare() {
     if [ ! -d "$dir" ]; then
         mkdir -m 700 "$dir" 2>/dev/null || return 1
     fi
+    # A link at the ledger path is refused before ANY create attempt —
+    # following a dangling link would create its target as a side effect.
+    [ -L "$PIGI_FC_LOG" ] && return 1
     if [ ! -e "$PIGI_FC_LOG" ]; then
         : >> "$PIGI_FC_LOG" 2>/dev/null || return 1
     fi
-    id_a=$(ledger_path_ok "$dir") || return 1
+    LEDGER_ID=$(ledger_path_ok "$dir") || return 1
     # A bare `exec 9>>... 2>/dev/null` would also send fd 2 to /dev/null for
     # the rest of the script; the group confines the suppression to open errors.
     { exec 9>>"$PIGI_FC_LOG" || return 1; } 2>/dev/null
     [ -f /dev/fd/9 ] || return 1
-    fdinfo=$(fd_meta 9) || return 1
-    # The open descriptor must name the very object just validated — a path
-    # swap between the two changes dev:inode — and the descriptor's real
-    # owner, mode, and link count must still meet ledger policy.
-    [ "$(printf %s "$fdinfo" | cut -d: -f1,2)" = "$id_a" ] || return 1
-    [ "$(printf %s "$fdinfo" | cut -d: -f3-)" = "$euid:600:1" ] || return 1
-    # Re-run every path check post-open: swaps, chmods, and link tricks staged
-    # inside the check→open window are caught here.
-    [ "$(ledger_path_ok "$dir")" = "$id_a" ] || return 1
+    # The open descriptor must name the very object just validated, and the
+    # post-open pass re-runs every path check so anything staged inside the
+    # check→open window is caught here.
+    ledger_fd_ok || return 1
+    ledger_bound || return 1
     return 0
-}
-
-# Just before append: the ledger path must still name the pinned descriptor's
-# inode and still meet file policy. A detach staged after the open cannot
-# redirect the fd-bound write, but it would leave the canonical path without
-# this event — so it is refused and recorded to the pinned inode instead.
-ledger_bound() {
-    [ "$(stat -f %Lp "$PIGI_FC_LOG" 2>/dev/null)" = "600" ] \
-        && [ ! -L "$PIGI_FC_LOG" ] && [ -f "$PIGI_FC_LOG" ] \
-        && [ "$(id_of "$PIGI_FC_LOG")" = "$(fd_meta 9 | cut -d: -f1,2)" ]
 }
 
 expected="$PIGI_MCP_PYTHON -B $PIGI_MCP_SCRIPT --account $PIGI_MCP_ACCOUNT"
@@ -151,7 +161,7 @@ fi
 
 ledger_prepare || refuse 'audit ledger unavailable; refusing.'
 
-if ! ledger_bound; then
+if ! ledger_gate; then
     result=deny; reason=detached
 elif [ -z "$original" ]; then
     result=deny; reason=empty
@@ -163,20 +173,23 @@ else
     result=allow; reason=exact
 fi
 
-if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+# fd 9 stays open through the gates so each check can fstat it; refuse()
+# exits anyway, and the exec below closes it in the child via `9>&-`.
+# The fd policy check is part of the emit statement so a same-UID change
+# staged before it refuses BEFORE any byte is written — never "write first,
+# refuse later". A change landing between the fstat inside the statement and
+# the write itself is the documented instruction-scale residual.
+if ! { ledger_fd_ok && printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$peer" "$result" "$reason" "$req_len" \
-    "$req_fp" >&9 2>/dev/null; then
+    "$req_fp" >&9; } 2>/dev/null; then
     refuse 'audit ledger unavailable; refusing.'
 fi
-# fd 9 stays open through the gates so each bound check can fstat it; refuse()
-# exits anyway, and the exec below closes it in the child via `9>&-`.
-ledger_bound || refuse 'audit ledger detached; refusing.'
 [ "$result" = allow ] || refuse 'command not permitted (pinned account-scoped read only).'
-# Final gate immediately before exec: a path detach staged between emit and
-# now still refuses — the canonical path must name the inode holding the
-# record. A swap in the remaining instruction-scale window cannot redirect
-# the (already fd-written) record and is documented as a residual.
-ledger_bound || refuse 'audit ledger detached; refusing.'
+# Final gate immediately before exec: full fd + path + ancestor checks — a
+# detach or policy change staged between emit and now still refuses. A swap
+# in the remaining instruction-scale window cannot redirect the (already
+# fd-written) record and is documented as a residual.
+ledger_gate || refuse 'audit ledger detached; refusing.'
 
 # The wire contract stays "python -B <script> --account <acct>"; the server
 # adds -E -S -X utf8 isolation flags itself, so the approved request and the

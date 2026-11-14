@@ -318,9 +318,11 @@ recorded; nothing pre-existing is destroyed:
   approved command run once anyway (rc=0, stub executed); (c) a same-inode
   truncate deleted prior audit history while every metadata gate still
   passed (rc=0). This is a risk-acceptance decision, not a technical fix:
-  no userspace primitive on macOS closes a same-UID check→use window on a
-  shared filesystem object — `uappnd`/`uchg` are owner-removable and
-  `sappend`/`schg` need root. The acceptance is bounded:
+  the three residuals remain reproducible in the current implementation.
+  This re-verification does not prove that no alternative architecture
+  could close them, and it did not verify filesystem-flags semantics —
+  accepting the risk does not authorize any isolation or flags change.
+  The acceptance is bounded:
   - Scope: `tr-mini-m4` only, single user, Billing read-only access to the
     one approved mailbox only — no sending, no write-back.
   - Owner of the accepted risk: Yicone Wang.
@@ -331,12 +333,14 @@ recorded; nothing pre-existing is destroyed:
   - Future reviews must keep reporting these three risks as present and
     must not be reworked window-by-window on this account; this does not
     certify "no risk" or live/remote verification.
-  Operationally the trusted-writer conditions remain standing
-  requirements, not assumptions: no other same-UID process writes under
+  The trusted-writer conditions are operational requirements that have not
+  yet been verified, and they cannot be cited as ruling out the same-UID
+  risks above: no other same-UID process writes under
   `~/Library/Application Support/pigi*`; ledger rotation, truncation, and
   manual edits are prohibited; any such maintenance needs its own numbered
-  approval. No residual is a remote or cross-UID attack (cross-UID
-  unverified). The fstat, traversal and O_EXCL-create checks require
+  approval. The evidence is same-UID synthetic tests only; remote and
+  cross-UID exploitability is unverified. The fstat, traversal and
+  O_EXCL-create checks require
   `/usr/bin/perl` (stock macOS) — listed as a rollout dependency below.
   Retention is manual, matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`

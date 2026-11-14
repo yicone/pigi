@@ -64,10 +64,10 @@ fd_meta() {
         2>/dev/null
 }
 
-# Full path validation; prints the ledger's dev:inode on success. Run before
-# AND after the open so a same-UID swap in either window is caught: a chmod or
-# replacement during the check→open window re-fails policy on the second pass.
-ledger_path_ok() {
+# Directory-side validation: leaf dir plus every ancestor to /. Must pass
+# BEFORE any mkdir or file create — a refused ancestor must never gain a
+# created object as a side effect.
+ledger_dirs_ok() {
     dir=$1
     [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
     [ "$(stat -f %u "$dir" 2>/dev/null)" = "$euid" ] || return 1
@@ -79,6 +79,13 @@ ledger_path_ok() {
         cur=${cur%/*}
         [ -n "$cur" ] || cur=/
     done
+}
+
+# Full path validation; prints the ledger's dev:inode on success. Run before
+# AND after the open so a same-UID swap in either window is caught: a chmod or
+# replacement during the check→open window re-fails policy on the second pass.
+ledger_path_ok() {
+    ledger_dirs_ok "$1" || return 1
     [ ! -L "$PIGI_FC_LOG" ] || return 1
     [ -f "$PIGI_FC_LOG" ] || return 1
     [ "$(stat -f %u "$PIGI_FC_LOG" 2>/dev/null)" = "$euid" ] || return 1
@@ -119,14 +126,36 @@ ledger_prepare() {
     esac
     dir=${PIGI_FC_LOG%/*}
     [ -n "$dir" ] || return 1
+    made_dir=
     if [ ! -d "$dir" ]; then
+        # Ancestors of the missing leaf must pass BEFORE mkdir — a refused
+        # ancestor must never gain a created directory as a side effect.
+        anc=${dir%/*}
+        [ -n "$anc" ] || anc=/
+        cur=$anc
+        while :; do
+            dir_component_ok "$cur" || return 1
+            [ "$cur" = / ] && break
+            cur=${cur%/*}
+            [ -n "$cur" ] || cur=/
+        done
         mkdir -m 700 "$dir" 2>/dev/null || return 1
+        made_dir=1
     fi
-    # A link at the ledger path is refused before ANY create attempt —
-    # following a dangling link would create its target as a side effect.
+    # Leaf dir + ancestors must pass BEFORE any file creation. On refusal the
+    # directory we just created is removed again — an empty rmdir only ever
+    # affects our own just-created object.
+    ledger_dirs_ok "$dir" || {
+        [ -n "$made_dir" ] && rmdir "$dir" 2>/dev/null
+        return 1
+    }
+    # A link at the ledger path is refused before ANY create attempt, and the
+    # create itself is atomic O_NOFOLLOW: a dangling link planted between the
+    # check and the open fails the syscall instead of materializing a target.
     [ -L "$PIGI_FC_LOG" ] && return 1
     if [ ! -e "$PIGI_FC_LOG" ]; then
-        : >> "$PIGI_FC_LOG" 2>/dev/null || return 1
+        /usr/bin/perl -e 'use Fcntl; sysopen(F,$ARGV[0],O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW,0600) or exit 1; close F' \
+            "$PIGI_FC_LOG" 2>/dev/null || return 1
     fi
     LEDGER_ID=$(ledger_path_ok "$dir") || return 1
     # A bare `exec 9>>... 2>/dev/null` would also send fd 2 to /dev/null for
@@ -175,20 +204,26 @@ fi
 
 # fd 9 stays open through the gates so each check can fstat it; refuse()
 # exits anyway, and the exec below closes it in the child via `9>&-`.
-# The fd policy check is part of the emit statement so a same-UID change
-# staged before it refuses BEFORE any byte is written — never "write first,
-# refuse later". A change landing between the fstat inside the statement and
-# the write itself is the documented instruction-scale residual.
-if ! { ledger_fd_ok && printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$peer" "$result" "$reason" "$req_len" \
-    "$req_fp" >&9; } 2>/dev/null; then
+# The emit statement re-checks the descriptor AND the canonical path (for
+# allow) inside the same command — a staged change refuses BEFORE any byte
+# is written, never "write first, refuse later". Every expansion inside the
+# statement is a precomputed variable; no command substitution runs between
+# the checks and the write. A change landing between the last check and the
+# write is the documented instruction-scale residual. deny records still
+# reach the pinned inode even when the canonical path detached.
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+if ! { ledger_fd_ok \
+        && { [ "$result" = deny ] || ledger_bound; } \
+        && printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$ts" "$peer" "$result" "$reason" "$req_len" "$req_fp" >&9; } \
+    2>/dev/null; then
     refuse 'audit ledger unavailable; refusing.'
 fi
 [ "$result" = allow ] || refuse 'command not permitted (pinned account-scoped read only).'
 # Final gate immediately before exec: full fd + path + ancestor checks — a
 # detach or policy change staged between emit and now still refuses. A swap
 # in the remaining instruction-scale window cannot redirect the (already
-# fd-written) record and is documented as a residual.
+# fd-written) record; its real residual is documented in the runbook.
 ledger_gate || refuse 'audit ledger detached; refusing.'
 
 # The wire contract stays "python -B <script> --account <acct>"; the server

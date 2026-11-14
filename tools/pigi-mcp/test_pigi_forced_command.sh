@@ -518,6 +518,54 @@ run "$pfc" "$EXPECTED"
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
 check 'fail-closed: missing fstat helper refuses' $?
 
+# 16n. Leaf dir is a symlink to a real 0700 dir and the log is absent: refuse
+# BEFORE creating anything — the symlink target must not gain a file.
+rn_="$rdir/n-target"; mkdir -m 700 "$rn_"
+aliasn="$rdir/n-alias"; ln -s "$rn_" "$aliasn"
+hfc="$(render n "$aliasn/forced-command.log")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ ! -e "$rn_/forced-command.log" ]; }
+check 'creation: refused symlinked dir never gains a created file' $?
+
+# 16o. Missing leaf dir with a refused ancestor: no mkdir side effect at all.
+ro_="$rdir/o-anc"; mkdir -m 700 "$ro_"; ln -s "$ro_" "$rdir/o-link"
+hfc="$(render o "$rdir/o-link/leaf/forced-command.log")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ ! -e "$ro_/leaf" ]; }
+check 'creation: refused ancestor never gains a created dir' $?
+
+# 16p. Ancestor swapped in the check→mkdir window: mkdir is cleaned up on
+# refusal (rmdir of our own empty dir), leaving no residue.
+rp_="$rdir/p-anc"; mkdir -m 700 "$rp_"
+hfc="$(render_hook p "$rp_/leaf/forced-command.log" 'mkdir -m 700' \
+    "    mv \"$rp_\" \"$rdir/p-old\"; ln -s \"$rdir/p-old\" \"$rp_\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
+check 'creation: check→mkdir ancestor swap refused' $?
+
+# 16q. Dangling link planted between -L check and atomic create: O_NOFOLLOW
+# refuses the open — target never materializes.
+rq_="$rdir/q"; mkdir -m 700 "$rq_"; rlogq="$rq_/forced-command.log"
+qtarget="$rq_/should-not-exist"
+hfc="$(render_hook q "$rlogq" 'O_NOFOLLOW' "    ln -s \"$qtarget\" \"$rlogq\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ ! -e "$qtarget" ]; }
+check 'creation: link planted in check→create window refused, no target' $?
+
+# 16r. Leaf dir swapped to symlink at emit time (same inode): the emit's own
+# path check refuses — nothing appended.
+rr_="$rdir/r"; mkdir -m 700 "$rr_"; rlogr="$rr_/forced-command.log"
+echo orig > "$rlogr"; chmod 600 "$rlogr"
+hfc="$(render_hook r "$rlogr" 'if ! { ledger_fd_ok' \
+    "    mv \"$rr_\" \"$rdir/r-old\"; ln -s \"$rdir/r-old\" \"$rr_\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogr")" = 'orig' ]; }
+check 'race: ancestor swap at emit refused, nothing written' $?
+
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and
 # EOF stdin: it must create exactly the inventoried audit set, nothing else.

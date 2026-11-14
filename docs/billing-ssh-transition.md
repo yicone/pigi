@@ -44,8 +44,8 @@ was absent before.
 | --- | --- | --- | --- |
 | `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
 | `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
-| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | pre-existing (record existence/mode only); if absent and auto-created, log that fact — deletion only if created by this rollout |
-| `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | exists today — record mode/owner; if absent at rollout the script creates it: log that; rollback deletes it only if it was created by this rollout |
+| `~/Library`, `~/Library/Application Support` | intermediate parents of every path below; exist on any macOS HOME — if either is absent the adapter/script creates it (0700) | 0700 | record existence/type/owner/mode before any write — a content hash does not apply to directories; record the child listing instead. If absent and auto-created, log that fact — deletion only if created by this rollout AND empty of every retained object below |
+| `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | record existence/type/owner/mode/child-listing. If absent at rollout the script creates it: log that. Rollback removes it only if it was created by this rollout AND is empty — a directory holding retained audit objects (below) is never deleted |
 | `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | **audit object — never overwritten or blindly deleted.** Expected absent today — if present, STOP and inventory it; if created by this rollout, rollback *retains* it by default as an audit record — deleting it is a decision the rollback approval must name explicitly |
 | `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout it is retained with the DB it contains |
 | `~/Library/Application Support/pigi-mcp/audit.sqlite3` (+ transient `-journal`) | adapter `tool_calls` ledger, auto-created 0600 at `Audit()` init on every adapter start | 0600 | **audit object — never overwritten or blindly deleted.** If present at rollout, STOP and inventory (existence/type/owner/mode/hash). If created by this rollout, rollback *retains* it by default as an audit record — deleting it is itself a decision the rollback approval must name explicitly. The `-journal` file is transient (created on write, removed on commit) and inherits the same policy — a crash-residue journal found later is treated as an audit object, not auto-deleted; its crash-recovery lifecycle is **unverified** offline |
@@ -235,8 +235,9 @@ recorded; nothing pre-existing is destroyed:
 
 - `authorized_keys`: restore the `cp -p` backup byte-for-byte; if the file did
   not exist before this rollout, delete it. Never `rm` a file that existed.
-- `pigi_forced_command.sh` and ledger: delete only if the inventory shows they
-  were absent before this rollout; otherwise restore the recorded backup.
+- `pigi_forced_command.sh`: delete only if the inventory shows it was absent
+  before this rollout; otherwise restore the recorded backup. (The ledger is
+  an audit object — see below; this bullet does NOT cover deleting it.)
 - Remote Login: return to the recorded prior state (today's verified state is
   OFF — but the rollout log's recorded value is authoritative, not this doc's
   snapshot; a system admin may have enabled it for other reasons in between,
@@ -263,21 +264,30 @@ recorded; nothing pre-existing is destroyed:
   length, and a truncated SHA-256 of the request for correlation. The raw
   request is never written; the ledger itself is fail-closed (invalid
   directory/file type, ownership, mode, links, or any write failure =
-  refuse). Append binding: full path validation (ancestors, leaf dir, file
-  policy) runs before *and* after the append descriptor is opened; the
-  descriptor's real fstat dev/inode/uid/mode/nlink must match the validated
-  object at every gate; the emit statement itself re-checks the descriptor
-  in the same command so a change staged before it refuses *before* any byte
-  is written; and a full gate re-runs immediately before exec — staged
-  same-UID changes at the boundaries the offline probes covered refuse
-  (`deny/detached`) without appending to a wrong object. Honest residuals:
-  (a) the instruction-scale window between the last fstat inside the emit
-  statement and the write syscall, and (b) between the final gate and
-  `exec` — neither can redirect a record to a wrong object, only
-  theoretically detach the canonical path for a nanosecond-scale interval.
-  All demonstrated windows are same-UID synthetic probes, not remote or
-  cross-UID attacks; cross-UID is unverified. The fstat checks require
-  `/usr/bin/perl` (stock macOS) — listed as a rollout dependency below.
+  refuse). Creation binding: the leaf dir's ancestors are validated before
+  `mkdir` (on refusal the just-created empty dir is `rmdir`'d — no residue),
+  leaf dir + ancestors are validated before any file create, a link at the
+  ledger path is refused up front, and the create itself is an atomic
+  `O_NOFOLLOW` open so a link planted in the check→create window fails the
+  syscall instead of materializing a target. Append binding: the emit
+  statement re-checks the descriptor's real fstat *and* (for `allow`) the
+  full canonical path inside the same command — a staged change refuses
+  before any byte is written, and a full gate re-runs immediately before
+  `exec`. Demonstrated probes refuse cleanly; deny records still land on the
+  pinned inode. Honest residuals, both requiring a same-UID writer inside
+  HOME: (a) between the last check inside the emit statement and the write
+  syscall — a chmod landing there could append a sanitized record to a
+  then-widened inode, a confidentiality-only impact on the record just
+  written; (b) between the final gate and `exec` — a chmod/detach there can
+  leave the canonical ledger path non-compliant while the already-approved
+  single `exec` proceeds: the record was written to the pinned inode, but the
+  ledger's on-disk state can degrade (e.g. to 0644, or detached) without a
+  second gate catching it. Neither can redirect a record to a wrong object;
+  neither is a remote or cross-UID attack (cross-UID unverified). A trusted
+  same-UID writer in HOME is therefore a required, verifiable precondition —
+  the ancestor/ownership checks above exist to bound it. The fstat and
+  O_NOFOLLOW-create checks require `/usr/bin/perl` (stock macOS) — listed as
+  a rollout dependency below.
   Retention is manual, matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`
   ledger (tool name + outcome only).

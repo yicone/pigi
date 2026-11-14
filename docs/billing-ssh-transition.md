@@ -44,7 +44,10 @@ was absent before.
 | --- | --- | --- | --- |
 | `~/.ssh/pigi_forced_command.sh` | installed copy of `tools/pigi-mcp/pigi_forced_command.sh` from the **merged** checkout | 0700, owner `tr` | expected absent today (verified) — if present at rollout, STOP; rollback = delete only if it was absent before, else restore backup |
 | `~/.ssh/authorized_keys` | single line below | 0600 | expected absent today (verified) — if present at rollout, `cp -p` to `authorized_keys.bak-<ts>` and append; rollback restores the backup (or deletes the file only if it was absent before) — never blindly `rm` |
+| `~/Library/Application Support/pigi/` | ledger parent; exists today (App data dir), auto-created 0700 by the script only if absent | 0700 | exists today — record mode/owner; if absent at rollout the script creates it: log that; rollback deletes it only if it was created by this rollout |
 | `~/Library/Application Support/pigi/forced-command.log` | sanitized event ledger created by the script | 0600 | expected absent today — if present, STOP and inventory it; rollback = delete only if created by this rollout |
+| `~/Library/Application Support/pigi-mcp/` | adapter audit parent, auto-created 0700 on first adapter start — before any tool call, on EOF | 0700 | expected absent today — if present, STOP and inventory it; if created by this rollout, rollback removes it only together with the DB it contains |
+| `~/Library/Application Support/pigi-mcp/audit.sqlite3` (+ transient `-journal`) | adapter `tool_calls` ledger, auto-created 0600 at `Audit()` init on every adapter start | 0600 | **audit object — never overwritten or blindly deleted.** If present at rollout, STOP and inventory (existence/type/owner/mode/hash). If created by this rollout, rollback *retains* it by default as an audit record — deleting it is itself a decision the rollback approval must name explicitly. The `-journal` file is transient and inherits the same policy |
 
 `authorized_keys` line (exact):
 
@@ -132,7 +135,7 @@ argument, the ssh config `Host`/`HostKeyAlias`, and the `known_hosts` key.
 | `~billing/.ssh/known_hosts` | `tr-mini-m4-pigi ssh-ed25519 <pubkey>` | 0600 | `cp -p` backup before edit if file exists; rollback restores the backup (or deletes only if the file was absent) |
 | `~billing/.ssh/config` | stanza below | 0600 | same backup-then-append rule; rollback restores backup or removes only this stanza; an existing `Host tr-mini-m4-pigi` stanza = STOP |
 | `/opt/pigi-mcp/remote_pigi_mcp.py` (or Billing-local path) | copy of the launcher | 0755 | expected absent — if present, STOP and identify its origin; rollback = delete only if installed by this rollout |
-| Billing MCP host config | stdio server entry below | per Billing convention | backup config file first; rollback removes only the added entry, restoring any prior `pigi-*` entries |
+| Billing MCP host config | stdio server entry `pigi-mail-read` below | per Billing convention | backup config file first; an existing `pigi-mail-read` key (or any `pigi-*` key) in the config = STOP and identify it — never silently replace; rollback removes only the entry this rollout added, byte-restoring the backup |
 
 Isolation requirements on the shared box:
 
@@ -232,20 +235,37 @@ recorded; nothing pre-existing is destroyed:
   OFF — but the rollout log's recorded value is authoritative, not this doc's
   snapshot; a system admin may have enabled it for other reasons in between,
   and blindly disabling it would break that).
+- Ledger parent `~/Library/Application Support/pigi/` and the forced-command
+  ledger: delete only if created by this rollout; the directory exists today
+  as App data and is normally left alone.
+- Adapter audit objects (`pigi-mcp/` dir, `audit.sqlite3`, transient
+  `-journal`): if created by this rollout they are audit records — RETAIN by
+  default; deletion requires an explicit named decision in the rollback
+  approval. Pre-existing ones are never touched.
 - Linux side: restore each backed-up file or remove only the added
   stanza/entry; delete the keypair and launcher copy only if they did not
   exist before.
-- No App restart, mail data, keychain, or repo state is touched at any point,
-  so rollback leaves nothing behind on the mail side.
+- No App restart, mail data, keychain, or repo state is touched at any point.
+  Note rollback does **not** leave "nothing behind" in the strict sense: the
+  forced-command ledger and adapter audit DB are audit trails this rollout
+  legitimately creates — they are retained unless the rollback approval says
+  otherwise. Everything *pre-existing* is left untouched.
 
 ## Audit surfaces
 
 - `~/Library/Application Support/pigi/forced-command.log`: one TSV line per
   SSH attempt — UTC timestamp, charset-validated peer, `allow`/`deny`, reason
-  (`exact`/`mismatch`/`empty`/`pinned-unavailable`), request byte length, and a
-  truncated SHA-256 of the request for correlation. The raw request is never
-  written; the ledger itself is fail-closed (invalid directory/file type,
-  ownership, mode, links, or any write failure = refuse). Retention is manual,
+  (`exact`/`mismatch`/`empty`/`pinned-unavailable`/`detached`), request byte
+  length, and a truncated SHA-256 of the request for correlation. The raw
+  request is never written; the ledger itself is fail-closed (invalid
+  directory/file type, ownership, mode, links, or any write failure =
+  refuse). Append binding: the full path is validated before *and* after the
+  append descriptor is opened, the descriptor's fstat device/inode/uid/
+  mode/nlink must match the validated object, and a path-detach check runs
+  immediately before emit and again before exec — a same-UID swap at any
+  staged window refuses (denied as `detached`) and never appends to the
+  wrong object. The instruction-scale residual between the final check and
+  `exec` cannot redirect the already fd-written record. Retention is manual,
   matching the App's audit model.
 - `~/Library/Application Support/pigi-mcp/audit.sqlite3`: adapter `tool_calls`
   ledger (tool name + outcome only).

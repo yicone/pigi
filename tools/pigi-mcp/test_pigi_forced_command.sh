@@ -343,8 +343,141 @@ if [ -f "$DOC" ]; then
     check 'runbook: rollback restores prior state, no overwrite-then-delete' $?
     grep -q 'required by default' "$DOC" && grep -q 'STOP' "$DOC"
     check 'runbook: from= stays mandatory and gaps STOP the rollout' $?
+    # Every object the pinned pipeline can auto-create is inventoried with a
+    # per-object policy, and audit objects are retained — not deleted.
+    grep -q 'pigi-mcp/audit\.sqlite3' "$DOC" \
+        && grep -q 'pigi-mail-read' "$DOC" \
+        && grep -q 'audit record' "$DOC" \
+        && grep -q 'RETAIN' "$DOC" \
+        && ! grep -q 'leaves nothing behind' "$DOC"
+    check 'runbook: runtime auto-created objects inventoried, audit retained' $?
 else
     check 'runbook: docs/billing-ssh-transition.md exists' 1
+fi
+
+# -- 16. Synchronous same-UID swap windows (ACM-967 item 1) -------------------
+# render_hook injects ONE literal line before a unique anchor in the rendered
+# copy — deterministic race coverage at each check→open→append boundary.
+# These are same-UID synthetic windows only; cross-UID is not safely testable.
+render_hook() { # render_hook <name> <log> <anchor-substring> <injected-line>
+    out="$TMP/fc-r$1.sh"
+    sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
+        -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
+        -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
+        -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
+        -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$2'|" \
+        "$FC" | awk -v anchor="$3" -v ins="$4" \
+        'index($0,anchor){print ins} {print}' > "$out"
+    chmod 700 "$out"
+    # The injection is verified by line count: exactly one inserted line per
+    # anchor occurrence (awk -v escape processing makes grep -F unreliable).
+    n_anchors=$(awk -v a="$3" 'index($0,a){c++} END{print c+0}' "$FC")
+    [ "$n_anchors" -ge 1 ] \
+        && [ "$(wc -l < "$out")" -eq "$(( $(wc -l < "$FC") + n_anchors ))" ] \
+        || { echo "hook inject failed: $1" >&2; exit 2; }
+    printf %s "$out"
+}
+rdir="$TMP/race"; mkdir -m 700 "$rdir"
+
+# 16a. chmod the validated inode between the checks and the open.
+ra="$rdir/a"; mkdir -m 700 "$ra"; rloga="$ra/forced-command.log"
+echo orig > "$rloga"; chmod 600 "$rloga"
+hfc="$(render_hook a "$rloga" '{ exec 9>>' "    chmod 644 \"$rloga\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT"; }
+check 'race: chmod in check→open window refused' $?
+
+# 16b. Same-UID 0644 replacement staged between the checks and the open.
+rb="$rdir/b"; mkdir -m 700 "$rb"; rlogb="$rb/forced-command.log"
+echo orig > "$rlogb"; chmod 600 "$rlogb"
+unsafe="$rb/unsafe"; echo unsafe > "$unsafe"; chmod 644 "$unsafe"
+hfc="$(render_hook b "$rlogb" '{ exec 9>>' "    mv \"$unsafe\" \"$rlogb\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogb")" = 'unsafe' ]; }
+check 'race: 0644 replacement before open refused, bad file untouched' $?
+
+# 16c. Policy-compliant 0600 replacement still refused (identity changed).
+rc_="$rdir/c"; mkdir -m 700 "$rc_"; rlogc="$rc_/forced-command.log"
+echo orig > "$rlogc"; chmod 600 "$rlogc"
+other="$rc_/other"; echo other > "$other"; chmod 600 "$other"
+hfc="$(render_hook c "$rlogc" '{ exec 9>>' "    mv \"$other\" \"$rlogc\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogc")" = 'other' ]; }
+check 'race: valid-mode replacement before open refused (inode mismatch)' $?
+
+# 16d. Leaf directory swapped to a symlink between traversal and open.
+rd="$rdir/d"; mkdir -m 700 "$rd"; rlogd="$rd/forced-command.log"
+echo orig > "$rlogd"; chmod 600 "$rlogd"
+rrepl="$rdir/repl"; mkdir -m 700 "$rrepl"; echo repl > "$rrepl/forced-command.log"
+chmod 600 "$rrepl/forced-command.log"
+hfc="$(render_hook d "$rlogd" '{ exec 9>>' \
+    "    mv \"$rd\" \"$rdir/d-old\"; ln -s \"$rrepl\" \"$rd\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rrepl/forced-command.log")" = 'repl' ]; }
+check 'race: ancestor symlink swap before open refused, target untouched' $?
+
+# 16e. Path detached after the open (pre-emit): bound check demotes to deny.
+re_="$rdir/e"; mkdir -m 700 "$re_"; rloge="$re_/forced-command.log"
+echo orig > "$rloge"; chmod 600 "$rloge"
+saved="$re_/saved"
+hfc="$(render_hook e "$rloge" 'if ! ledger_bound' \
+    "    mv \"$rloge\" \"$saved\"; printf 'decoy\\\\n' > \"$rloge\"; chmod 600 \"$rloge\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rloge")" = 'decoy' ] \
+    && grep -q 'deny' "$saved" && grep -q 'detached' "$saved"; }
+check 'race: post-open detach refused, record on pinned inode only' $?
+
+# 16f. Detach between bound check and emit: post-emit gate still refuses.
+rf_="$rdir/f"; mkdir -m 700 "$rf_"; rlogf="$rf_/forced-command.log"
+echo orig > "$rlogf"; chmod 600 "$rlogf"
+savedf="$rf_/saved"
+hfc="$(render_hook f "$rlogf" 'if ! printf' \
+    "    mv \"$rlogf\" \"$savedf\"; printf 'decoy\\\\n' > \"$rlogf\"; chmod 600 \"$rlogf\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogf")" = 'decoy' ] \
+    && grep -q 'allow' "$savedf"; }
+check 'race: post-bound detach refused, event only on pinned inode' $?
+
+# 16g. Detach at the final gate (post-emit): allow never reaches the stub.
+rg_="$rdir/g"; mkdir -m 700 "$rg_"; rlogg="$rg_/forced-command.log"
+echo orig > "$rlogg"; chmod 600 "$rlogg"
+savedg="$rg_/saved"
+hfc="$(render_hook g "$rlogg" 'ledger_bound || refuse' \
+    "    mv \"$rlogg\" \"$savedg\"; printf 'decoy\\\\n' > \"$rlogg\"; chmod 600 \"$rlogg\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ "$(cat "$rlogg")" = 'decoy' ]; }
+check 'race: detach at final gate refused' $?
+
+# -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
+# Drive the REAL adapter through the forced command under a synthetic HOME and
+# EOF stdin: it must create exactly the inventoried audit set, nothing else.
+TESTPY=
+for cand in "$(awk -F"'" '/^readonly PIGI_MCP_PYTHON=/{print $2}' "$FC")" \
+            "$(command -v python3 || true)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ] \
+        && "$cand" -c 'import sys;sys.exit(sys.version_info<(3,10))' 2>/dev/null; then
+        TESTPY=$cand; break
+    fi
+done
+if [ -n "$TESTPY" ]; then
+    adhome="$TMP/adhome"; mkdir -m 700 "$adhome"
+    adled="$TMP/adled"; mkdir -m 700 "$adled"; adlog="$adled/forced-command.log"
+    adfc="$(render adapter "$adlog" "$TESTPY" "$ROOT/pigi_mcp.py" "$adhome")"
+    EXPAD="$TESTPY -B $ROOT/pigi_mcp.py --account $ACCOUNT"
+    run "$adfc" "$EXPAD" </dev/null
+    created=$(cd "$adhome" && find . -type f | sort)
+    { [ "$created" = './Library/Application Support/pigi-mcp/audit.sqlite3' ] \
+        && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp")" = 700 ] \
+        && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp/audit.sqlite3")" = 600 ]; }
+    check 'runtime-objects: adapter auto-creates only the inventoried audit set' $?
+else
+    check 'runtime-objects: python3 present for adapter probe' 1
 fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"

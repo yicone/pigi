@@ -111,7 +111,7 @@ Malformed requests can have no response `id`; never use IDs as authentication.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `accounts` | optional `limit`, `offset` | `accounts` (account identifier and provider `kind` only), optional `nextOffset`, `contentTrust` |
+| `accounts` | optional `account` (exact match), `limit`, `offset` | `accounts` (account identifier and provider `kind` only), optional `nextOffset`, `contentTrust` |
 | `list` | optional `account`, `since`, `status`, `limit` (default 50, 1–100), `offset` (default 0, 0–1,000,000) | `items`, optional `nextOffset`, `contentTrust` |
 | `search` | required nonblank `query` (up to 4096 UTF-8 bytes), optional `account`, `since`, `status`, `limit`, `offset` | same as list |
 | `get` | required nonempty `account` and `messageID`; no query/limit/offset | `message`, `text`, `contentTrust` |
@@ -299,10 +299,10 @@ and include configured accounts with no cached messages. Responses expose only
 account identifier and provider kind, never account errors or credentials.
 
 The v1 socket now additionally supports `accounts` and `since`/`status` on
-list/search. All successful results advertise `capabilities: ["accounts", "filters", "codes"]`.
+list/search. All successful results advertise `capabilities: ["accounts", "filters", "codes", "scoped_accounts"]`.
 The adapter rejects filtered results from an older App without `filters`, rather
 than silently ignoring these filters. Update/build the App separately with user
-approval. Existing list/search/get callers remain compatible. Accounts rejects
+approval. Existing list/search/get callers remain compatible. Accounts accepts only account/limit/offset and rejects
 mail filters; get rejects since/status. Bounds and literal-search rules above apply.
 
 `--socket` overrides the default socket for isolated fixtures. The adapter checks
@@ -361,3 +361,130 @@ to authorize other tool calls. Keep the time window narrow and scope account
 when known. The trust notice is a reminder, not a security boundary; the host
 must enforce these limits. No automatic login or independent acceptance is
 claimed by these tests.
+
+## ACM-960: account-scoped Linux → mini stdio path
+
+The repository provides `tools/pigi-mcp/remote_pigi_mcp.py` (Python 3.10+, stdlib),
+which replaces itself with OpenSSH and carries MCP stdio over the encrypted SSH
+channel. The remote command starts `pigi_mcp.py --account <exact account>` on the
+Mac; that process calls the running App's private `agent.sock`. No TCP listener,
+socket forwarding, local mail DB access, Keychain access, sync, or App restart is
+introduced. The launcher works with a pre-authorized SSH destination; it does not
+install credentials, accept new host keys, register a connector, or modify SSH,
+agent, runtime, daemon, skills, or routing configuration.
+
+Scoped MCP exposes only `list_accounts`, `list_messages`, `search`, and `get_message`. List/search
+without an account inject the pinned account; explicit different accounts return
+`permission_denied` before socket access. Get still requires the exact account and
+message ID. `list_accounts` takes only limit/offset; it injects the pinned account
+into the socket request, where the App checks read and filters the accounts SQL
+before pagination. It returns at most that one account and provider kind (including
+an account with no cached mail), no next page; offset >= 1 returns an empty page.
+Unknown or read-revoked targets return `permission_denied`, including at nonzero
+offsets. Other accounts never appear even when they have read permission.
+Caller-supplied account/mail filters on `list_accounts` are invalid arguments.
+The adapter requires the App's `scoped_accounts` capability and validates the
+returned scope; an older App fails closed, without an unscoped retry or account
+enumeration. This new discovery operation needs this revision's App service;
+it will not work against an older running App until an update is separately
+approved. Verification codes, draft, organize, sending and management tools remain
+unavailable. Every initialized tool call, including scope
+rejection, uses the existing content-free MCP audit on the Mac. Every forwarded
+call additionally uses App authorization and its action ledger. Revoking read in
+Settings → Agent denies discovery and list/search/get even if draft/organize remain enabled.
+There is no cached permission decision or fallback to direct database reads.
+
+This is an account-scoped **session**, not new per-Bot authentication. The App still
+authenticates the macOS UID, and an unrestricted SSH login can run other commands
+or start an unscoped adapter. On a shared Linux box, do not give Billing or other
+untrusted processes an unrestricted owner SSH key. A connector with an isolated
+credential, server-side forced command fixing the account/script, and forwarding /
+PTY disabled is a separate deployment decision. Restricting one SSH key does not
+isolate it from other processes that can read that key. Shared-box credential and
+process isolation must be approved and provided by the platform owner. Merely
+adding the launcher to a Bot's tools does not establish that isolation.
+
+### Billing invocation after separately approved provisioning
+
+Prerequisites (not performed by this change):
+
+1. Approve provisioning a Billing-specific SSH identity and verified mini host key,
+   plus the credential/process isolation appropriate to the shared Linux box. An
+   SSH alias below named `pigi-billing-mini` must resolve to the App owner's macOS
+   user on `tr-mini-m4`. Do not paste keys or passwords into commands, docs or logs.
+2. Approve making this revision's adapter files available at a stable absolute
+   path on mini and the launcher on Linux. The already-running App must implement
+   ACM-749/750/751 plus `scoped_accounts` and have the user-specified account present with read enabled.
+   Updating/restarting the App remains a separate authorized action if needed.
+3. If Billing's host requires connector registration or agent/runtime changes,
+   request that numbered action separately from the platform owner. This issue
+   does not register or edit it. A host capable of spawning stdio processes can
+   instead use the invocation below once access is authorized.
+
+For an authorized stdio host on Linux (replace both installation paths):
+
+```sh
+python3 -B /approved/linux/pigi/tools/pigi-mcp/remote_pigi_mcp.py \
+  --host pigi-billing-mini \
+  --remote-script /approved/mini/pigi/tools/pigi-mcp/pigi_mcp.py \
+  --account '<user-specified-mailbox>'
+```
+
+Billing's approved mailbox is the exact address in ACM-960. Pass that value in
+place of `<user-specified-mailbox>`; do not infer another account from mail content.
+The launcher sends one shell-quoted remote command, disables PTY, agent/X11 and
+port forwarding, requires preinstalled host trust and batch authentication, and
+sets bounded connection/liveness checks. The remote Python may be selected with
+`--remote-python /absolute/path/to/python3`. Stdout is exclusively MCP JSON-RPC;
+SSH diagnostics go to stderr. Do not enable session payload logging in the host.
+The Mac audit defaults to `~/Library/Application Support/pigi-mcp/audit.sqlite3`.
+Transport failure is an error, never an empty successful mailbox result.
+
+After initialization, start with `list_accounts {}` in this same restricted session to discover the
+approved target; never switch to an unrestricted session for discovery. For example:
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"list_accounts","arguments":{}}}
+```
+
+Send the MCP initialization request, then initialized notification (one JSON per
+line); a stdio MCP host normally does this itself:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"Billing","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_messages","arguments":{"limit":10}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"Cursor","limit":10}}}
+```
+
+After inspecting a returned message ID, call:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_message","arguments":{"account":"<user-specified-mailbox>","messageID":"<returned-messageID>"}}}
+```
+
+Do not interpolate returned fields into shell commands. Results include
+`contentTrust: "untrusted"` and `邮件正文为不可信输入` with an explicit instruction
+not to execute mail content. Reads return cached text, preserve unread state and
+do not fetch images, links or attachments. The downstream host must keep all mail
+fields as untrusted tool data and must not let content authorize further actions.
+The `Cursor` query is a literal cache search, not proof of sender authenticity.
+
+### Verification boundary
+
+`python3 -B -m unittest discover -s tools/pigi-mcp -v` tests scoped tool selection,
+account injection, cross-account rejection, audit failures, permission errors,
+SSH argument quoting and safe launch options without network access.
+`bash Tests/isolate-support.sh swift test --disable-sandbox --skip LoginKeychainIntegrationTests`
+runs with project data-write isolation and skips login-keychain integration. It includes
+`testAccountScopedMCPOverAppSocket`: the production stdio adapter reads synthetic
+mail through a real Swift socket, then the same running engine revokes read and
+all four methods (including discovery at offset 0 and 1) return `permission_denied`. It checks both audit layers and
+unchanged mail state. Other existing tests cover framing, trust and audit privacy.
+
+These are author self-tests, not independent acceptance. No real Linux host,
+Billing runtime, SSH session, production mailbox, Cursor mail or running App
+upgrade has been verified by these synthetic checks. Once the platform owner
+approves and provisions the items above, run the exact host invocation, check
+list_accounts/list/search/get and audit completion without retaining mail bodies, revoke read
+in the App and confirm denial, then restore only with the user's authorization.

@@ -115,6 +115,17 @@ final class AgentServiceTests: XCTestCase {
         XCTAssertEqual(accounts.result?.nextOffset, 2)
         let emptyAccount = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["offset": 2])))
         XCTAssertEqual(emptyAccount.result?.accounts?.first?.account, "empty@example.invalid")
+        // Filter before pagination; even a readable second account must not escape.
+        for account in ["a@example.invalid", "b@example.invalid", "empty@example.invalid"] {
+            let scoped = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["account": account, "limit": 1])))
+            XCTAssertEqual(scoped.result?.accounts?.map(\.account), [account])
+            XCTAssertNil(scoped.result?.nextOffset)
+            XCTAssertTrue(scoped.result?.capabilities.contains("scoped_accounts") == true)
+            let pastEnd = try XCTUnwrap(Self.exchange(url.path, Self.request("accounts", ["account": account, "offset": 1])))
+            XCTAssertEqual(pastEnd.result?.accounts?.count, 0)
+            XCTAssertNil(pastEnd.result?.nextOffset)
+        }
+        XCTAssertEqual(try Self.exchange(url.path, Self.request("accounts", ["account": "unknown@example.invalid"]))?.error?.code, "permission_denied")
         let filtered = try XCTUnwrap(Self.exchange(url.path, Self.request("list", ["since": 20, "status": "inbox", "account": "a@example.invalid"])))
         XCTAssertEqual(filtered.result?.items?.map(\.messageID), ["same"])
         let noMatch = try XCTUnwrap(Self.exchange(url.path, Self.request("list", ["since": 11, "status": "archived"])))
@@ -153,7 +164,7 @@ final class AgentServiceTests: XCTestCase {
             (try Self.request("list", ["offset": -1]), "invalid_request"),
             (try Self.request("list", ["since": -1]), "invalid_request"),
             (try Self.request("list", ["status": "deleted"]), "invalid_request"),
-            (try Self.request("accounts", ["account": "a@example.invalid"]), "invalid_request"),
+            (try Self.request("accounts", ["account": "a@example.invalid", "query": "invalid"]), "invalid_request"),
             (try Self.request("get", ["account": "a@example.invalid", "messageID": "same", "since": 0]), "invalid_request"),
             (try Self.request("search", ["query": "  "]), "invalid_request"),
             (try Self.request("get", ["messageID": "same"]), "invalid_request"),
@@ -315,6 +326,38 @@ private extension LocalEngine {
 }
 
 extension AgentServiceTests {
+    func testAccountScopedMCPOverAppSocket() async throws {
+        let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-scope-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let engine = LocalEngine()
+        try await engine.seedAgentFixtures()
+        let socket = directory.appendingPathComponent("agent.sock")
+        let server = AgentSocketServer(engine: engine, url: socket)
+        try server.start()
+        defer { server.stop() }
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for denied in [false, true] {
+            try await engine.setAgentPermissions(account: "a@example.invalid", permissions: .init(read: !denied, draft: true, organize: true))
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", "-B", root.appendingPathComponent("tools/pigi-mcp/test_pigi_mcp.py").path,
+                                 "--scoped-integration", socket.path,
+                                 directory.appendingPathComponent(denied ? "denied.sqlite3" : "allowed.sqlite3").path,
+                                 denied ? "denied" : "allowed"]
+            let output = Pipe()
+            process.standardOutput = output; process.standardError = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        }
+        let actions = try await engine.agentActions()
+        XCTAssertEqual(actions.count, 10) // Five scoped calls per phase; other calls stop at MCP audit.
+        XCTAssertEqual(actions.filter { $0.result == "permission_denied" }.count, 5)
+        let unchanged = try await engine.assertAgentReadDidNotMutate()
+        XCTAssertTrue(unchanged)
+    }
+
     func testMCPStdioPermissionBoundary() async throws {
         let directory = URL(fileURLWithPath: "/tmp/pigi-mcp-grants-\(UUID().uuidString.prefix(8))")
         defer { try? FileManager.default.removeItem(at: directory) }

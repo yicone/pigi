@@ -566,6 +566,33 @@ run "$hfc" "$EXPECTED"
     && [ "$(cat "$rlogr")" = 'orig' ]; }
 check 'race: ancestor swap at emit refused, nothing written' $?
 
+# 16s. Directory swapped for a symlink to another 0700 dir between validation
+# and the dirfd-bound create: fstat compare refuses — the substitute dir must
+# not gain a file, and neither must the moved-away original.
+rs_="$rdir/s-real"; mkdir -m 700 "$rs_"
+rssub="$rdir/s-sub"; mkdir -m 700 "$rssub"
+rslog="$rdir/s-real/forced-command.log"
+hfc="$(render_hook s "$rslog" 'sysopen(D' \
+    "    mv \"$rs_\" \"$rdir/s-moved\"; ln -s \"$rssub\" \"$rs_\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ ! -e "$rssub/forced-command.log" ] \
+    && [ ! -e "$rdir/s-moved/forced-command.log" ]; }
+check 'creation: dir swap before create refused, no file anywhere' $?
+
+# 16t. Self-created leaf dir swapped out for a pre-existing empty 0755 dir
+# before revalidation: refusal must NOT delete the pre-existing dir, and the
+# self-created one stays as residue where it was moved.
+rt_="$rdir/t-anc"; mkdir -m 700 "$rt_"
+prex="$rdir/t-preex"; mkdir "$prex"; chmod 755 "$prex"
+rtlog="$rt_/leaf/forced-command.log"
+hfc="$(render_hook t "$rtlog" 'ledger_dirs_ok "$dir" ||' \
+    "    mv \"$rt_/leaf\" \"$rdir/t-mine\"; mv \"$prex\" \"$rt_/leaf\"")"
+run "$hfc" "$EXPECTED"
+{ [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && [ -d "$rt_/leaf" ] && [ -d "$rdir/t-mine" ]; }
+check 'cleanup: pre-existing dir preserved, created dir residue only' $?
+
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and
 # EOF stdin: it must create exactly the inventoried audit set, nothing else.

@@ -184,7 +184,7 @@ def scoped_integration(socket_path, audit_path, denied):
 
 class MCPTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="pmcp-", dir="/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="pmcp-")
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name)
         self.audit = Audit(self.path / "audit.sqlite3")

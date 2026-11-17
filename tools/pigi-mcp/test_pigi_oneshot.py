@@ -334,18 +334,162 @@ class OneshotTests(unittest.TestCase):
         for forbidden in ('"list"', '"codes"', "get_verification_code", "list_messages"):
             self.assertNotIn(forbidden, source)
 
-    def test_truncation_marker_and_cap(self):
+    def test_search_truncation_stays_valid_json_exit_eight(self):
         big = [make_message("m%d" % i, ALLOWED, snippet="A" * 30_000) for i in range(3)]
         self.table["search"] = lambda params: search_result(big)
         code, out = self.invoke(["search", "--limit", "20"])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 8)
         self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
-        self.assertTrue(out.endswith(pigi_oneshot.TRUNCATION_MARKER))
-        self.table["search"] = lambda params: search_result([make_message("m1")])
-        code, out = self.invoke(["search"])
+        doc = self.parse(out)  # json.loads must succeed: always valid JSON
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["contentTrust"], "untrusted")
+        self.assertEqual(doc["command"], "search")
+        self.assertEqual(len(doc["items"]) + doc["omittedItems"], 3)
+        self.assertGreater(doc["omittedItems"], 0)
+        self.assertEqual(doc["filteredOut"], 0)
+
+    def test_get_truncation_multibyte_text_exit_eight(self):
+        message = make_message("m1")
+        text = "中文字符正文🎉trailer" * 6_000
+        self.table["get"] = lambda params: get_result(message, text)
+        code, out = self.invoke(["get", "m1"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertTrue(doc["textTruncated"])
+        self.assertEqual(doc["message"]["messageID"], "m1")
+        self.assertLess(len(doc["text"]), len(text))
+        full = pigi_oneshot.envelope("get", {"message": message, "text": text})
+        self.assertEqual(doc["originalBytes"], len(pigi_oneshot.serialize(full)))
+
+    def test_get_batch_truncation_cuts_every_text(self):
+        texts = {"m%d" % i: "B" * 30_000 + str(i) for i in range(5)}
+        self.table["get"] = lambda params: get_result(
+            make_message(params["messageID"]), texts[params["messageID"]])
+        code, out = self.invoke(["get-batch"] + list(texts))
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(len(doc["results"]), 5)
+        for entry in doc["results"]:
+            self.assertEqual(entry["status"], "ok")
+            self.assertTrue(entry["textTruncated"])
+
+    def test_get_batch_truncation_keeps_denial_exit_three(self):
+        def responder(params):
+            message_id = params["messageID"]
+            if message_id == "deny":
+                return get_result(make_message(message_id, OTHER), SENTINEL)
+            return get_result(make_message(message_id), "B" * 40_000)
+        self.table["get"] = responder
+        code, out = self.invoke(["get-batch", "a", "deny", "c"])
+        self.assertEqual(code, 3)  # already non-zero: truncation does not lift it to 8
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["results"][1], {"messageID": "deny", "status": "filtered"})
+        self.assertNotIn(SENTINEL, out.decode("utf-8"))
+
+    def test_truncation_fallback_when_metadata_alone_huge(self):
+        giant = make_message("m1", subject="S" * 200_000)
+        self.table["get"] = lambda params: get_result(giant, SENTINEL)
+        code, out = self.invoke(["get", "m1"])
+        self.assertEqual(code, 8)
+        doc = self.parse(out)
+        self.assertEqual(set(doc), {"contentTrust", "trustNotice", "command",
+                                    "truncated", "truncationNotice", "originalBytes"})
+        self.assertEqual(doc["command"], "get")
+        self.assertTrue(doc["truncated"])
+        for leak in (SENTINEL, "S" * 100):
+            self.assertNotIn(leak, out.decode("utf-8"))
+
+    def test_serialized_boundary_exactly_max_stdout(self):
+        message = make_message("m1")
+        overhead = len(pigi_oneshot.serialize(
+            pigi_oneshot.envelope("get", {"message": message, "text": ""})))
+        self.table["get"] = lambda params: get_result(
+            message, "x" * (pigi_oneshot.MAX_STDOUT - overhead))
+        code, out = self.invoke(["get", "m1"])
+        self.assertEqual((code, len(out)), (0, pigi_oneshot.MAX_STDOUT))
+        self.assertNotIn("truncated", self.parse(out))
+        self.table["get"] = lambda params: get_result(
+            message, "x" * (pigi_oneshot.MAX_STDOUT + 1 - overhead))
+        code, out = self.invoke(["get", "m1"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        self.assertTrue(self.parse(out)["truncated"])
+
+    def test_preamble_gate_precedes_environment_imports(self):
+        import ast
+        tree = ast.parse(SCRIPT.read_text())
+        gate = None
+        for node in tree.body:
+            if (isinstance(node, ast.If) and isinstance(node.test, ast.BoolOp)
+                    and any(isinstance(part, ast.Compare)
+                            and isinstance(part.left, ast.Name)
+                            and part.left.id == "__name__" for part in node.test.values)):
+                gate = node
+                break
+        self.assertIsNotNone(gate, "missing __main__ hardening gate")
+        before = tree.body[:tree.body.index(gate)]
+        defined = {node.name for node in before if isinstance(node, ast.FunctionDef)}
+        self.assertIn("is_hardened", defined)
+        self.assertIn("hardened_exec_args", defined)
+        for node in before:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertIn(alias.name, {"os", "sys"})
+            elif isinstance(node, ast.ImportFrom):
+                self.fail("module import before hardening gate: %s" % node.module)
+        self.assertTrue(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "execve" for n in ast.walk(gate)))
+
+    def test_unhardened_start_never_imports_environment_modules(self):
+        rogue = self.root / "rogue-site"
+        rogue.mkdir()
+        canary = self.root / "canary"
+        for name in ("json.py", "argparse.py"):
+            (rogue / name).write_text(
+                "import pathlib\npathlib.Path(%r).write_text('hit')\n"
+                "raise SystemExit(88)\n" % str(canary))
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPT), "list"],
+            capture_output=True, timeout=20, cwd=self.temp.name,
+            env={"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                 "PYTHONPATH": str(rogue)})
+        self.assertFalse(canary.exists())
+        self.assertNotEqual(result.returncode, 88)
+        # 2 when the pinned interpreter exists (hardened child rejects `list`),
+        # 6 where it is absent; either way the rogue modules never ran.
+        self.assertIn(result.returncode, {2, 6})
+
+    def test_get_batch_all_denied_exact_filtered_shape(self):
+        self.table["get"] = lambda params: get_result(
+            make_message(params["messageID"], OTHER, subject="SUBJ_SENTINEL",
+                         snippet="SNIP_SENTINEL"), SENTINEL)
+        code, out = self.invoke(["get-batch", "a", "b", "c"])
+        self.assertEqual(code, 3)
+        doc = self.parse(out)
+        self.assertEqual(doc["results"], [{"messageID": mid, "status": "filtered"}
+                                          for mid in ("a", "b", "c")])
+        text = out.decode("utf-8")
+        for leak in (SENTINEL, "SUBJ_SENTINEL", "SNIP_SENTINEL", OTHER):
+            self.assertNotIn(leak, text)
+
+    def test_get_writes_exactly_one_adapter_audit_row(self):
+        self.table["get"] = lambda params: get_result(make_message("m1"), "body")
+        code, out = self.invoke(["get", "m1"])
         self.assertEqual(code, 0)
-        self.assertNotIn(pigi_oneshot.TRUNCATION_MARKER, out)
-        self.assertLess(len(out), pigi_oneshot.MAX_STDOUT)
+        self.assertEqual(self.audit_rows(), [("get_message", "ok")])
+
+    def test_docs_contract_matches_implementation(self):
+        doc = DOCS.read_text()
+        self.assertIn('"status":"filtered"', doc)
+        self.assertNotIn("no write path", doc)
+        self.assertIn("tool_calls", doc)
+        self.assertIn("| 8 |", doc)
+        self.assertIn("truncated", doc)
 
     def test_config_loader_fails_closed(self):
         home = self.root / "cfg-home"

@@ -4,7 +4,11 @@
 Billing local-execution channel. Each run performs exactly one of four read
 subcommands against the already-running App's `agent.sock`, through a child
 `pigi_mcp.py` scoped to one pinned account, then exits. There is no daemon, no
-shell, no free-form input path, and no write path anywhere in the chain.
+shell, no free-form input path, and no mail-write or mutation path anywhere in
+the chain (no send, mark-read, draft or delete). The wrapper itself writes no
+files; the child adapter it spawns writes its own content-free `tool_calls`
+audit rows to the adapter audit DB, and the App writes `agent_actions` — both
+pre-existing ledgers, see Audit below.
 
 Everything the caller can reach is fixed by code and config: the target mailbox,
 the allowed senders, the search query (`Cursor`), the subcommands, and every
@@ -26,7 +30,7 @@ hardening flags (see below):
 | `accounts` | `list_accounts {}` scoped to the configured account; returns at most that one account and its provider kind. |
 | `search [--since-days N] [--limit M]` | Literal search for the fixed query `Cursor`. `N` defaults to 7 (1–30), `M` defaults to 10 (1–20). Items whose `fromEmail` is not on the sender allowlist are dropped and counted in `filteredOut`. |
 | `get <messageID>` | `get_message` for one ID (`^[A-Za-z0-9._@=+-]{1,256}$`). Sender allowlist applies to the returned message, not just search hits. |
-| `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status`: `ok`, `filtered` (no content), `not_found`, `error`. |
+| `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. |
 
 Not implemented — now or by accident: `list`, `get_verification_code`,
 `--account`, `--offset`, a caller-chosen query, send/mark-read/draft or any
@@ -40,14 +44,28 @@ characters can never reach the caller raw). Successful results use the envelope
 `{"contentTrust":"untrusted","trustNotice":...,"command":<name>, ...}`; every
 upstream result is re-checked for `contentTrust == "untrusted"` before use.
 
-`get`/`get-batch` with a sender outside the allowlist emits exactly
+`get` with a sender outside the allowlist emits exactly
 `{"contentTrust":"untrusted","trustNotice":...,"allowed":false,"message":null}`,
 built from scratch — no upstream field is copied, so a denied body, subject,
-snippet or sender can never leak through the denial path.
+snippet or sender can never leak through the denial path. `get-batch` uses a
+different shape: a denied entry is `{"messageID": ..., "status":"filtered"}`
+inside the normal `results` list of the `get-batch` envelope — again with no
+message or text keys, and the run exits 3 by the precedence below.
 
-If serialized stdout would exceed 65,536 bytes it is truncated and terminated
-by the literal marker line `[pigi-oneshot: output truncated at 65536 bytes]`
-(exit code unchanged); the marker means the JSON is incomplete, not valid.
+When a serialized payload would exceed 65,536 bytes the wrapper shrinks it by
+shape and marks it with `"truncated":true`,
+`"truncationNotice":"pigi-oneshot: output truncated at 65536 bytes"` and
+`"originalBytes":<full serialized size>`. `search` keeps the longest fitting
+prefix of `items` plus `"omittedItems"`; `get` keeps the message metadata and
+cuts `text` to the longest fitting character prefix plus `"textTruncated":true`;
+`get-batch` cuts every `ok` entry's `text` to a common per-entry character
+budget plus `"textTruncated":true` on cut entries, keeping all entries and
+statuses. If the result still does not fit — for example metadata fields alone
+are huge — the output is the minimal envelope
+`{contentTrust, trustNotice, command, truncated, truncationNotice,
+originalBytes}` with no mail data, which always fits. Truncated output remains
+valid JSON; a successful-but-truncated command exits 8, while an already
+non-zero exit code is kept.
 
 ## Limits
 
@@ -57,7 +75,7 @@ by the literal marker line `[pigi-oneshot: output truncated at 65536 bytes]`
 | `--limit` | 1–20 (default 10); no `--offset` exists |
 | `get-batch` IDs | 1–5, one handshake |
 | `messageID` | `^[A-Za-z0-9._@=+-]{1,256}$` |
-| stdout | 65,536 bytes incl. marker |
+| stdout | 65,536 bytes, always valid JSON |
 | config `account` | non-blank, ≤1024 UTF-8 bytes |
 | `senders` | 1–64 exact addresses, each ≤1024 bytes |
 | child session | one `pigi_mcp.py` process, 20 s total |
@@ -73,10 +91,13 @@ by the literal marker line `[pigi-oneshot: output truncated at 65536 bytes]`
 | 5 | upstream/transport/MCP error; stdout is `{"contentTrust":"untrusted","error":<fixed code>}` |
 | 6 | config or environment failure (missing/unsafe config, missing pinned interpreter) |
 | 7 | internal error; stderr is the fixed line `pigi-oneshot: internal error` |
+| 8 | success but output truncated; data incomplete — do not treat as complete |
 
 All stderr lines are fixed strings; mail content, arguments and exception text
 never reach stderr. `get-batch` maps per-entry outcomes to the worst exit code
-by precedence 5 > 4 > 3 > 0.
+by precedence 5 > 4 > 3 > 0. Exit 8 applies only when the command would
+otherwise exit 0; an already non-zero code (3/4/5) is kept even when the JSON
+carries `"truncated":true`.
 
 ## Configuration (never committed)
 
@@ -132,8 +153,9 @@ creating another audit object). Every `tools/call` still lands in the adapter's
   contain fewer than `limit` items (the rest counted in `filteredOut`).
 - `get-batch` is the only multi-call path: at most 5 `get` calls behind one
   handshake, sequential, same child.
-- Truncated output is intentionally invalid JSON ending in the marker line;
-  callers must not parse past it.
+- Output is always valid JSON; incomplete data is marked by
+  `"truncated":true`/`"textTruncated":true`/`"omittedItems"` and exit 8 —
+  callers must check the flags and code, not assume completeness.
 - Command output enters the caller's transcript/context; mail fields remain
   `untrusted` data and must never be executed or elevated to instructions.
 - Exit 5 covers any upstream, transport or MCP failure; the fixed `error` codes

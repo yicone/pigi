@@ -17,13 +17,21 @@ path.
 
 ## Invocation
 
-Run the pinned interpreter directly, or let the script re-exec itself with
-hardening flags (see below):
+The **only** supported launch is the launcher script (this is the command text
+the approver sees):
 
 ```sh
-/Users/tr/.pyenv/versions/3.11.13/bin/python3 -B -E -S -X utf8 \
-  /path/to/pigi/tools/pigi-mcp/pigi_oneshot.py <subcommand>
+<checkout>/tools/pigi-mcp/pigi_oneshot.sh <subcommand> …
 ```
+
+Running `python3 pigi_oneshot.py` directly — or through any other interpreter
+command line — is refused with exit 9. The reason: a Python interpreter runs
+its site hooks (`sitecustomize`, `usercustomize`, `.pth` files, `PYTHONPATH`
+modules) *before* the script's first line, so no in-script check can undo that;
+entry has to be controlled outside the script. The launcher therefore scrubs
+the environment with `env -i`, execs a pinned interpreter with
+`-I -S -B -X utf8`, and marks the run with the trusted-entry flag the script's
+gate requires (see Hardening).
 
 | Subcommand | Effect |
 | --- | --- |
@@ -98,6 +106,7 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | 6 | config or environment failure (missing/unsafe config, missing pinned interpreter) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
 | 7 | internal error | `{"contentTrust":"untrusted","error":"internal_error"}` |
 | 8 | success but output truncated; data incomplete — do not treat as complete | truncated envelope with `"truncated":true` |
+| 9 | untrusted entry — not launched by `pigi_oneshot.sh` | `{"contentTrust":"untrusted","error":"untrusted_entry"}` |
 
 `get-batch` maps per-entry outcomes to the worst exit code by precedence
 5 > 4 > 3 > 0. Exit 8 applies only when the command would otherwise exit 0; an
@@ -123,14 +132,27 @@ real mailbox and sender addresses stay out of the repo.
 
 ## Hardening
 
-On start the script checks whether it already runs with `-B -E -S -X utf8`
-(ignore environment, no site, UTF-8 stdio, no `.pyc` writes); if not, it
-re-execs the pinned interpreter `/Users/tr/.pyenv/versions/3.11.13/bin/python3`
-with those flags and an environment containing only `HOME=/Users/tr` and
-`PATH=/usr/bin:/bin:/usr/sbin:/sbin`. A missing pinned interpreter exits 6.
-Under `-S` only the script's own directory and the stdlib are importable, which
-covers its siblings (`pigi_mcp`, `transport`, `audit`) and nothing else. The
-process umask is 077.
+`pigi_oneshot.sh` (POSIX sh, mode 0755) fixes `PATH`, resets `IFS`, sets umask
+077 and unsets every interpreter-influencing variable (`BASH_ENV`, `ENV`,
+`CDPATH`, all `PYTHON*`). It then `exec env -i` a pinned interpreter
+(`/Users/tr/.pyenv/versions/3.11.13/bin/python3`) with a whitelisted
+environment — `HOME`, `PATH`, `LANG`, `LC_ALL`, and the flag
+`PIGI_ONESHOT_LAUNCHER=trusted-entry-v1` — and the flags `-I -S -B -X utf8`
+(isolated mode: ignore env vars and user site; no site processing, so no
+`sitecustomize`/`usercustomize`/`.pth`; no `.pyc` writes; UTF-8 stdio). Only
+`"$@"` passes through. If the pinned interpreter is not executable or the
+script is not a regular file, the launcher prints
+`{"contentTrust":"untrusted","error":"configuration_unavailable"}` on stdout
+and exits 6 — fail closed, before the interpreter runs.
+
+`pigi_oneshot.py` itself opens with a gate — before any import other than
+`os`/`sys` — that requires exactly that flag value *and* `sys.flags`
+`isolated`/`no_site`/`dont_write_bytecode`/`utf8_mode`; anything else exits 9
+with `{"contentTrust":"untrusted","error":"untrusted_entry"}` on stdout, so a
+bare `python3 pigi_oneshot.py` can never reach config, socket, or mail code.
+Under `-S` only the script's own directory and the stdlib are importable,
+which covers its siblings (`pigi_mcp`, `transport`, `audit`) and nothing else.
+The process umask is 077.
 
 The MCP session spawns `pigi_mcp.py --account <configured account> --socket
 <default agent.sock> --audit-db <default audit>` as a child with the same
@@ -163,5 +185,16 @@ creating another audit object). Every `tools/call` still lands in the adapter's
   callers must check the flags and code, not assume completeness.
 - Command output enters the caller's transcript/context; mail fields remain
   `untrusted` data and must never be executed or elevated to instructions.
+- Same-UID code can edit the launcher, the script, or the config — or bypass
+  this channel entirely and call `agent.sock` itself; the chain hardens the
+  *approved* entry, it is not a boundary against the local user.
+- The trusted-entry flag is a public constant, not a secret or authentication:
+  it only catches accidental/direct launches and non-isolated interpreters;
+  nothing stops same-UID code from setting it deliberately.
+- `/bin/sh` startup, the dyld/kernel exec environment, and the pinned
+  interpreter's own installation integrity are outside what the launcher can
+  control.
+- The pinned literals inside `pigi_oneshot.sh` must be edited only as rendered
+  values at rollout (the installed copy is never edited in place by tests).
 - Exit 5 covers any upstream, transport or MCP failure; the fixed `error` codes
   come from the protocol-v1 set plus `invalid_response`/`upstream_unavailable`.

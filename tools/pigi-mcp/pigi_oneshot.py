@@ -1,57 +1,63 @@
 #!/usr/bin/env python3
 """Hardened one-shot reader over the account-scoped pigi-mcp adapter. Python 3.10+, stdlib only."""
-# Only os and sys may be imported before the hardening gate: both are already
-# in sys.modules at interpreter startup, so nothing PYTHONPATH-controlled can
-# run before the re-exec below. Every other import, stdlib or sibling, must
-# wait until after the gate (under -E -S, PYTHONPATH and site are inert anyway).
+# Only os and sys may be imported before the trusted-entry gate: both are
+# already in sys.modules at interpreter startup, so nothing PYTHONPATH-
+# controlled can run before the refusal below. Every other import, stdlib or
+# sibling, must wait until after the gate — the only supported launch is
+# pigi_oneshot.sh, which scrubs the environment and marks the run.
 import os
 import sys
 
 # Pinned literals only; behavior never comes from the caller's environment.
-PINNED_PYTHON = "/Users/tr/.pyenv/versions/3.11.13/bin/python3"
 PINNED_HOME = "/Users/tr"
 PINNED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-EXEC_ENV = {"HOME": PINNED_HOME, "PATH": PINNED_PATH}
+# The launcher sets this exact flag value after scrubbing the environment.
+# It is a marker that an isolated launcher ran — a public constant, not a
+# secret or authentication.
+TRUSTED_FLAG_NAME = "PIGI_ONESHOT_LAUNCHER"
+TRUSTED_FLAG_VALUE = "trusted-entry-v1"
+EXIT_UNTRUSTED_ENTRY = 9
 # Fixed-shape error documents; every exit path emits one JSON on stdout and
 # nothing on stderr. These are plain strings because the gate below must be
 # able to emit them before the json module is safe to import.
 USAGE_ERROR_JSON = '{"contentTrust":"untrusted","error":"invalid_arguments"}'
 CONFIG_ERROR_JSON = '{"contentTrust":"untrusted","error":"configuration_unavailable"}'
 INTERNAL_ERROR_JSON = '{"contentTrust":"untrusted","error":"internal_error"}'
+UNTRUSTED_ENTRY_JSON = '{"contentTrust":"untrusted","error":"untrusted_entry"}'
 
 
-def is_hardened():
+def trusted_entry():
     flags = sys.flags
-    return bool(flags.ignore_environment and flags.no_site and flags.utf8_mode
-                and getattr(flags, "dont_write_bytecode", sys.dont_write_bytecode))
+    return (os.environ.get(TRUSTED_FLAG_NAME) == TRUSTED_FLAG_VALUE
+            and flags.isolated and flags.no_site and flags.utf8_mode
+            and getattr(flags, "dont_write_bytecode", sys.dont_write_bytecode))
 
 
-def hardened_exec_args(argv):
-    return [PINNED_PYTHON, "-B", "-E", "-S", "-X", "utf8",
-            os.path.realpath(__file__), *argv[1:]]
+if __name__ == "__main__" and not trusted_entry():
+    sys.stdout.write(UNTRUSTED_ENTRY_JSON)
+    sys.exit(EXIT_UNTRUSTED_ENTRY)
 
+# -I keeps the script's own directory off sys.path (-P semantics); re-add the
+# real directory so sibling modules resolve — never a caller-controlled path.
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
-if __name__ == "__main__" and not is_hardened():
-    if not (os.path.isfile(PINNED_PYTHON) and os.access(PINNED_PYTHON, os.X_OK)):
-        sys.stdout.write(CONFIG_ERROR_JSON)
-        sys.exit(6)
-    try:
-        os.execve(PINNED_PYTHON, hardened_exec_args(sys.argv), EXEC_ENV)
-    except OSError:
-        sys.stdout.write(CONFIG_ERROR_JSON)
-        sys.exit(6)
+try:
+    import argparse
+    import json
+    from pathlib import Path
+    import re
+    import stat
+    import subprocess
+    import time
 
-import argparse
-import json
-from pathlib import Path
-import re
-import stat
-import subprocess
-import time
-
-from audit import DEFAULT_AUDIT
-from pigi_mcp import PROTOCOL_VERSION, TRUST_NOTICE
-from transport import DEFAULT_SOCKET
+    from audit import DEFAULT_AUDIT
+    from pigi_mcp import PROTOCOL_VERSION, TRUST_NOTICE
+    from transport import DEFAULT_SOCKET
+except ImportError:
+    sys.stdout.write(CONFIG_ERROR_JSON)
+    sys.exit(6)
 
 MAX_STDOUT = 65_536
 TRUNCATION_NOTICE = "pigi-oneshot: output truncated at 65536 bytes"
@@ -470,15 +476,8 @@ def execute(argv, ctx):
 def run_main(argv):
     """Whole CLI flow as (exit_code, stdout_bytes); every failure maps to JSON."""
     try:
-        if not is_hardened():
-            if not (os.path.isfile(PINNED_PYTHON) and os.access(PINNED_PYTHON, os.X_OK)):
-                sys.stdout.write(CONFIG_ERROR_JSON)
-                return EXIT_CONFIG, b""
-            try:
-                os.execve(PINNED_PYTHON, hardened_exec_args(sys.argv), EXEC_ENV)
-            except OSError:
-                sys.stdout.write(CONFIG_ERROR_JSON)
-                return EXIT_CONFIG, b""
+        if not trusted_entry():
+            return EXIT_UNTRUSTED_ENTRY, UNTRUSTED_ENTRY_JSON.encode("ascii")
         os.umask(0o077)
         # Reject arguments before any config read or socket use.
         try:

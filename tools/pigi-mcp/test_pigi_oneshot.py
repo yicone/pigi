@@ -21,7 +21,9 @@ from pigi_mcp import TRUST_NOTICE
 import transport
 
 SCRIPT = Path(__file__).with_name("pigi_oneshot.py")
-DOCS = Path(__file__).resolve().parent.parent.parent / "docs" / "pigi-oneshot.md"
+LAUNCHER = SCRIPT.with_name("pigi_oneshot.sh")
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DOCS = REPO_ROOT / "docs" / "pigi-oneshot.md"
 ORIGINAL_PINNED_HOME = pigi_oneshot.PINNED_HOME
 ACCOUNT = "target@example.com"
 ALLOWED = "allowed@example.com"
@@ -219,15 +221,79 @@ class OneshotTests(unittest.TestCase):
     def parse(self, out):
         return json.loads(out.decode("utf-8").strip())
 
+    def trusted_env(self, extra=None):
+        env = {"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               pigi_oneshot.TRUSTED_FLAG_NAME: pigi_oneshot.TRUSTED_FLAG_VALUE}
+        if extra:
+            env.update(extra)
+        return env
+
     def cli(self, args):
         result = subprocess.run(
-            [sys.executable, "-B", "-E", "-S", "-X", "utf8", str(SCRIPT), *args],
-            capture_output=True, timeout=20,
-            env={"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *args],
+            capture_output=True, timeout=20, env=self.trusted_env())
         self.assertEqual(result.stderr, b"")
         if result.stdout:
             json.loads(result.stdout)  # always a single JSON document
         return result
+
+    def render_launcher(self, directory, python, script, home):
+        """Throwaway copy of pigi_oneshot.sh with the pinned literals replaced."""
+        rendered = Path(directory) / "pigi_oneshot.sh"
+        text = LAUNCHER.read_text()
+        for name, value in (("PIGI_OS_PYTHON", str(python)),
+                            ("PIGI_OS_SCRIPT", str(script)),
+                            ("PIGI_OS_HOME", str(home))):
+            text, count = re.subn(r"^readonly %s=.*$" % name,
+                                  "readonly %s='%s'" % (name, value), text,
+                                  count=1, flags=re.M)
+            self.assertEqual(count, 1, name)
+            self.assertEqual(text.count("readonly %s='%s'" % (name, value)), 1)
+        rendered.write_text(text)
+        os.chmod(rendered, 0o755)
+        support = Path(home) / "Library" / "Application Support"
+        assert_isolated(str(home), support / "pigi" / "oneshot.json",
+                        support / "pigi" / "agent.sock",
+                        support / "pigi-mcp" / "audit.sqlite3")
+        return rendered
+
+    def make_hooks(self):
+        """A poisoned launch environment: sitecustomize, usercustomize and a
+        .pth in the user-site tree, plus PYTHONPATH json/argparse poison —
+        every hook writes a distinct canary file. Returns (env, canaries)."""
+        hookdir = self.root / "hookdir"
+        hookdir.mkdir()
+        base = self.root / "userbase"
+        canaries = {}
+
+        def canary(name):
+            path = self.root / ("canary-" + name)
+            canaries[name] = path
+            return path
+
+        for name in ("sitecustomize", "json", "argparse"):
+            (hookdir / (name + ".py")).write_text(
+                "import os\nopen(%r, 'w').write('hit')\n" % str(canary(name)))
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import site; print(site.getusersitepackages())"],
+            capture_output=True, timeout=20,
+            env={"PYTHONUSERBASE": str(base),
+                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+        usersite = Path(probe.stdout.decode("utf-8").strip())
+        usersite.mkdir(parents=True)
+        (usersite / "usercustomize.py").write_text(
+            "import os\nopen(%r, 'w').write('hit')\n" % str(canary("usercustomize")))
+        (usersite / "canary.pth").write_text(
+            "import os; open(%r, 'w').write('pth')" % str(canary("pth")))
+        startup = hookdir / "startup.py"
+        startup.write_text("import os\nopen(%r, 'w').write('hit')\n"
+                           % str(canary("startup")))
+        env = {"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "PYTHONPATH": str(hookdir), "PYTHONUSERBASE": str(base),
+               "PYTHONSTARTUP": str(startup), "BASH_ENV": str(hookdir / "bash_env"),
+               "FOO": "poison"}
+        return env, canaries
 
     def make_home(self, name, config=None, agent=False):
         """Isolated fake HOME, optionally with a valid config and a live fake
@@ -258,7 +324,7 @@ class OneshotTests(unittest.TestCase):
         stdout, err = _BytesStdout(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(pigi_oneshot, "PINNED_HOME", str(home)))
-            stack.enter_context(patch.object(pigi_oneshot, "is_hardened", lambda: True))
+            stack.enter_context(patch.object(pigi_oneshot, "trusted_entry", lambda: True))
             stack.enter_context(patch.object(sys, "argv", ["pigi-oneshot", *argv]))
             stack.enter_context(patch.object(sys, "stdout", stdout))
             stack.enter_context(contextlib.redirect_stderr(err))
@@ -548,43 +614,139 @@ class OneshotTests(unittest.TestCase):
                             and part.left.id == "__name__" for part in node.test.values)):
                 gate = node
                 break
-        self.assertIsNotNone(gate, "missing __main__ hardening gate")
+        self.assertIsNotNone(gate, "missing __main__ trusted-entry gate")
         before = tree.body[:tree.body.index(gate)]
         defined = {node.name for node in before if isinstance(node, ast.FunctionDef)}
-        self.assertIn("is_hardened", defined)
-        self.assertIn("hardened_exec_args", defined)
+        self.assertIn("trusted_entry", defined)
         for node in before:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.assertIn(alias.name, {"os", "sys"})
             elif isinstance(node, ast.ImportFrom):
-                self.fail("module import before hardening gate: %s" % node.module)
+                self.fail("module import before trusted-entry gate: %s" % node.module)
         self.assertTrue(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                            and n.func.attr == "execve" for n in ast.walk(gate)))
+                            and n.func.attr == "exit" for n in ast.walk(gate)))
 
-    def test_unhardened_start_never_imports_environment_modules(self):
-        rogue = self.root / "rogue-site"
-        rogue.mkdir()
-        canary = self.root / "canary"
-        for name in ("json.py", "argparse.py"):
-            (rogue / name).write_text(
-                "import pathlib\npathlib.Path(%r).write_text('hit')\n"
-                "raise SystemExit(88)\n" % str(canary))
-        result = subprocess.run(
-            [sys.executable, "-B", str(SCRIPT), "list"],
-            capture_output=True, timeout=20, cwd=self.temp.name,
-            env={"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                 "PYTHONPATH": str(rogue)})
-        self.assertFalse(canary.exists())
-        self.assertNotEqual(result.returncode, 88)
-        # 2 when the pinned interpreter exists (hardened child rejects `list`),
-        # 6 where it is absent; either way the rogue modules never ran.
-        self.assertIn(result.returncode, {2, 6})
+    def test_direct_launch_refused_exit_nine(self):
+        env, canaries = self.make_hooks()
+        result = subprocess.run([sys.executable, str(SCRIPT), "list"],
+                                capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(result.stdout,
+                         b'{"contentTrust":"untrusted","error":"untrusted_entry"}')
         self.assertEqual(result.stderr, b"")
-        if result.returncode == 2:
-            self.assertEqual(self.parse(result.stdout), USAGE_DOC)
-        elif result.returncode == 6:
-            self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
+        # Site hooks may already have run — the documented pre-first-line limit —
+        # but the refusal happens before parse/config/socket.
+        self.assertTrue(canaries["sitecustomize"].exists())
+        self.assertEqual(self.agent.requests, [])
+
+    def test_direct_launch_gate_variants(self):
+        env, _ = self.make_hooks()
+        # Launcher flag set but interpreter not isolated -> still refused.
+        flagged = dict(env)
+        flagged[pigi_oneshot.TRUSTED_FLAG_NAME] = pigi_oneshot.TRUSTED_FLAG_VALUE
+        result = subprocess.run([sys.executable, str(SCRIPT), "list"],
+                                capture_output=True, timeout=20, env=flagged)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(result.stderr, b"")
+        # Isolation flags but no launcher flag -> refused.
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+            capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 9)
+        self.assertEqual(result.stderr, b"")
+        # Flag plus all isolation flags -> passes the gate, rejects `list`.
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+            capture_output=True, timeout=20, env=flagged)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertEqual(result.stderr, b"")
+
+    def test_launcher_blocks_environment_hooks(self):
+        home, _ = self.make_home("launch-home")
+        launcher = self.render_launcher(self.root, sys.executable, SCRIPT, home)
+        env, canaries = self.make_hooks()
+        for argv in (["list"], ["--account", "x"]):
+            with self.subTest(argv=argv):
+                result = subprocess.run([str(launcher), *argv],
+                                        capture_output=True, timeout=20, env=env)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+                self.assertEqual(result.stderr, b"")
+        for name, path in canaries.items():
+            self.assertFalse(path.exists(), name)
+
+    def test_launcher_child_environment_fixed_and_args_verbatim(self):
+        home, _ = self.make_home("probe-home")
+        probe = self.root / "probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            "sys.stdout.write(json.dumps({\n"
+            "    'env': dict(os.environ),\n"
+            "    'flags': {'isolated': bool(sys.flags.isolated),\n"
+            "              'no_site': bool(sys.flags.no_site),\n"
+            "              'dont_write_bytecode': bool(sys.flags.dont_write_bytecode),\n"
+            "              'utf8_mode': bool(sys.flags.utf8_mode)},\n"
+            "    'argv': sys.argv[1:]}))\n")
+        launcher = self.render_launcher(self.root, sys.executable, probe, home)
+        env, _ = self.make_hooks()
+        args = ["a b", "qu'ote", "$HOME", "a;b", 'x"y']
+        result = subprocess.run([str(launcher), *args],
+                                capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        doc = json.loads(result.stdout)
+        # macOS libSystem synthesizes __CF_USER_TEXT_ENCODING inside the new
+        # process after exec; it is OS-injected, not inherited — env -i cannot
+        # remove it. Everything else must be exactly the launcher whitelist.
+        keys = set(doc["env"]) - {"__CF_USER_TEXT_ENCODING"}
+        self.assertEqual(keys,
+                         {"HOME", "PATH", "LANG", "LC_ALL", "PIGI_ONESHOT_LAUNCHER"})
+        for poison in ("PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
+                       "PYTHONHOME", "BASH_ENV", "FOO"):
+            self.assertNotIn(poison, doc["env"])
+        self.assertEqual(doc["env"]["HOME"], str(home))
+        self.assertEqual(doc["env"]["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(doc["env"]["PIGI_ONESHOT_LAUNCHER"], "trusted-entry-v1")
+        self.assertEqual(doc["flags"], {"isolated": True, "no_site": True,
+                                        "dont_write_bytecode": True,
+                                        "utf8_mode": True})
+        self.assertEqual(doc["argv"], args)
+
+    def test_launcher_fails_closed(self):
+        home, _ = self.make_home("closed-home")
+        d1, d2 = self.root / "r1", self.root / "r2"
+        d1.mkdir()
+        d2.mkdir()
+        launcher = self.render_launcher(d1, self.root / "no-such-python", SCRIPT, home)
+        result = subprocess.run([str(launcher), "accounts"],
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 6)
+        self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
+        self.assertEqual(result.stderr, b"")
+        launcher = self.render_launcher(d2, sys.executable,
+                                        self.root / "no-such-script.py", home)
+        result = subprocess.run([str(launcher), "accounts"],
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 6)
+        self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
+        self.assertEqual(result.stderr, b"")
+
+    def test_launcher_source_and_mode(self):
+        self.assertTrue(os.access(LAUNCHER, os.X_OK))
+        listing = subprocess.run(
+            ["git", "ls-files", "-s", "tools/pigi-mcp/pigi_oneshot.sh"],
+            capture_output=True, text=True, cwd=REPO_ROOT).stdout
+        if listing.strip():  # indexed in this checkout
+            self.assertTrue(listing.startswith("100755"), listing)
+        source = LAUNCHER.read_text()
+        self.assertNotIn("eval", source)
+        self.assertNotIn("SSH_ORIGINAL_COMMAND", source)
+        self.assertIn("env -i", source)
+        self.assertIn("-I -S -B", source)
+        self.assertIn("umask 077", source)
+        self.assertNotIn("execve", SCRIPT.read_text())
 
     def test_get_batch_all_denied_exact_filtered_shape(self):
         self.table["get"] = lambda params: get_result(
@@ -615,6 +777,8 @@ class OneshotTests(unittest.TestCase):
         self.assertIn('"error":"invalid_arguments"', doc)
         self.assertIn('"error":"configuration_unavailable"', doc)
         self.assertIn('"error":"internal_error"', doc)
+        self.assertIn('"error":"untrusted_entry"', doc)
+        self.assertIn("| 9 |", doc)
         self.assertIn("stderr", doc)
 
     def test_config_loader_fails_closed(self):
@@ -668,16 +832,17 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(config["account"], ACCOUNT)
         self.assertEqual(config["senders"], frozenset({ALLOWED, OTHER}))
 
-    def test_hardening_helpers(self):
-        self.assertFalse(pigi_oneshot.is_hardened())
-        args = pigi_oneshot.hardened_exec_args(["prog", "search", "--limit", "3"])
-        self.assertEqual(args, [pigi_oneshot.PINNED_PYTHON, "-B", "-E", "-S", "-X",
-                                "utf8", os.path.realpath(pigi_oneshot.__file__),
-                                "search", "--limit", "3"])
-        self.assertEqual(pigi_oneshot.EXEC_ENV,
-                         {"HOME": pigi_oneshot.PINNED_HOME,
-                          "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
-        self.assertEqual(set(pigi_oneshot.EXEC_ENV), {"HOME", "PATH"})
+    def test_trusted_entry_gate(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(pigi_oneshot.trusted_entry())
+        # The flag alone is not enough: this test process is not isolated.
+        with patch.dict(os.environ, {pigi_oneshot.TRUSTED_FLAG_NAME:
+                                     pigi_oneshot.TRUSTED_FLAG_VALUE},
+                        clear=True):
+            self.assertFalse(pigi_oneshot.trusted_entry())
+        self.assertEqual(pigi_oneshot.TRUSTED_FLAG_NAME, "PIGI_ONESHOT_LAUNCHER")
+        self.assertEqual(pigi_oneshot.TRUSTED_FLAG_VALUE, "trusted-entry-v1")
+        self.assertEqual(pigi_oneshot.EXIT_UNTRUSTED_ENTRY, 9)
 
     def test_transport_failures_exit_five_without_leaks(self):
         self.table["accounts"] = lambda params: accounts_result()
@@ -722,7 +887,7 @@ class OneshotTests(unittest.TestCase):
         self.assertTrue(str(self.ctx.socket_path).startswith(self.temp.name))
         domains = {"example.com", "example.org", "example.net"}
         pattern = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
-        for path in (SCRIPT, Path(__file__), DOCS):
+        for path in (SCRIPT, LAUNCHER, Path(__file__), DOCS):
             self.assertTrue(path.exists(), path)
             for match in pattern.finditer(path.read_text()):
                 self.assertIn(match.group(1).lower(), domains, (path, match.group(0)))
@@ -741,10 +906,9 @@ class OneshotTests(unittest.TestCase):
         for argv in cases:
             with self.subTest(argv=argv):
                 merged = subprocess.run(
-                    [sys.executable, "-B", "-E", "-S", "-X", "utf8", str(SCRIPT), *argv],
+                    [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *argv],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
-                    env={"HOME": self.temp.name,
-                         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+                    env=self.trusted_env())
                 self.assertEqual(merged.returncode, 2)
                 # stdout+stderr merged is still exactly the one JSON document.
                 self.assertEqual(json.loads(merged.stdout), USAGE_DOC)

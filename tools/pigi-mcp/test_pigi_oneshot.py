@@ -52,14 +52,52 @@ def real_homes():
             os.path.realpath(ORIGINAL_PINNED_HOME)}
 
 
+_NATIVE_MAGICS = frozenset({
+    b"\x7fELF",                            # ELF
+    b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",  # Mach-O big-endian 32/64-bit
+    b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe",  # Mach-O little-endian 32/64-bit
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",  # Mach-O fat/universal
+})
+# The newest feature the wrapper code uses is bytes.removesuffix (3.9).
+MIN_TEST_PYTHON = (3, 9)
+TEST_PYTHON_CANDIDATES = ("/opt/homebrew/bin/python3",
+                          "/usr/local/bin/python3", "/usr/bin/python3")
+
+
+def _is_native_binary(path):
+    """True when the first bytes are Mach-O or ELF magic — a real executable,
+    never a #! script or other text wrapper around one."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4)
+    except OSError:
+        return False
+    return head in _NATIVE_MAGICS
+
+
 def check_interpreter(interpreter):
-    """Refuse the pinned production interpreter path in any spelling."""
+    """Refuse the pinned production interpreter in any spelling, and refuse
+    any script/wrapper standing in for an interpreter — only a native binary
+    may be spawned or rendered into a launcher."""
     forbidden = {os.path.normpath(PINNED_LAUNCHER_PYTHON),
                  os.path.realpath(PINNED_LAUNCHER_PYTHON)}
     if (os.path.normpath(interpreter) in forbidden
             or os.path.realpath(interpreter) in forbidden):
         raise AssertionError("refusing pinned production interpreter: %s"
                              % interpreter)
+    if os.path.exists(interpreter) and not _is_native_binary(interpreter):
+        raise AssertionError("refusing non-native interpreter path: %s"
+                             % interpreter)
+
+
+def validate_test_interpreter(path):
+    """Static checks only — the candidate is never executed here."""
+    if not path or not os.path.isfile(path):
+        raise AssertionError("test interpreter is not a file: %r" % path)
+    if not os.access(path, os.X_OK):
+        raise AssertionError("test interpreter not executable: %s" % path)
+    check_interpreter(path)
+    return path
 
 
 def assert_isolated(home, config_path, socket_path, audit_db, interpreter=None):
@@ -101,29 +139,62 @@ def pick_temp_root():
 _SYNTHETIC_PYTHON = None
 
 
-def synthetic_python():
-    """A python executable that is never the pinned production path.
+def _test_python_version(path):
+    """version_info[:2] of a validated interpreter via a fast probe, or None."""
+    try:
+        probe = subprocess.run(
+            [path, "-I", "-S", "-c",
+             "import sys; print('%d %d' % sys.version_info[:2])"],
+            capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if probe.returncode != 0:
+        return None
+    parts = probe.stdout.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
 
-    On machines where sys.executable IS the pinned interpreter, return a
-    /bin/sh shim in a temp dir that execs the real one — argv[0] never carries
-    the pinned literal while the interpreter behavior stays identical."""
+
+def synthetic_python():
+    """Resolve a confirmed NON-production interpreter for subprocesses.
+
+    The test-runner process itself may legitimately be the pinned interpreter
+    on machines where the suite is launched with it — the guarantee here is
+    only that no subprocess and no rendered launcher ever uses the pinned
+    binary or a wrapper around it. Candidates are tried in order: an explicit
+    PIGI_TEST_PYTHON override, sys.executable, then the fixed fallbacks.
+    A set-but-invalid override fails closed rather than silently falling
+    through; when nothing qualifies the suite raises instead of creating any
+    file or temp dir."""
     global _SYNTHETIC_PYTHON
-    if _SYNTHETIC_PYTHON is None:
+    if _SYNTHETIC_PYTHON is not None:
+        return _SYNTHETIC_PYTHON
+    override = os.environ.get("PIGI_TEST_PYTHON")
+    candidates = ([override] if override
+                  else [sys.executable, *TEST_PYTHON_CANDIDATES])
+    errors = []
+    for candidate in candidates:
         try:
-            check_interpreter(sys.executable)
-            _SYNTHETIC_PYTHON = sys.executable
-        except AssertionError:
-            bindir = os.path.join(tempfile.mkdtemp(prefix="po-py-",
-                                                   dir=pick_temp_root()),
-                                  "bin")
-            os.mkdir(bindir)
-            path = os.path.join(bindir, "python3")
-            with open(path, "w") as handle:
-                handle.write("#!/bin/sh\nexec %r \"$@\"\n"
-                             % os.path.realpath(sys.executable))
-            os.chmod(path, 0o755)
-            _SYNTHETIC_PYTHON = path
-    return _SYNTHETIC_PYTHON
+            validate_test_interpreter(candidate)
+        except AssertionError as exc:
+            errors.append(str(exc))
+            continue
+        version = _test_python_version(candidate)
+        if version is not None and version >= MIN_TEST_PYTHON:
+            _SYNTHETIC_PYTHON = candidate
+            return candidate
+        errors.append("%s unusable or older than %s: %r"
+                      % (candidate, MIN_TEST_PYTHON, version))
+    if override:
+        raise AssertionError("PIGI_TEST_PYTHON rejected: %s"
+                             % "; ".join(errors))
+    raise AssertionError("no non-production python interpreter available; "
+                         "set PIGI_TEST_PYTHON (tried: %s)"
+                         % "; ".join(errors))
 
 
 def setUpModule():
@@ -803,11 +874,8 @@ class OneshotTests(unittest.TestCase):
         doc = json.loads(result.stdout)
         # macOS libSystem synthesizes __CF_USER_TEXT_ENCODING inside the new
         # process after exec; it is OS-injected, not inherited — env -i cannot
-        # remove it. The synthetic_python() shim's /bin/sh likewise exports
-        # PWD/SHLVL before it execs the real interpreter — a test-fixture
-        # artifact, not something the launcher sets. Everything else must be
-        # exactly the launcher whitelist.
-        keys = set(doc["env"]) - {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL"}
+        # remove it. Everything else must be exactly the launcher whitelist.
+        keys = set(doc["env"]) - {"__CF_USER_TEXT_ENCODING"}
         self.assertEqual(keys,
                          {"HOME", "PATH", "LANG", "LC_ALL", "PIGI_ONESHOT_LAUNCHER"})
         for poison in ("PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
@@ -842,27 +910,32 @@ class OneshotTests(unittest.TestCase):
             sub = tempfile.mkdtemp(prefix=tag + "-", dir=self.temp.name)
             return self.render_launcher(sub, python, script, home)
 
-        # (a) executable garbage text file: exec fallback reports 127 -> exit 6.
-        garbage = self.root / "garbage"
-        garbage.write_text("this is not a script or binary\n")
-        os.chmod(garbage, 0o755)
-        merged, split = self.launch(render(garbage, tag="a"), ["accounts"])
+        # (a) a corrupted-but-executable binary: native magic prefix with no
+        # real program behind it — passes the guard's native-binary rule, then
+        # exec itself fails (126/127) -> exit 6.
+        stub = self.root / "macho-stub"
+        stub.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 60)
+        os.chmod(stub, 0o755)
+        merged, split = self.launch(render(stub, tag="a"), ["accounts"])
         self.assert_json_contract(merged, split, 6, CONFIG_DOC)
 
-        # (b) interpreter that executes but exits 127 -> exit 6.
-        exit127 = self.root / "exit127"
-        exit127.write_text("#!/bin/sh\nexit 127\n")
-        os.chmod(exit127, 0o755)
-        merged, split = self.launch(render(exit127, tag="b"), ["accounts"])
+        # (b) a real interpreter whose run exits 127 -> exit 6.
+        exit127 = self.root / "exit127.py"
+        exit127.write_text("import sys; sys.exit(127)\n")
+        merged, split = self.launch(
+            render(synthetic_python(), exit127, tag="b"), ["accounts"])
         self.assert_json_contract(merged, split, 6, CONFIG_DOC)
 
-        # (c) interpreter that prints junk to stdout+stderr then dies on a
+        # (c) the interpreter writes junk to stdout+stderr then dies on a
         # signal -> exit 7, captured junk never surfaces.
-        killer = self.root / "killer"
-        killer.write_text("#!/bin/sh\necho JUNK-OUT\necho JUNK-ERR >&2\n"
-                          "kill -SEGV $$\nexit 139\n")
-        os.chmod(killer, 0o755)
-        merged, split = self.launch(render(killer, tag="c"), ["accounts"])
+        crash = self.root / "crash.py"
+        crash.write_text(
+            "import os, sys\n"
+            "sys.stdout.write('JUNK-OUT'); sys.stdout.flush()\n"
+            "sys.stderr.write('JUNK-ERR'); sys.stderr.flush()\n"
+            "os.kill(os.getpid(), 11)\n")
+        merged, split = self.launch(
+            render(synthetic_python(), crash, tag="c"), ["accounts"])
         self.assert_json_contract(merged, split, 7, INTERNAL_DOC)
         self.assertNotIn(b"JUNK", merged.stdout)
         self.assertNotIn(b"JUNK", split.stdout)
@@ -1191,6 +1264,84 @@ class OneshotTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 self.run_python([pinned, "--version"])
         mock_run.assert_not_called()
+
+    def test_validate_test_interpreter_rejects_wrappers(self):
+        pinned_real = os.path.realpath(PINNED_LAUNCHER_PYTHON)
+        # A shim that merely execs the real binary is not an interpreter.
+        shim = self.root / "shim"
+        shim.write_text("#!/bin/sh\nexec '%s' \"$@\"\n" % pinned_real)
+        os.chmod(shim, 0o755)
+        with self.assertRaises(AssertionError):
+            validate_test_interpreter(str(shim))
+        # The guard blocks it before a launcher is rendered or a spawn runs.
+        outdir = self.root / "no-render"
+        outdir.mkdir()
+        home = self.root / "shim-home"
+        home.mkdir()
+        with self.assertRaises(AssertionError):
+            self.render_launcher(outdir, shim, SCRIPT, home)
+        self.assertEqual(list(outdir.iterdir()), [])
+        with patch.object(subprocess, "run") as mock_run:
+            with self.assertRaises(AssertionError):
+                self.run_python([str(shim), "--version"])
+        mock_run.assert_not_called()
+        # A symlink to the pinned binary fails the realpath rule.
+        link = self.root / "python-link"
+        link.symlink_to(pinned_real)
+        with self.assertRaises(AssertionError):
+            validate_test_interpreter(str(link))
+        # Missing or non-executable candidates fail statically.
+        with self.assertRaises(AssertionError):
+            validate_test_interpreter(str(self.root / "absent"))
+        plain = self.root / "plain"
+        plain.write_text("")
+        os.chmod(plain, 0o644)
+        with self.assertRaises(AssertionError):
+            validate_test_interpreter(str(plain))
+
+    def test_synthetic_python_result_is_native_nonproduction(self):
+        chosen = synthetic_python()
+        self.assertEqual(validate_test_interpreter(chosen), chosen)
+        self.assertNotEqual(os.path.realpath(chosen),
+                            os.path.realpath(PINNED_LAUNCHER_PYTHON))
+        with open(chosen, "rb") as handle:
+            self.assertNotEqual(handle.read(2), b"#!")
+
+    def test_synthetic_python_fails_closed(self):
+        pinned = PINNED_LAUNCHER_PYTHON
+        link = self.root / "cand-link"
+        link.symlink_to(os.path.realpath(pinned))
+        shim = self.root / "cand-shim"
+        shim.write_text("#!/bin/sh\nexec '%s' \"$@\"\n"
+                        % os.path.realpath(pinned))
+        os.chmod(shim, 0o755)
+        module = sys.modules[__name__]
+        env = {k: v for k, v in os.environ.items()
+               if k != "PIGI_TEST_PYTHON"}
+        before = set(os.listdir(self.temp.name))
+        with patch.object(module, "_SYNTHETIC_PYTHON", None), \
+                patch.dict(os.environ, env, clear=True), \
+                patch.object(sys, "executable", pinned), \
+                patch.object(module, "TEST_PYTHON_CANDIDATES",
+                             (str(link), str(shim))), \
+                patch.object(tempfile, "mkdtemp") as mock_mkdtemp:
+            with self.assertRaises(AssertionError):
+                synthetic_python()
+        mock_mkdtemp.assert_not_called()
+        self.assertEqual(set(os.listdir(self.temp.name)), before)
+
+    def test_pigi_test_python_override_fails_closed(self):
+        module = sys.modules[__name__]
+        shim = self.root / "env-shim"
+        shim.write_text("#!/bin/sh\nexec '%s' \"$@\"\n"
+                        % os.path.realpath(PINNED_LAUNCHER_PYTHON))
+        os.chmod(shim, 0o755)
+        for bad in (PINNED_LAUNCHER_PYTHON, str(shim)):
+            with self.subTest(bad=bad), \
+                    patch.object(module, "_SYNTHETIC_PYTHON", None), \
+                    patch.dict(os.environ, {"PIGI_TEST_PYTHON": bad}):
+                with self.assertRaises(AssertionError):
+                    synthetic_python()
 
     def test_fixture_socket_paths_stay_short(self):
         # AF_UNIX sun_path is 104 bytes on macOS; a long TMPDIR must surface as

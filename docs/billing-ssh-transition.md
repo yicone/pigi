@@ -1,8 +1,8 @@
 # Billing transitional read access over restricted SSH (ACM-963)
 
 Temporary bridge until the long-term token-auth design (ACM-962) lands. It gives
-the Grok Bot **Billing** read-only access to the approved account
-`adhielgona@gmail.com` through the running pigi App's `agent.sock`. Nothing here
+the Grok Bot **Billing** read-only access to the approved target mailbox
+`<target-mailbox>` through the running pigi App's `agent.sock`. Nothing here
 grants unrestricted shell access to the mini: the only deliverable to the SSH
 layer is one pinned forced command.
 
@@ -21,7 +21,7 @@ Billing MCP host (shared Linux box)
                       └─ pigi_forced_command.sh  (never executes the client command)
                            └─ wire contract: <python> -B <script> --account <acct>
                            └─ execs ONLY: python3 -B -E -S -X utf8 pigi_mcp.py
-                                          --account adhielgona@gmail.com
+                                          --account <target-mailbox>
                                 └─ agent.sock (0600, getpeereid same-UID)
                                      └─ App LocalEngine.agentRead (read grant + scoped_accounts + audit)
 ```
@@ -71,13 +71,44 @@ from="<billing-src>",restrict,command="/Users/tr/.ssh/pigi_forced_command.sh" ss
 The pinned pipeline uses the deployed checkout
 `~/Workspace/pigi/tools/pigi-mcp/pigi_mcp.py` and interpreter
 `/Users/tr/.pyenv/versions/3.11.13/bin/python3` — the adapter requires Python
-3.10+; the system `/usr/bin/python3` is 3.9.6 and is NOT used. The interpreter
+3.10+; the system `/usr/bin/python3` is 3.9.6 and is not the adapter. The interpreter
 path must be a real executable, not a pyenv shim. If the checkout moves, update
 the installed script's `PIGI_MCP_SCRIPT` literal and redeploy it; the
 `SSH_ORIGINAL_COMMAND` comparison is a byte-exact match against the wire
-contract `<python> -B <script> --account <account>` — the remote launcher sends
+contract `<python> -B <script> --account <target-mailbox>` — the remote launcher sends
 exactly that string, and the forced command adds its own `-E -S -X utf8`
-hardening flags when it re-execs the interpreter.
+hardening flags when it re-execs the interpreter. `<target-mailbox>` is the
+`account` value from the outside config below, not a literal in the script.
+The system `/usr/bin/python3` (3.9.6) is still not the adapter interpreter.
+The forced command uses it only as `python3 -I -B` to read that config; if
+the reader is missing or the config check fails, the script refuses before
+`pigi_mcp.py` starts.
+
+## Pinned mailbox config (outside the repo)
+
+The mailbox is not committed. At start the forced command reads it from the
+pinned `PIGI_FC_HOME` literal — never from the process environment's `HOME`:
+
+`~/Library/Application Support/pigi/oneshot.json`
+
+That is the same path and JSON shape pigi-oneshot uses (`docs/pigi-oneshot.md`).
+For the pinned home on this mini the file is
+`$PIGI_FC_HOME/Library/Application Support/pigi/oneshot.json`.
+
+```json
+{"account": "<target-mailbox>", "senders": ["<allowed-sender>"]}
+```
+
+The file must be a regular file, mode exactly 0600, a single hard link, owned
+by the effective user, and not a symlink. It is opened with `O_NOFOLLOW` and
+checked with `fstat` before reading. Its parent directory must be a real
+directory owned by that user and not group- or world-writable. A missing file,
+unsafe mode, bad owner, extra link, symlink, unreadable file, malformed JSON,
+or wrong shape refuses execution before the ledger is created and before
+`pigi_mcp.py` starts. The account must also be a single line (no NUL, CR, or
+LF) so it can be compared with `SSH_ORIGINAL_COMMAND`. This change does not
+create, read, or modify the real file. The Billing launcher's `--account`
+must be that same value.
 
 ## Trust conditions verified at rollout (before authorized_keys is installed)
 
@@ -100,8 +131,10 @@ hardening flags when it re-execs the interpreter.
   test — but the passed HOME is still a trust surface for the script's own
   future use, which is why `PIGI_FC_HOME` is a literal and the ledger path is
   a literal rather than `$HOME`-derived.
-- Authorization inputs are `readonly` literals; environment overrides were
-  removed. The offline harness reproduced the old env-override path — that
+- The mailbox is read from the oneshot file above, under the pinned
+  `PIGI_FC_HOME` literal, never from the environment. The other authorization
+  inputs remain `readonly` literals; environment overrides stay removed.
+  The offline harness reproduced the old env-override path — that
   proved only the script honored env, not that sshd would pass client env.
   Whether sshd passes client-supplied environment at all is an sshd-side
   property verified at rollout via the checks above — offline tests do not
@@ -172,13 +205,15 @@ Billing MCP host stdio entry (exact path per Billing conventions):
   "args": ["/opt/pigi-mcp/remote_pigi_mcp.py",
            "--host", "tr-mini-m4-pigi",
            "--remote-script", "/Users/tr/Workspace/pigi/tools/pigi-mcp/pigi_mcp.py",
-           "--account", "adhielgona@gmail.com",
+           "--account", "<target-mailbox>",
            "--remote-python", "/Users/tr/.pyenv/versions/3.11.13/bin/python3"]
 }
 ```
 
-The `--account`, `--remote-script`, and `--remote-python` args must match the
-forced command's pinned string verbatim, or the request is logged and refused.
+The `--remote-script` and `--remote-python` args must match the forced
+command's pinned literals verbatim. `--account` must match the `account`
+field in the mini's oneshot config (the placeholder `<target-mailbox>` above),
+not a value stored in the repo. Otherwise the request is logged and refused.
 
 ## Gates and rollout order (each needs its own numbered approval)
 

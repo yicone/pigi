@@ -1,11 +1,12 @@
 #!/bin/sh
 # Offline self-test for pigi_forced_command.sh (ACM-963 rework, ACM-965/966).
 #
-# Method: render a throwaway copy whose five pinned literals are replaced with
-# synthetic values (the installed production file is never modified), drive it
-# with stub interpreters under a resolved temporary scratch dir and hostile
-# environment. Never opens agent.sock, the App, mail.db, keychains, or real
-# audit ledgers; never touches real HOME data.
+# Method: render a throwaway copy whose four pinned literals are replaced with
+# synthetic values, and whose mailbox comes from a synthetic oneshot.json under
+# that copy's pinned home (the installed production file is never modified).
+# Drive it with stub interpreters under a resolved temporary scratch dir and
+# hostile environment. Never opens agent.sock, the App, mail.db, keychains, or
+# real audit ledgers; never touches real HOME data.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +31,18 @@ LOGDIR="$TMP/led"
 LOG="$LOGDIR/forced-command.log"
 mkdir -m 700 "$LOGDIR"
 
+# Synthetic oneshot.json under a pinned home. Mode 0600, parent 0700.
+# Never points at the real Application Support directory.
+install_config() { # install_config <home>
+    base="$1/Library/Application Support/pigi"
+    mkdir -p "$base"
+    chmod 700 "$1" "$1/Library" "$1/Library/Application Support" "$base"
+    printf '{"account":"%s","senders":["allowed@example.invalid"]}\n' "$ACCOUNT" \
+        > "$base/oneshot.json"
+    chmod 600 "$base/oneshot.json"
+}
+install_config "$THOME"
+
 # Render a test copy: identical logic, synthetic pinned constants only.
 render() { # render <name> <log-path> [python] [script] [home]
     out="$TMP/fc-$1.sh"
@@ -37,12 +50,11 @@ render() { # render <name> <log-path> [python] [script] [home]
     sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$hm'|" \
         -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$py'|" \
         -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$sc'|" \
-        -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
         -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$2'|" \
         "$FC" > "$out"
     chmod 700 "$out"
-    grep -q "readonly PIGI_MCP_ACCOUNT='$ACCOUNT'" "$out" || {
-        echo "render failed: pinned literal not substituted" >&2; exit 2; }
+    grep -q 'readonly PIGI_MCP_ACCOUNT="$_pigi_fc_account"' "$out" || {
+        echo "render failed: account must stay config-backed" >&2; exit 2; }
     printf %s "$out"
 }
 
@@ -246,6 +258,7 @@ check 'fail-closed: deterministic descriptor-open failure refuses' $?
 TESTPY="$(command -v python3 || true)"
 if [ -n "$TESTPY" ]; then
     PYHOME="$TMP/py-home"; mkdir -m 700 "$PYHOME"
+    install_config "$PYHOME"
     PYSNIPE="$TMP/pysnipe.py"; printf 'print("STUB-EXECUTED")\n' > "$PYSNIPE"
     usite=$(env HOME="$PYHOME" "$TESTPY" -c 'import site; print(site.getusersitepackages())' 2>/dev/null) || usite=
     if [ -n "$usite" ]; then
@@ -364,7 +377,6 @@ render_hook() { # render_hook <name> <log> <anchor-substring> <injected-line>
     sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
         -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
         -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
-        -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
         -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$2'|" \
         "$FC" | awk -v anchor="$3" -v ins="$4" \
         'index($0,anchor){print ins} {print}' > "$out"
@@ -510,7 +522,6 @@ pfc="$TMP/fc-rm.sh"
 sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
     -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
     -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
-    -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
     -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$rlogm'|" \
     -e 's|/usr/bin/perl|/nonexistent-synthetic-perl|g' \
     "$FC" > "$pfc"; chmod 700 "$pfc"
@@ -636,17 +647,23 @@ for cand in "$(awk -F"'" '/^readonly PIGI_MCP_PYTHON=/{print $2}' "$FC")" \
 done
 if [ -n "$TESTPY" ]; then
     adhome="$TMP/adhome"; mkdir -m 700 "$adhome"
+    install_config "$adhome"
     adled="$TMP/adled"; mkdir -m 700 "$adled"; adlog="$adled/forced-command.log"
     adfc="$(render adapter "$adlog" "$TESTPY" "$ROOT/pigi_mcp.py" "$adhome")"
     EXPAD="$TESTPY -B $ROOT/pigi_mcp.py --account $ACCOUNT"
     run "$adfc" "$EXPAD" </dev/null
     created_f=$(cd "$adhome" && find . -type f | sort)
     created_d=$(cd "$adhome" && find . -type d | sort)
+    # oneshot.json is the synthetic fixture planted before the run. The adapter
+    # itself still adds only the inventoried audit database.
+    expected_f='./Library/Application Support/pigi-mcp/audit.sqlite3
+./Library/Application Support/pigi/oneshot.json'
     expected_d='.
 ./Library
 ./Library/Application Support
+./Library/Application Support/pigi
 ./Library/Application Support/pigi-mcp'
-    { [ "$created_f" = './Library/Application Support/pigi-mcp/audit.sqlite3' ] \
+    { [ "$created_f" = "$expected_f" ] \
         && [ "$created_d" = "$expected_d" ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp")" = 700 ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp/audit.sqlite3")" = 600 ]; }
@@ -654,6 +671,17 @@ if [ -n "$TESTPY" ]; then
 else
     check 'runtime-objects: python3 present for adapter probe' 1
 fi
+
+# -- 18. Missing outside config refuses before any pipeline ------------------
+nohome="$TMP/no-config-home"; mkdir -m 700 "$nohome"
+nologdir="$TMP/no-config-led"; mkdir -m 700 "$nologdir"
+nolog="$nologdir/forced-command.log"
+nofc="$(render noconfig "$nolog" "$STUB" "$SCRIPT_PATH" "$nohome")"
+run "$nofc" "$EXPECTED"
+{ [ "$RC" -eq 1 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && grep -q 'configuration unavailable' "$ERR" \
+    && [ ! -e "$nolog" ]; }
+check 'fail-closed: missing oneshot config refuses, stub not run' $?
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

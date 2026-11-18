@@ -7,7 +7,8 @@
 # fail-closed ledger, and execs only the fixed pipeline. No code path runs
 # attacker-controlled input.
 #
-# Authorization inputs are the literals below only — never the environment.
+# Authorization inputs are the literals below, plus the mailbox read from
+# oneshot.json under the pinned PIGI_FC_HOME — never the environment.
 # The pinned interpreter is re-exec'd via `env -i` with -E -S -X utf8: no
 # PYTHON* variables, no site processing (no user/global site-packages, no .pth
 # or other startup files), explicit UTF-8 stdio; imports resolve to the
@@ -23,12 +24,12 @@ unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
 trap '' XFSZ 2>/dev/null || true
 
 # --- pinned configuration (production literals) ---
-# The offline self-test renders a throwaway copy with these five values
-# replaced; it never edits this installed file.
+# The offline self-test renders a throwaway copy with these four values
+# replaced; it never edits this installed file. The mailbox is not a literal:
+# it is read from oneshot.json under PIGI_FC_HOME before any command is served.
 readonly PIGI_FC_HOME='/Users/tr'
 readonly PIGI_MCP_PYTHON='/Users/tr/.pyenv/versions/3.11.13/bin/python3'
 readonly PIGI_MCP_SCRIPT='/Users/tr/Workspace/pigi/tools/pigi-mcp/pigi_mcp.py'
-readonly PIGI_MCP_ACCOUNT='adhielgona@gmail.com'
 readonly PIGI_FC_LOG='/Users/tr/Library/Application Support/pigi/forced-command.log'
 # --- end pinned configuration ---
 
@@ -194,6 +195,62 @@ ledger_prepare() {
     ledger_bound || return 1
     return 0
 }
+
+# Same file and checks as pigi-oneshot's load_config, resolved from the pinned
+# home rather than the environment. A failure refuses before the ledger or the
+# pipeline. The reader is isolated system python so a stub pinned interpreter
+# cannot skip the check; its stderr is discarded. The account must be one line
+# so the SSH comparison stays a single string.
+cfg="$PIGI_FC_HOME/Library/Application Support/pigi/oneshot.json"
+_pigi_fc_account=$(/usr/bin/python3 -I -B - "$cfg" 2>/dev/null <<'PY'
+import json, os, stat, sys
+
+def fail():
+    raise SystemExit(1)
+
+try:
+    flag = getattr(os, "O_NOFOLLOW", 0)
+    if not flag:
+        fail()
+    path = sys.argv[1]
+    parent = os.path.dirname(path)
+    st = os.lstat(parent)
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+            or stat.S_IMODE(st.st_mode) & 0o022):
+        fail()
+    fd = os.open(path, os.O_RDONLY | flag)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            fail()
+        data = os.read(fd, 65537)
+        if len(data) > 65536:
+            fail()
+    finally:
+        os.close(fd)
+    doc = json.loads(data)
+    if not isinstance(doc, dict) or set(doc) != {"account", "senders"}:
+        fail()
+    account, senders = doc["account"], doc["senders"]
+    if (not isinstance(account, str) or not account.strip()
+            or len(account.encode("utf-8")) > 1024
+            or "\n" in account or "\r" in account or "\0" in account):
+        fail()
+    if (not isinstance(senders, list) or not senders or len(senders) > 64
+            or any(not isinstance(item, str) or not item.strip()
+                   or len(item.encode("utf-8")) > 1024 for item in senders)):
+        fail()
+    sys.stdout.buffer.write(account.encode("utf-8"))
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)
+PY
+) || refuse 'configuration unavailable; refusing.'
+[ -n "$_pigi_fc_account" ] || refuse 'configuration unavailable; refusing.'
+readonly PIGI_MCP_ACCOUNT="$_pigi_fc_account"
+unset _pigi_fc_account
 
 expected="$PIGI_MCP_PYTHON -B $PIGI_MCP_SCRIPT --account $PIGI_MCP_ACCOUNT"
 original="${SSH_ORIGINAL_COMMAND-}"

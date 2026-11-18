@@ -12,6 +12,12 @@ PINNED_PYTHON = "/Users/tr/.pyenv/versions/3.11.13/bin/python3"
 PINNED_HOME = "/Users/tr"
 PINNED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 EXEC_ENV = {"HOME": PINNED_HOME, "PATH": PINNED_PATH}
+# Fixed-shape error documents; every exit path emits one JSON on stdout and
+# nothing on stderr. These are plain strings because the gate below must be
+# able to emit them before the json module is safe to import.
+USAGE_ERROR_JSON = '{"contentTrust":"untrusted","error":"invalid_arguments"}'
+CONFIG_ERROR_JSON = '{"contentTrust":"untrusted","error":"configuration_unavailable"}'
+INTERNAL_ERROR_JSON = '{"contentTrust":"untrusted","error":"internal_error"}'
 
 
 def is_hardened():
@@ -27,12 +33,12 @@ def hardened_exec_args(argv):
 
 if __name__ == "__main__" and not is_hardened():
     if not (os.path.isfile(PINNED_PYTHON) and os.access(PINNED_PYTHON, os.X_OK)):
-        print("pigi-oneshot: pinned interpreter unavailable", file=sys.stderr)
+        sys.stdout.write(CONFIG_ERROR_JSON)
         sys.exit(6)
     try:
         os.execve(PINNED_PYTHON, hardened_exec_args(sys.argv), EXEC_ENV)
     except OSError:
-        print("pigi-oneshot: pinned interpreter unavailable", file=sys.stderr)
+        sys.stdout.write(CONFIG_ERROR_JSON)
         sys.exit(6)
 
 import argparse
@@ -63,19 +69,13 @@ EXIT_CONFIG = 6
 EXIT_INTERNAL = 7
 EXIT_TRUNCATED = 8
 
-FAILURE_LINES = {EXIT_USAGE: "pigi-oneshot: invalid arguments",
-                 EXIT_SENDER_DENIED: "pigi-oneshot: sender not on the allowlist",
-                 EXIT_NOT_FOUND: "pigi-oneshot: not found",
-                 EXIT_UPSTREAM: "pigi-oneshot: upstream error",
-                 EXIT_TRUNCATED: "pigi-oneshot: output truncated"}
-
 
 class ConfigError(Exception):
     pass
 
 
 def load_config(home):
-    """Return {"account": str, "senders": frozenset}; fail closed with exit 6."""
+    """Return {"account": str, "senders": frozenset}; raise ConfigError otherwise."""
     try:
         path = Path(home).joinpath(*CONFIG_PARTS)
         parent = path.parent.lstat()
@@ -106,9 +106,8 @@ def load_config(home):
             raise ConfigError
         return {"account": account,
                 "senders": frozenset(item.strip().lower() for item in senders)}
-    except (OSError, ValueError, ConfigError):
-        print("pigi-oneshot: configuration unavailable", file=sys.stderr)
-        raise SystemExit(EXIT_CONFIG) from None
+    except (OSError, ValueError):
+        raise ConfigError from None
 
 
 class Context:
@@ -385,9 +384,17 @@ def emit(payload):
 
 
 class Parser(argparse.ArgumentParser):
+    """Never prints: rejections surface only as the exit-2 JSON on stdout."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+
     def error(self, message=None):
-        print(FAILURE_LINES[EXIT_USAGE], file=sys.stderr)
         raise SystemExit(EXIT_USAGE)
+
+    def exit(self, status=0, message=None):
+        raise SystemExit(status)
 
 
 def bounded_int(low, high):
@@ -445,8 +452,6 @@ def run_command(args, ctx):
     stdout, truncated = emit(payload)
     if truncated and code == EXIT_OK:
         code = EXIT_TRUNCATED
-    if code in FAILURE_LINES:
-        print(FAILURE_LINES[code], file=sys.stderr)
     return code, stdout
 
 
@@ -454,50 +459,69 @@ def execute(argv, ctx):
     """Parse argv (no program name) and run it. Returns (exit_code, stdout_bytes)."""
     try:
         args = parse_args(argv)
-    except SystemExit as exit_:
-        code = exit_.code if isinstance(exit_.code, int) else EXIT_USAGE
-        return code, b""
+    except SystemExit:
+        return EXIT_USAGE, USAGE_ERROR_JSON.encode("ascii")
     try:
         return run_command(args, ctx)
     except Exception:
-        print("pigi-oneshot: internal error", file=sys.stderr)
-        return EXIT_INTERNAL, b""
+        return EXIT_INTERNAL, INTERNAL_ERROR_JSON.encode("ascii")
+
+
+def run_main(argv):
+    """Whole CLI flow as (exit_code, stdout_bytes); every failure maps to JSON."""
+    try:
+        if not is_hardened():
+            if not (os.path.isfile(PINNED_PYTHON) and os.access(PINNED_PYTHON, os.X_OK)):
+                sys.stdout.write(CONFIG_ERROR_JSON)
+                return EXIT_CONFIG, b""
+            try:
+                os.execve(PINNED_PYTHON, hardened_exec_args(sys.argv), EXEC_ENV)
+            except OSError:
+                sys.stdout.write(CONFIG_ERROR_JSON)
+                return EXIT_CONFIG, b""
+        os.umask(0o077)
+        # Reject arguments before any config read or socket use.
+        try:
+            args = parse_args(argv)
+        except SystemExit:
+            return EXIT_USAGE, USAGE_ERROR_JSON.encode("ascii")
+        home = PINNED_HOME
+        config = load_config(home)
+        ctx = Context(config["account"], config["senders"], home=home,
+                      socket_path=Path(home) / "Library/Application Support/pigi/agent.sock",
+                      audit_db=Path(home) / "Library/Application Support/pigi-mcp/audit.sqlite3")
+        return run_command(args, ctx)
+    except ConfigError:
+        return EXIT_CONFIG, CONFIG_ERROR_JSON.encode("ascii")
+    except SystemExit:
+        raise
+    except Exception:
+        return EXIT_INTERNAL, INTERNAL_ERROR_JSON.encode("ascii")
 
 
 def main():
-    if not is_hardened():
-        if not (os.path.isfile(PINNED_PYTHON) and os.access(PINNED_PYTHON, os.X_OK)):
-            print("pigi-oneshot: pinned interpreter unavailable", file=sys.stderr)
-            return EXIT_CONFIG
-        try:
-            os.execve(PINNED_PYTHON, hardened_exec_args(sys.argv), EXEC_ENV)
-        except OSError:
-            print("pigi-oneshot: pinned interpreter unavailable", file=sys.stderr)
-            return EXIT_CONFIG
-    os.umask(0o077)
-    argv = sys.argv[1:]
-    # Reject arguments before any config read or socket use.
     try:
-        args = parse_args(argv)
-    except SystemExit as exit_:
-        return exit_.code if isinstance(exit_.code, int) else EXIT_USAGE
-    home = PINNED_HOME
-    config = load_config(home)
-    ctx = Context(config["account"], config["senders"], home=home,
-                  socket_path=Path(home) / "Library/Application Support/pigi/agent.sock",
-                  audit_db=Path(home) / "Library/Application Support/pigi-mcp/audit.sqlite3")
-    try:
-        code, stdout = run_command(args, ctx)
-    except Exception:
-        print("pigi-oneshot: internal error", file=sys.stderr)
-        return EXIT_INTERNAL
+        code, stdout = run_main(sys.argv[1:])
+    except SystemExit:
+        raise
+    except BaseException:
+        code, stdout = EXIT_INTERNAL, INTERNAL_ERROR_JSON.encode("ascii")
     try:
         sys.stdout.buffer.write(stdout)
         sys.stdout.buffer.flush()
-    except OSError:
+    except (OSError, AttributeError):
         pass
     return code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        try:
+            sys.stdout.write(INTERNAL_ERROR_JSON)
+        except Exception:
+            pass
+        sys.exit(7)

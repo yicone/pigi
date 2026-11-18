@@ -33,14 +33,18 @@ hardening flags (see below):
 | `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. |
 
 Not implemented — now or by accident: `list`, `get_verification_code`,
-`--account`, `--offset`, a caller-chosen query, send/mark-read/draft or any
-mutation. Unknown subcommands and unknown options exit 2. Enabling `list`
+`--account`, `--offset`, `--help`/`-h` (unsupported, exits 2), a caller-chosen
+query, send/mark-read/draft or any mutation. Unknown subcommands and unknown
+options exit 2. Enabling `list`
 requires a code change and its own review, not a config change.
 
 ## Output
 
-Stdout is one ASCII JSON line (pure `ensure_ascii`, so control and bidi
-characters can never reach the caller raw). Successful results use the envelope
+**stderr is always empty.** Stdout is exactly one JSON document — at most
+65,536 ASCII bytes (`ensure_ascii` keeps control and bidi characters escaped) —
+on every exit path, success or failure. Merging stdout and stderr therefore
+yields the same single JSON document; callers never need to read stderr at all.
+Successful results use the envelope
 `{"contentTrust":"untrusted","trustNotice":...,"command":<name>, ...}`; every
 upstream result is re-checked for `contentTrust == "untrusted"` before use.
 
@@ -82,22 +86,23 @@ non-zero exit code is kept.
 
 ## Exit codes
 
-| Code | Meaning |
-| --- | --- |
-| 0 | success |
-| 2 | usage/validation error; stderr is the fixed line `pigi-oneshot: invalid arguments`, never echoed input |
-| 3 | sender not on the allowlist (`get`/`get-batch`) |
-| 4 | `not_found` |
-| 5 | upstream/transport/MCP error; stdout is `{"contentTrust":"untrusted","error":<fixed code>}` |
-| 6 | config or environment failure (missing/unsafe config, missing pinned interpreter) |
-| 7 | internal error; stderr is the fixed line `pigi-oneshot: internal error` |
-| 8 | success but output truncated; data incomplete — do not treat as complete |
+Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 
-All stderr lines are fixed strings; mail content, arguments and exception text
-never reach stderr. `get-batch` maps per-entry outcomes to the worst exit code
-by precedence 5 > 4 > 3 > 0. Exit 8 applies only when the command would
-otherwise exit 0; an already non-zero code (3/4/5) is kept even when the JSON
-carries `"truncated":true`.
+| Code | Meaning | Stdout shape |
+| --- | --- | --- |
+| 0 | success | `{"contentTrust":"untrusted","trustNotice":...,"command":<name>, ...}` |
+| 2 | usage/validation error (incl. `--help`, which is unsupported) | `{"contentTrust":"untrusted","error":"invalid_arguments"}` |
+| 3 | sender not on the allowlist | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
+| 4 | `not_found` | `{"contentTrust":"untrusted","error":"not_found"}` |
+| 5 | upstream/transport/MCP error | `{"contentTrust":"untrusted","error":<fixed code>}` |
+| 6 | config or environment failure (missing/unsafe config, missing pinned interpreter) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
+| 7 | internal error | `{"contentTrust":"untrusted","error":"internal_error"}` |
+| 8 | success but output truncated; data incomplete — do not treat as complete | truncated envelope with `"truncated":true` |
+
+`get-batch` maps per-entry outcomes to the worst exit code by precedence
+5 > 4 > 3 > 0. Exit 8 applies only when the command would otherwise exit 0; an
+already non-zero code (3/4/5) is kept even when the JSON carries
+`"truncated":true`.
 
 ## Configuration (never committed)
 
@@ -129,10 +134,10 @@ process umask is 077.
 
 The MCP session spawns `pigi_mcp.py --account <configured account> --socket
 <default agent.sock> --audit-db <default audit>` as a child with the same
-minimal environment; the child's stderr is captured and discarded. The script
-itself reads only the config file; it never opens `mail.db`, the Keychain, the
-network, or any other file. Writes are limited to what the adapter itself does
-(its `tool_calls` audit DB).
+minimal environment; the child's stderr is captured and discarded so it can
+never leak into ours. The script itself reads only the config file; it never
+opens `mail.db`, the Keychain, the network, or any other file. Writes are
+limited to what the adapter itself does (its `tool_calls` audit DB).
 
 ## Audit
 

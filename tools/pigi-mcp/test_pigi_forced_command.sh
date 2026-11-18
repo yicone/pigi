@@ -1,15 +1,73 @@
 #!/bin/sh
 # Offline self-test for pigi_forced_command.sh (ACM-963 rework, ACM-965/966).
 #
-# Method: render a throwaway copy whose five pinned literals are replaced with
-# synthetic values (the installed production file is never modified), drive it
-# with stub interpreters under a resolved temporary scratch dir and hostile
-# environment. Never opens agent.sock, the App, mail.db, keychains, or real
-# audit ledgers; never touches real HOME data.
+# Method: render a throwaway copy whose four pinned literals are replaced with
+# synthetic values, and whose mailbox comes from a synthetic oneshot.json under
+# that copy's pinned home (the installed production file is never modified).
+# Drive it with stub interpreters under a resolved temporary scratch dir and a
+# cleared environment. Adapter probes use only an explicit non-production
+# interpreter (PIGI_TEST_PYTHON, else the fixed Homebrew/local/system paths);
+# the production pinned interpreter and any installed copy are never executed.
+# Never opens agent.sock, the App, mail.db, keychains, or real audit ledgers;
+# never touches real HOME data.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 FC="$ROOT/pigi_forced_command.sh"
+case "$FC" in
+    */.ssh/*) echo "refusing installed forced-command copy" >&2; exit 2 ;;
+esac
+PINNED_PY=$(awk -F"'" '/^readonly PIGI_MCP_PYTHON=/{print $2; exit}' "$FC")
+[ -n "$PINNED_PY" ] || { echo "pinned interpreter literal missing" >&2; exit 2; }
+
+# True when the candidate is the production pin by spelling or realpath.
+# The candidate is not executed.
+same_as_pinned() {
+    /usr/bin/python3 -I -B -c '
+import os, sys
+pin, cand = sys.argv[1], sys.argv[2]
+def keys(path):
+    found = {os.path.normpath(path)}
+    if os.path.lexists(path):
+        found.add(os.path.realpath(path))
+    return found
+sys.exit(0 if keys(pin) & keys(cand) else 1)
+' "$PINNED_PY" "$1"
+}
+
+is_native_bin() {
+    sig=$(/usr/bin/od -An -t x1 -N 4 "$1" 2>/dev/null | /usr/bin/tr -d ' \n')
+    case "$sig" in
+        cffaedfe|cefaedfe|feedface|feedfacf|cafebabe|bebafeca|7f454c46) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# pick_python <min_minor>: print one non-production interpreter, or return 1.
+# A set PIGI_TEST_PYTHON that fails these checks aborts the suite.
+python_ok() { # python_ok <path> <min_minor>
+    [ -f "$1" ] && [ -x "$1" ] && is_native_bin "$1" || return 1
+    same_as_pinned "$1" && return 1
+    env -i PATH=/usr/bin:/bin "$1" -I -c \
+        'import sys; sys.exit(0 if sys.version_info>=(3,'"$2"') else 1)' \
+        >/dev/null 2>&1
+}
+pick_python() {
+    min=$1
+    if [ -n "${PIGI_TEST_PYTHON:-}" ]; then
+        python_ok "$PIGI_TEST_PYTHON" "$min" || {
+            echo "PIGI_TEST_PYTHON rejected" >&2; exit 2; }
+        printf %s "$PIGI_TEST_PYTHON"
+        return 0
+    fi
+    for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if python_ok "$cand" "$min"; then
+            printf %s "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pigi-fc-test.XXXXXX")"
 TMP="$(cd "$TMP" && pwd -P)"   # physical path: ancestor checks reject /var symlinks
 trap 'rm -rf "$TMP"' EXIT
@@ -30,6 +88,18 @@ LOGDIR="$TMP/led"
 LOG="$LOGDIR/forced-command.log"
 mkdir -m 700 "$LOGDIR"
 
+# Synthetic oneshot.json under a pinned home. Mode 0600, parent 0700.
+# Never points at the real Application Support directory.
+install_config() { # install_config <home>
+    base="$1/Library/Application Support/pigi"
+    mkdir -p "$base"
+    chmod 700 "$1" "$1/Library" "$1/Library/Application Support" "$base"
+    printf '{"account":"%s","senders":["allowed@example.invalid"]}\n' "$ACCOUNT" \
+        > "$base/oneshot.json"
+    chmod 600 "$base/oneshot.json"
+}
+install_config "$THOME"
+
 # Render a test copy: identical logic, synthetic pinned constants only.
 render() { # render <name> <log-path> [python] [script] [home]
     out="$TMP/fc-$1.sh"
@@ -37,12 +107,11 @@ render() { # render <name> <log-path> [python] [script] [home]
     sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$hm'|" \
         -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$py'|" \
         -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$sc'|" \
-        -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
         -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$2'|" \
         "$FC" > "$out"
     chmod 700 "$out"
-    grep -q "readonly PIGI_MCP_ACCOUNT='$ACCOUNT'" "$out" || {
-        echo "render failed: pinned literal not substituted" >&2; exit 2; }
+    grep -q 'readonly PIGI_MCP_ACCOUNT="$_pigi_fc_account"' "$out" || {
+        echo "render failed: account must stay config-backed" >&2; exit 2; }
     printf %s "$out"
 }
 
@@ -57,11 +126,15 @@ check() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 
 run() { # run <fc> <original|'__UNSET__'> -> OUT ERR RC ; ENVX may add hostile env
     OUT="$TMP/out"; ERR="$TMP/err"
+    # Cleared environment. The script under test pins PATH itself; ENVX is the
+    # only extra input, and only for the hostile-env cases.
     if [ "$2" = '__UNSET__' ]; then
-        env -u SSH_ORIGINAL_COMMAND ${ENVX:-} SSH_CLIENT='10.9.9.9 5000 22' \
+        env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin ${ENVX:-} \
+            SSH_CLIENT='10.9.9.9 5000 22' \
             sh "$1" >"$OUT" 2>"$ERR" && RC=0 || RC=$?
     else
-        env ${ENVX:-} SSH_ORIGINAL_COMMAND="$2" SSH_CLIENT='10.9.9.9 5000 22' \
+        env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin ${ENVX:-} \
+            SSH_ORIGINAL_COMMAND="$2" SSH_CLIENT='10.9.9.9 5000 22' \
             sh "$1" >"$OUT" 2>"$ERR" && RC=0 || RC=$?
     fi
 }
@@ -228,7 +301,8 @@ fulldir="$TMP/fulldir"; mkdir -m 700 "$fulldir"
 fulllog="$fulldir/forced-command.log"
 printf 'x%.0s' $(seq 1 600) > "$fulllog"; chmod 600 "$fulllog"
 fullfc="$(render full "$fulllog")"
-sh -c 'ulimit -f 0; exec env SSH_ORIGINAL_COMMAND="$1" SSH_CLIENT="10.9.9.9 5000 22" sh "$2"' \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c \
+    'ulimit -f 0; exec env -i PATH="$PATH" SSH_ORIGINAL_COMMAND="$1" SSH_CLIENT="10.9.9.9 5000 22" sh "$2"' \
     _ "$EXPECTED" "$fullfc" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
 { [ "$RC" -eq 1 ] && ! grep -q 'STUB-EXECUTED' "$TMP/out" \
     && [ "$(wc -c < "$fulllog")" -eq 600 ]; }
@@ -237,17 +311,23 @@ check 'fail-closed: deterministic append failure refuses, stub not run' $?
 # 11b. Open of the pinned descriptor fails (RLIMIT_NOFILE below fd 9). POSIX
 # `exec` redirection failure may abort the shell before refuse() runs, so the
 # contract is nonzero rc + stub not run, not a specific stderr message.
-sh -c 'ulimit -n 9; exec env SSH_ORIGINAL_COMMAND="$1" SSH_CLIENT="10.9.9.9 5000 22" sh "$2"' \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c \
+    'ulimit -n 9; exec env -i PATH="$PATH" SSH_ORIGINAL_COMMAND="$1" SSH_CLIENT="10.9.9.9 5000 22" sh "$2"' \
     _ "$EXPECTED" "$freshfc" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
 { [ "$RC" -ne 0 ] && ! grep -q 'STUB-EXECUTED' "$TMP/out"; }
 check 'fail-closed: deterministic descriptor-open failure refuses' $?
 
 # -- 12. Python startup isolation (ACM-966 item 4) ----------------------------
-TESTPY="$(command -v python3 || true)"
+if [ -n "${PIGI_TEST_PYTHON:-}" ]; then
+    TESTPY=$(pick_python 9) || exit 2
+else
+    TESTPY=$(pick_python 9 || true)
+fi
 if [ -n "$TESTPY" ]; then
     PYHOME="$TMP/py-home"; mkdir -m 700 "$PYHOME"
+    install_config "$PYHOME"
     PYSNIPE="$TMP/pysnipe.py"; printf 'print("STUB-EXECUTED")\n' > "$PYSNIPE"
-    usite=$(env HOME="$PYHOME" "$TESTPY" -c 'import site; print(site.getusersitepackages())' 2>/dev/null) || usite=
+    usite=$(env -i HOME="$PYHOME" PATH=/usr/bin:/bin "$TESTPY" -c 'import site; print(site.getusersitepackages())' 2>/dev/null) || usite=
     if [ -n "$usite" ]; then
         mkdir -p "$usite"
         marker="$TMP/pth-marker"
@@ -259,7 +339,8 @@ if [ -n "$TESTPY" ]; then
         pylg="$TMP/pylogdir"; mkdir -m 700 "$pylg"
         pyfc="$(render pyiso "$pylg/forced-command.log" "$TESTPY" "$PYSNIPE" "$PYHOME")"
         PYEXP="$TESTPY -B $PYSNIPE --account $ACCOUNT"
-        env SSH_ORIGINAL_COMMAND="$PYEXP" SSH_CLIENT='10.9.9.9 5000 22' \
+        env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            SSH_ORIGINAL_COMMAND="$PYEXP" SSH_CLIENT='10.9.9.9 5000 22' \
             sh "$pyfc" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
         { [ "$control_fired" = yes ] && [ "$RC" -eq 0 ] \
             && grep -q 'STUB-EXECUTED' "$TMP/out" && [ ! -e "$marker" ]; }
@@ -277,7 +358,8 @@ akvalue() { printf %s "$1" | sed 's/\\"/"/g'; }
 
 # 13a. Space-free installed path: `sh -c` receives the bare path and runs it.
 val="$(akvalue "$TESTFC")"
-SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
     /bin/sh -c "$val" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
 { [ "$RC" -eq 0 ] && grep -q '^STUB-EXECUTED' "$TMP/out"; }
 check 'launch: space-free authorized_keys path executes via sh -c' $?
@@ -288,7 +370,8 @@ spacedfc="$spaced/pigi_forced_command.sh"
 cp "$TESTFC" "$spacedfc"; chmod 700 "$spacedfc"
 stored="\"$spacedfc\""                       # what authorized_keys stores
 val="$(akvalue "$stored")"                   # what `sh -c` receives
-SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
     /bin/sh -c "$val" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
 { [ "$RC" -eq 0 ] && grep -q '^STUB-EXECUTED' "$TMP/out"; }
 check 'launch: escaped-quote spaced path executes via sh -c' $?
@@ -296,7 +379,8 @@ check 'launch: escaped-quote spaced path executes via sh -c' $?
 # 13c. The documented authorized_keys entry itself, end to end.
 ak_line="from=\"192.0.2.10\",restrict,command=\"\\\"$spacedfc\\\"\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeSyntheticKeyMaterialForTestingOnlyx"
 cmdval=$(printf %s "$ak_line" | sed -n -E 's/.*command="((\\.|[^"])*)" ssh-.*/\1/p' | sed 's/\\"/"/g')
-SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
     /bin/sh -c "$cmdval" >"$TMP/out" 2>"$TMP/err" && RC=0 || RC=$?
 { [ "$RC" -eq 0 ] && grep -q '^STUB-EXECUTED' "$TMP/out"; }
 check 'launch: full authorized_keys line parses and runs spaced path' $?
@@ -364,7 +448,6 @@ render_hook() { # render_hook <name> <log> <anchor-substring> <injected-line>
     sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
         -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
         -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
-        -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
         -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$2'|" \
         "$FC" | awk -v anchor="$3" -v ins="$4" \
         'index($0,anchor){print ins} {print}' > "$out"
@@ -510,7 +593,6 @@ pfc="$TMP/fc-rm.sh"
 sed -e "s|^readonly PIGI_FC_HOME=.*|readonly PIGI_FC_HOME='$THOME'|" \
     -e "s|^readonly PIGI_MCP_PYTHON=.*|readonly PIGI_MCP_PYTHON='$STUB'|" \
     -e "s|^readonly PIGI_MCP_SCRIPT=.*|readonly PIGI_MCP_SCRIPT='$SCRIPT_PATH'|" \
-    -e "s|^readonly PIGI_MCP_ACCOUNT=.*|readonly PIGI_MCP_ACCOUNT='$ACCOUNT'|" \
     -e "s|^readonly PIGI_FC_LOG=.*|readonly PIGI_FC_LOG='$rlogm'|" \
     -e 's|/usr/bin/perl|/nonexistent-synthetic-perl|g' \
     "$FC" > "$pfc"; chmod 700 "$pfc"
@@ -626,27 +708,33 @@ check 'creation: substitute file never unlinked, self-created kept as residue' $
 # -- 17. Runtime objects auto-created by the pinned pipeline (ACM-967 item 6) --
 # Drive the REAL adapter through the forced command under a synthetic HOME and
 # EOF stdin: it must create exactly the inventoried audit set, nothing else.
-TESTPY=
-for cand in "$(awk -F"'" '/^readonly PIGI_MCP_PYTHON=/{print $2}' "$FC")" \
-            "$(command -v python3 || true)"; do
-    if [ -n "$cand" ] && [ -x "$cand" ] \
-        && "$cand" -c 'import sys;sys.exit(sys.version_info<(3,10))' 2>/dev/null; then
-        TESTPY=$cand; break
-    fi
-done
+if [ -n "${PIGI_TEST_PYTHON:-}" ]; then
+    TESTPY=$(pick_python 10) || exit 2
+else
+    TESTPY=$(pick_python 10 || true)
+fi
+if [ -n "$TESTPY" ]; then
+    same_as_pinned "$TESTPY" && { echo "refusing production interpreter" >&2; exit 2; }
+fi
 if [ -n "$TESTPY" ]; then
     adhome="$TMP/adhome"; mkdir -m 700 "$adhome"
+    install_config "$adhome"
     adled="$TMP/adled"; mkdir -m 700 "$adled"; adlog="$adled/forced-command.log"
     adfc="$(render adapter "$adlog" "$TESTPY" "$ROOT/pigi_mcp.py" "$adhome")"
     EXPAD="$TESTPY -B $ROOT/pigi_mcp.py --account $ACCOUNT"
     run "$adfc" "$EXPAD" </dev/null
     created_f=$(cd "$adhome" && find . -type f | sort)
     created_d=$(cd "$adhome" && find . -type d | sort)
+    # oneshot.json is the synthetic fixture planted before the run. The adapter
+    # itself still adds only the inventoried audit database.
+    expected_f='./Library/Application Support/pigi-mcp/audit.sqlite3
+./Library/Application Support/pigi/oneshot.json'
     expected_d='.
 ./Library
 ./Library/Application Support
+./Library/Application Support/pigi
 ./Library/Application Support/pigi-mcp'
-    { [ "$created_f" = './Library/Application Support/pigi-mcp/audit.sqlite3' ] \
+    { [ "$created_f" = "$expected_f" ] \
         && [ "$created_d" = "$expected_d" ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp")" = 700 ] \
         && [ "$(stat -f %Lp "$adhome/Library/Application Support/pigi-mcp/audit.sqlite3")" = 600 ]; }
@@ -654,6 +742,53 @@ if [ -n "$TESTPY" ]; then
 else
     check 'runtime-objects: python3 present for adapter probe' 1
 fi
+
+# -- 18. Missing outside config refuses before any pipeline ------------------
+nohome="$TMP/no-config-home"; mkdir -m 700 "$nohome"
+nologdir="$TMP/no-config-led"; mkdir -m 700 "$nologdir"
+nolog="$nologdir/forced-command.log"
+nofc="$(render noconfig "$nolog" "$STUB" "$SCRIPT_PATH" "$nohome")"
+run "$nofc" "$EXPECTED"
+{ [ "$RC" -eq 1 ] && ! grep -q 'STUB-EXECUTED' "$OUT" \
+    && grep -q 'configuration unavailable' "$ERR" \
+    && [ ! -e "$nolog" ]; }
+check 'fail-closed: missing oneshot config refuses, stub not run' $?
+
+# -- 19. A 0600 FIFO config must refuse without a writer unlocking it --------
+fifohome="$TMP/fifo-home"; mkdir -m 700 "$fifohome"
+fifobase="$fifohome/Library/Application Support/pigi"
+mkdir -p "$fifobase"
+chmod 700 "$fifohome" "$fifohome/Library" "$fifohome/Library/Application Support" "$fifobase"
+mkfifo "$fifobase/oneshot.json"
+chmod 600 "$fifobase/oneshot.json"
+fifoled="$TMP/fifo-led"; mkdir -m 700 "$fifoled"
+fifolog="$fifoled/forced-command.log"
+fifofc="$(render fifo "$fifolog" "$STUB" "$SCRIPT_PATH" "$fifohome")"
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    SSH_ORIGINAL_COMMAND="$EXPECTED" SSH_CLIENT='10.9.9.9 5000 22' \
+    sh "$fifofc" >"$TMP/out" 2>"$TMP/err" &
+fpid=$!
+ticks=0
+while kill -0 "$fpid" 2>/dev/null; do
+    if [ "$ticks" -ge 20 ]; then
+        kill "$fpid" 2>/dev/null || true
+        wait "$fpid" 2>/dev/null || true
+        ticks=99
+        break
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+done
+if [ "$ticks" -eq 99 ]; then
+    RC=99
+else
+    wait "$fpid" && RC=0 || RC=$?
+fi
+{ [ "$RC" -eq 1 ] && [ "$ticks" -lt 20 ] \
+    && ! grep -q 'STUB-EXECUTED' "$TMP/out" \
+    && grep -q 'configuration unavailable' "$TMP/err" \
+    && [ ! -e "$fifolog" ] && [ -p "$fifobase/oneshot.json" ]; }
+check 'fail-closed: 0600 fifo config refuses promptly, stub not run' $?
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

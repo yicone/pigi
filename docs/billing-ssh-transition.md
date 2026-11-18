@@ -100,9 +100,13 @@ For the pinned home on this mini the file is
 ```
 
 The file must be a regular file, mode exactly 0600, a single hard link, owned
-by the effective user, and not a symlink. It is opened with `O_NOFOLLOW` and
-checked with `fstat` before reading. Its parent directory must be a real
-directory owned by that user and not group- or world-writable. A missing file,
+by the effective user, and not a symlink. It is opened with
+`O_RDONLY|O_NOFOLLOW|O_NONBLOCK` so a FIFO with no writer cannot block the
+open, then checked with `fstat` before reading. A descriptor that is not a
+regular file, or whose owner, mode, or link count is wrong, is closed and
+refused. Only a descriptor that passes is switched back to blocking for the
+read. Its parent directory must be a real directory owned by that user and
+not group- or world-writable. A missing file,
 unsafe mode, bad owner, extra link, symlink, unreadable file, malformed JSON,
 or wrong shape refuses execution before the ledger is created and before
 `pigi_mcp.py` starts. The account must also be a single line (no NUL, CR, or

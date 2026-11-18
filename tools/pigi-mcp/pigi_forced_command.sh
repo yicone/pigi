@@ -218,12 +218,18 @@ try:
     if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
             or stat.S_IMODE(st.st_mode) & 0o022):
         fail()
-    fd = os.open(path, os.O_RDONLY | flag)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nonblock:
+        fail()
+    # O_NONBLOCK so a FIFO with no writer cannot stall the open. The fd is
+    # still required to be a regular file; only then is the flag cleared.
+    fd = os.open(path, os.O_RDONLY | flag | nonblock)
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
             fail()
+        os.set_blocking(fd, True)
         data = os.read(fd, 65537)
         if len(data) > 65536:
             fail()

@@ -39,6 +39,12 @@ USAGE_DOC = {"contentTrust": "untrusted", "error": "invalid_arguments"}
 CONFIG_DOC = {"contentTrust": "untrusted", "error": "configuration_unavailable"}
 INTERNAL_DOC = {"contentTrust": "untrusted", "error": "internal_error"}
 
+_LAUNCHER_PIN = re.search(r"^readonly PIGI_OS_PYTHON='([^']*)'",
+                          LAUNCHER.read_text(), re.M)
+if _LAUNCHER_PIN is None:
+    raise AssertionError("launcher pinned interpreter literal not found")
+PINNED_LAUNCHER_PYTHON = _LAUNCHER_PIN.group(1)
+
 
 def real_homes():
     return {os.path.realpath(os.path.expanduser("~")),
@@ -46,7 +52,17 @@ def real_homes():
             os.path.realpath(ORIGINAL_PINNED_HOME)}
 
 
-def assert_isolated(home, config_path, socket_path, audit_db):
+def check_interpreter(interpreter):
+    """Refuse the pinned production interpreter path in any spelling."""
+    forbidden = {os.path.normpath(PINNED_LAUNCHER_PYTHON),
+                 os.path.realpath(PINNED_LAUNCHER_PYTHON)}
+    if (os.path.normpath(interpreter) in forbidden
+            or os.path.realpath(interpreter) in forbidden):
+        raise AssertionError("refusing pinned production interpreter: %s"
+                             % interpreter)
+
+
+def assert_isolated(home, config_path, socket_path, audit_db, interpreter=None):
     """Refuse (AssertionError) when any path resolves to a real location."""
     homes = real_homes()
     resolved_home = os.path.realpath(home)
@@ -66,6 +82,48 @@ def assert_isolated(home, config_path, socket_path, audit_db):
         raise AssertionError("refusing default socket path")
     if os.path.realpath(audit_db) == os.path.realpath(audit.DEFAULT_AUDIT):
         raise AssertionError("refusing default audit path")
+    if interpreter is not None:
+        check_interpreter(interpreter)
+
+
+def pick_temp_root():
+    """A short writable temp base so AF_UNIX fixture paths stay <=90 bytes."""
+    suffix = os.path.join("po-XXXXXXXX", "00000000", "Library",
+                          "Application Support", "pigi", "agent.sock")
+    for base in ("/tmp", "/private/tmp", "/var/tmp", tempfile.gettempdir()):
+        if not base or not os.path.isdir(base) or not os.access(base, os.W_OK):
+            continue
+        if len(os.fsencode(os.path.join(os.path.realpath(base), suffix))) <= 90:
+            return base
+    raise AssertionError("no short writable temp base for AF_UNIX fixtures")
+
+
+_SYNTHETIC_PYTHON = None
+
+
+def synthetic_python():
+    """A python executable that is never the pinned production path.
+
+    On machines where sys.executable IS the pinned interpreter, return a
+    /bin/sh shim in a temp dir that execs the real one — argv[0] never carries
+    the pinned literal while the interpreter behavior stays identical."""
+    global _SYNTHETIC_PYTHON
+    if _SYNTHETIC_PYTHON is None:
+        try:
+            check_interpreter(sys.executable)
+            _SYNTHETIC_PYTHON = sys.executable
+        except AssertionError:
+            bindir = os.path.join(tempfile.mkdtemp(prefix="po-py-",
+                                                   dir=pick_temp_root()),
+                                  "bin")
+            os.mkdir(bindir)
+            path = os.path.join(bindir, "python3")
+            with open(path, "w") as handle:
+                handle.write("#!/bin/sh\nexec %r \"$@\"\n"
+                             % os.path.realpath(sys.executable))
+            os.chmod(path, 0o755)
+            _SYNTHETIC_PYTHON = path
+    return _SYNTHETIC_PYTHON
 
 
 def setUpModule():
@@ -74,11 +132,23 @@ def setUpModule():
     default_config = Path(ORIGINAL_PINNED_HOME).joinpath(*pigi_oneshot.CONFIG_PARTS)
     try:
         assert_isolated(ORIGINAL_PINNED_HOME, default_config,
-                        transport.DEFAULT_SOCKET, audit.DEFAULT_AUDIT)
+                        transport.DEFAULT_SOCKET, audit.DEFAULT_AUDIT,
+                        interpreter=PINNED_LAUNCHER_PYTHON)
     except AssertionError:
         pass
     else:
         raise AssertionError("isolation guard ignored real defaults")
+    # ... and specifically the pinned production interpreter.
+    with tempfile.TemporaryDirectory(prefix="po-g-") as tmp:
+        try:
+            assert_isolated(tmp, os.path.join(tmp, "oneshot.json"),
+                            os.path.join(tmp, "agent.sock"),
+                            os.path.join(tmp, "audit.sqlite3"),
+                            interpreter=PINNED_LAUNCHER_PYTHON)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("isolation guard ignored pinned interpreter")
 
 
 class _BytesStdout:
@@ -190,7 +260,7 @@ class FakeAgent(threading.Thread):
 
 class OneshotTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="po-", dir="/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="po-", dir=pick_temp_root())
         self.addCleanup(self.temp.cleanup)
         os.chmod(self.temp.name, 0o700)
         self.root = Path(self.temp.name)
@@ -201,10 +271,11 @@ class OneshotTests(unittest.TestCase):
         self.addCleanup(self.stop_agent)
         self.ctx = pigi_oneshot.Context(
             ACCOUNT, {ALLOWED}, socket_path=self.agent.endpoint,
-            audit_db=self.root / "audit.sqlite3", python=sys.executable,
+            audit_db=self.root / "audit.sqlite3", python=synthetic_python(),
             home=self.temp.name, now_ms=lambda: NOW)
         assert_isolated(self.temp.name, self.root / "oneshot.json",
-                        self.ctx.socket_path, self.ctx.audit_db)
+                        self.ctx.socket_path, self.ctx.audit_db,
+                        interpreter=self.ctx.python)
 
     def stop_agent(self):
         self.agent.stop()
@@ -228,17 +299,48 @@ class OneshotTests(unittest.TestCase):
             env.update(extra)
         return env
 
+    def run_python(self, argv, **kwargs):
+        """Spawn a python subprocess; the interpreter is guard-checked first."""
+        check_interpreter(str(argv[0]))
+        return subprocess.run(argv, **kwargs)
+
     def cli(self, args):
-        result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *args],
+        result = self.run_python(
+            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8",
+             str(SCRIPT), *args],
             capture_output=True, timeout=20, env=self.trusted_env())
         self.assertEqual(result.stderr, b"")
         if result.stdout:
             json.loads(result.stdout)  # always a single JSON document
         return result
 
+    def launch(self, launcher, argv, env=None):
+        """Run a rendered launcher twice: merged stderr=STDOUT, then split."""
+        merged = subprocess.run([str(launcher), *argv], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=20, env=env)
+        split = subprocess.run([str(launcher), *argv], capture_output=True,
+                               timeout=20, env=env)
+        return merged, split
+
+    def assert_json_contract(self, merged, split, code, doc=None):
+        """stderr empty, stdout one bounded JSON doc, merged == stdout."""
+        self.assertEqual(split.returncode, code)
+        self.assertEqual(split.stderr, b"")
+        self.assertLessEqual(len(split.stdout), pigi_oneshot.MAX_STDOUT)
+        parsed = json.loads(split.stdout)
+        self.assertEqual(parsed["contentTrust"], "untrusted")
+        if doc is not None:
+            self.assertEqual(parsed, doc)
+        self.assertEqual(json.loads(merged.stdout), parsed)
+
     def render_launcher(self, directory, python, script, home):
-        """Throwaway copy of pigi_oneshot.sh with the pinned literals replaced."""
+        """Throwaway copy of pigi_oneshot.sh with the pinned literals replaced.
+        The isolation guard runs first — a refused call writes nothing."""
+        support = Path(home) / "Library" / "Application Support"
+        assert_isolated(str(home), support / "pigi" / "oneshot.json",
+                        support / "pigi" / "agent.sock",
+                        support / "pigi-mcp" / "audit.sqlite3",
+                        interpreter=str(python))
         rendered = Path(directory) / "pigi_oneshot.sh"
         text = LAUNCHER.read_text()
         for name, value in (("PIGI_OS_PYTHON", str(python)),
@@ -251,16 +353,13 @@ class OneshotTests(unittest.TestCase):
             self.assertEqual(text.count("readonly %s='%s'" % (name, value)), 1)
         rendered.write_text(text)
         os.chmod(rendered, 0o755)
-        support = Path(home) / "Library" / "Application Support"
-        assert_isolated(str(home), support / "pigi" / "oneshot.json",
-                        support / "pigi" / "agent.sock",
-                        support / "pigi-mcp" / "audit.sqlite3")
         return rendered
 
     def make_hooks(self):
         """A poisoned launch environment: sitecustomize, usercustomize and a
-        .pth in the user-site tree, plus PYTHONPATH json/argparse poison —
-        every hook writes a distinct canary file. Returns (env, canaries)."""
+        .pth in the user-site tree, plus PYTHONPATH json/argparse poison and a
+        BASH_ENV file — every hook writes a distinct canary file.
+        Returns (env, canaries)."""
         hookdir = self.root / "hookdir"
         hookdir.mkdir()
         base = self.root / "userbase"
@@ -274,8 +373,10 @@ class OneshotTests(unittest.TestCase):
         for name in ("sitecustomize", "json", "argparse"):
             (hookdir / (name + ".py")).write_text(
                 "import os\nopen(%r, 'w').write('hit')\n" % str(canary(name)))
-        probe = subprocess.run(
-            [sys.executable, "-c",
+        bash_env = hookdir / "bash_env"
+        bash_env.write_text("echo hit > '%s'\n" % canary("bash_env"))
+        probe = self.run_python(
+            [synthetic_python(), "-c",
              "import site; print(site.getusersitepackages())"],
             capture_output=True, timeout=20,
             env={"PYTHONUSERBASE": str(base),
@@ -291,7 +392,7 @@ class OneshotTests(unittest.TestCase):
                            % str(canary("startup")))
         env = {"HOME": self.temp.name, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                "PYTHONPATH": str(hookdir), "PYTHONUSERBASE": str(base),
-               "PYTHONSTARTUP": str(startup), "BASH_ENV": str(hookdir / "bash_env"),
+               "PYTHONSTARTUP": str(startup), "BASH_ENV": str(bash_env),
                "FOO": "poison"}
         return env, canaries
 
@@ -318,13 +419,16 @@ class OneshotTests(unittest.TestCase):
         """Run main() with PINNED_HOME patched to an isolated home; returns
         (exit_code, stdout_bytes, parsed_doc). Asserts stderr stays empty."""
         support = Path(home) / "Library" / "Application Support"
+        python = synthetic_python()
         assert_isolated(str(home), support / "pigi" / "oneshot.json",
                         support / "pigi" / "agent.sock",
-                        support / "pigi-mcp" / "audit.sqlite3")
+                        support / "pigi-mcp" / "audit.sqlite3",
+                        interpreter=python)
         stdout, err = _BytesStdout(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(pigi_oneshot, "PINNED_HOME", str(home)))
             stack.enter_context(patch.object(pigi_oneshot, "trusted_entry", lambda: True))
+            stack.enter_context(patch.object(sys, "executable", python))
             stack.enter_context(patch.object(sys, "argv", ["pigi-oneshot", *argv]))
             stack.enter_context(patch.object(sys, "stdout", stdout))
             stack.enter_context(contextlib.redirect_stderr(err))
@@ -629,7 +733,7 @@ class OneshotTests(unittest.TestCase):
 
     def test_direct_launch_refused_exit_nine(self):
         env, canaries = self.make_hooks()
-        result = subprocess.run([sys.executable, str(SCRIPT), "list"],
+        result = self.run_python([synthetic_python(), str(SCRIPT), "list"],
                                 capture_output=True, timeout=20, env=env)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stdout,
@@ -645,27 +749,27 @@ class OneshotTests(unittest.TestCase):
         # Launcher flag set but interpreter not isolated -> still refused.
         flagged = dict(env)
         flagged[pigi_oneshot.TRUSTED_FLAG_NAME] = pigi_oneshot.TRUSTED_FLAG_VALUE
-        result = subprocess.run([sys.executable, str(SCRIPT), "list"],
+        result = self.run_python([synthetic_python(), str(SCRIPT), "list"],
                                 capture_output=True, timeout=20, env=flagged)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stderr, b"")
         # Isolation flags but no launcher flag -> refused.
-        result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+        result = self.run_python(
+            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
             capture_output=True, timeout=20, env=env)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stderr, b"")
         # Flag plus all isolation flags -> passes the gate, rejects `list`.
-        result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+        result = self.run_python(
+            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
             capture_output=True, timeout=20, env=flagged)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.parse(result.stdout), USAGE_DOC)
         self.assertEqual(result.stderr, b"")
 
     def test_launcher_blocks_environment_hooks(self):
-        home, _ = self.make_home("launch-home")
-        launcher = self.render_launcher(self.root, sys.executable, SCRIPT, home)
+        home, _ = self.make_home("hla")
+        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
         env, canaries = self.make_hooks()
         for argv in (["list"], ["--account", "x"]):
             with self.subTest(argv=argv):
@@ -678,7 +782,7 @@ class OneshotTests(unittest.TestCase):
             self.assertFalse(path.exists(), name)
 
     def test_launcher_child_environment_fixed_and_args_verbatim(self):
-        home, _ = self.make_home("probe-home")
+        home, _ = self.make_home("hpr")
         probe = self.root / "probe.py"
         probe.write_text(
             "import json, os, sys\n"
@@ -689,7 +793,7 @@ class OneshotTests(unittest.TestCase):
             "              'dont_write_bytecode': bool(sys.flags.dont_write_bytecode),\n"
             "              'utf8_mode': bool(sys.flags.utf8_mode)},\n"
             "    'argv': sys.argv[1:]}))\n")
-        launcher = self.render_launcher(self.root, sys.executable, probe, home)
+        launcher = self.render_launcher(self.root, synthetic_python(), probe, home)
         env, _ = self.make_hooks()
         args = ["a b", "qu'ote", "$HOME", "a;b", 'x"y']
         result = subprocess.run([str(launcher), *args],
@@ -699,8 +803,11 @@ class OneshotTests(unittest.TestCase):
         doc = json.loads(result.stdout)
         # macOS libSystem synthesizes __CF_USER_TEXT_ENCODING inside the new
         # process after exec; it is OS-injected, not inherited — env -i cannot
-        # remove it. Everything else must be exactly the launcher whitelist.
-        keys = set(doc["env"]) - {"__CF_USER_TEXT_ENCODING"}
+        # remove it. The synthetic_python() shim's /bin/sh likewise exports
+        # PWD/SHLVL before it execs the real interpreter — a test-fixture
+        # artifact, not something the launcher sets. Everything else must be
+        # exactly the launcher whitelist.
+        keys = set(doc["env"]) - {"__CF_USER_TEXT_ENCODING", "PWD", "SHLVL"}
         self.assertEqual(keys,
                          {"HOME", "PATH", "LANG", "LC_ALL", "PIGI_ONESHOT_LAUNCHER"})
         for poison in ("PYTHONPATH", "PYTHONUSERBASE", "PYTHONSTARTUP",
@@ -715,23 +822,98 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(doc["argv"], args)
 
     def test_launcher_fails_closed(self):
-        home, _ = self.make_home("closed-home")
+        home, _ = self.make_home("hcl")
         d1, d2 = self.root / "r1", self.root / "r2"
         d1.mkdir()
         d2.mkdir()
-        launcher = self.render_launcher(d1, self.root / "no-such-python", SCRIPT, home)
-        result = subprocess.run([str(launcher), "accounts"],
-                                capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 6)
-        self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
-        self.assertEqual(result.stderr, b"")
-        launcher = self.render_launcher(d2, sys.executable,
+        launcher = self.render_launcher(d1, self.root / "no-such-python",
+                                        SCRIPT, home)
+        merged, split = self.launch(launcher, ["accounts"])
+        self.assert_json_contract(merged, split, 6, CONFIG_DOC)
+        launcher = self.render_launcher(d2, synthetic_python(),
                                         self.root / "no-such-script.py", home)
-        result = subprocess.run([str(launcher), "accounts"],
-                                capture_output=True, timeout=20)
-        self.assertEqual(result.returncode, 6)
-        self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
-        self.assertEqual(result.stderr, b"")
+        merged, split = self.launch(launcher, ["accounts"])
+        self.assert_json_contract(merged, split, 6, CONFIG_DOC)
+
+    def test_launcher_normalizes_interpreter_failures(self):
+        home, _ = self.make_home("hni")
+
+        def render(python, script=SCRIPT, tag="r"):
+            sub = tempfile.mkdtemp(prefix=tag + "-", dir=self.temp.name)
+            return self.render_launcher(sub, python, script, home)
+
+        # (a) executable garbage text file: exec fallback reports 127 -> exit 6.
+        garbage = self.root / "garbage"
+        garbage.write_text("this is not a script or binary\n")
+        os.chmod(garbage, 0o755)
+        merged, split = self.launch(render(garbage, tag="a"), ["accounts"])
+        self.assert_json_contract(merged, split, 6, CONFIG_DOC)
+
+        # (b) interpreter that executes but exits 127 -> exit 6.
+        exit127 = self.root / "exit127"
+        exit127.write_text("#!/bin/sh\nexit 127\n")
+        os.chmod(exit127, 0o755)
+        merged, split = self.launch(render(exit127, tag="b"), ["accounts"])
+        self.assert_json_contract(merged, split, 6, CONFIG_DOC)
+
+        # (c) interpreter that prints junk to stdout+stderr then dies on a
+        # signal -> exit 7, captured junk never surfaces.
+        killer = self.root / "killer"
+        killer.write_text("#!/bin/sh\necho JUNK-OUT\necho JUNK-ERR >&2\n"
+                          "kill -SEGV $$\nexit 139\n")
+        os.chmod(killer, 0o755)
+        merged, split = self.launch(render(killer, tag="c"), ["accounts"])
+        self.assert_json_contract(merged, split, 7, INTERNAL_DOC)
+        self.assertNotIn(b"JUNK", merged.stdout)
+        self.assertNotIn(b"JUNK", split.stdout)
+
+    def test_launcher_passthrough_status_and_args(self):
+        home, _ = self.make_home("hpt")
+        exiter = self.root / "exiter.py"
+        exiter.write_text(
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'contentTrust': 'untrusted',"
+            " 'argv': sys.argv[1:]}))\n"
+            "sys.exit(int(sys.argv[1]))\n")
+        sub = self.root / "rpt"
+        sub.mkdir()
+        launcher = self.render_launcher(sub, synthetic_python(), exiter, home)
+        for code in (0, 2, 9):
+            merged, split = self.launch(launcher, [str(code), "arg with spaces"])
+            self.assertEqual(split.returncode, code)
+            self.assertEqual(split.stderr, b"")
+            doc = json.loads(split.stdout)
+            self.assertEqual(doc["contentTrust"], "untrusted")
+            self.assertEqual(doc["argv"], [str(code), "arg with spaces"])
+            self.assertEqual(json.loads(merged.stdout), doc)
+
+    def test_bash_env_never_runs_on_supported_launches(self):
+        home, _ = self.make_home("hba")
+        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
+        env, canaries = self.make_hooks()
+        for command in ([str(launcher), "list"], ["/bin/sh", str(launcher), "list"]):
+            with self.subTest(command=command):
+                self.assertFalse(canaries["bash_env"].exists())
+                result = subprocess.run(command, capture_output=True,
+                                        timeout=20, env=env)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+                self.assertEqual(result.stderr, b"")
+                self.assertFalse(canaries["bash_env"].exists())
+
+    @unittest.skipUnless(os.path.exists("/bin/bash"), "no /bin/bash available")
+    def test_bash_wrapper_runs_bash_env_hazard(self):
+        # Documents why `bash pigi_oneshot.sh` is forbidden: bash sources
+        # $BASH_ENV before the script's first line — the canary fires even
+        # though the run itself still ends in the fixed refusal.
+        home, _ = self.make_home("hbb")
+        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
+        env, canaries = self.make_hooks()
+        result = subprocess.run(["/bin/bash", str(launcher), "list"],
+                                capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertTrue(canaries["bash_env"].exists())
 
     def test_launcher_source_and_mode(self):
         self.assertTrue(os.access(LAUNCHER, os.X_OK))
@@ -780,6 +962,22 @@ class OneshotTests(unittest.TestCase):
         self.assertIn('"error":"untrusted_entry"', doc)
         self.assertIn("| 9 |", doc)
         self.assertIn("stderr", doc)
+
+    def test_docs_forbidden_wrappers_and_normalized_rows(self):
+        doc = DOCS.read_text()
+        self.assertIn("BASH_ENV", doc)
+        self.assertIn("bash pigi_oneshot.sh", doc)
+        # The bash-wrapper ban must be stated as forbidden/not supported.
+        self.assertRegex(doc,
+                         r"(?s)bash pigi_oneshot\.sh.{0,200}forbidden|"
+                         r"forbidden.{0,200}bash pigi_oneshot\.sh|"
+                         r"bash pigi_oneshot\.sh.{0,200}not supported|"
+                         r"not supported.{0,200}bash pigi_oneshot\.sh")
+        self.assertIn("directly", doc)
+        # Updated exit-table wording for launcher normalization.
+        self.assertIn("126/127", doc)
+        self.assertIn("normalized", doc)
+        self.assertIn("does not `exec`", doc)
 
     def test_config_loader_fails_closed(self):
         home = self.root / "cfg-home"
@@ -848,7 +1046,7 @@ class OneshotTests(unittest.TestCase):
         self.table["accounts"] = lambda params: accounts_result()
         missing = pigi_oneshot.Context(
             ACCOUNT, {ALLOWED}, socket_path=self.root / "missing.sock",
-            audit_db=self.root / "a2.sqlite3", python=sys.executable,
+            audit_db=self.root / "a2.sqlite3", python=synthetic_python(),
             home=self.temp.name, now_ms=lambda: NOW)
         code, out = self.invoke(["accounts"], missing)
         self.assertEqual(code, 5)
@@ -860,7 +1058,7 @@ class OneshotTests(unittest.TestCase):
         regular.write_text("keep")
         bad = pigi_oneshot.Context(
             ACCOUNT, {ALLOWED}, socket_path=regular, audit_db=self.root / "a3.sqlite3",
-            python=sys.executable, home=self.temp.name, now_ms=lambda: NOW)
+            python=synthetic_python(), home=self.temp.name, now_ms=lambda: NOW)
         code, out = self.invoke(["accounts"], bad)
         self.assertEqual(code, 5)
         self.assertNotIn(SENTINEL, out.decode("utf-8"))
@@ -905,8 +1103,8 @@ class OneshotTests(unittest.TestCase):
                  ["get-batch"] + ["i%d" % i for i in range(6)]]
         for argv in cases:
             with self.subTest(argv=argv):
-                merged = subprocess.run(
-                    [sys.executable, "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *argv],
+                merged = self.run_python(
+                    [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *argv],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
                     env=self.trusted_env())
                 self.assertEqual(merged.returncode, 2)
@@ -925,7 +1123,7 @@ class OneshotTests(unittest.TestCase):
         blocker.write_text("not a dir")
         ctx = pigi_oneshot.Context(
             ACCOUNT, {ALLOWED}, socket_path=self.agent.endpoint,
-            audit_db=blocker / "audit.sqlite3", python=sys.executable,
+            audit_db=blocker / "audit.sqlite3", python=synthetic_python(),
             home=self.temp.name, now_ms=lambda: NOW)
         self.table["accounts"] = lambda params: accounts_result()
         code, out = self.invoke(["accounts"], ctx)  # invoke asserts stderr == ""
@@ -961,12 +1159,46 @@ class OneshotTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_isolated(str(home), str(support / "pigi" / "oneshot.json"),
                             str(sock), str(audit_path))
-        # A path merely under the real home (like this checkout) is allowed.
-        under = os.path.realpath(Path(__file__).parent)
-        self.assertTrue(under.startswith(os.path.realpath(real_home)))
-        assert_isolated(under, os.path.join(under, "oneshot.json"),
-                        os.path.join(under, "agent.sock"),
-                        os.path.join(under, "audit.sqlite3"))
+        # A synthetic path merely under the real home is allowed — the guard
+        # compares path strings only, nothing is created or touched there.
+        under = os.path.join(os.path.realpath(real_home),
+                             "synthetic-not-protected-dir")
+        assert_isolated(under, under + "/oneshot.json", under + "/agent.sock",
+                        under + "/audit.sqlite3")
+
+    def test_interpreter_guard(self):
+        home = self.root / "ig"
+        home.mkdir()
+        paths = [str(home / "oneshot.json"), str(home / "agent.sock"),
+                 str(home / "audit.sqlite3")]
+        assert_isolated(str(home), *paths, interpreter=synthetic_python())
+        pinned = PINNED_LAUNCHER_PYTHON
+        variants = {pinned, os.path.realpath(pinned),
+                    os.path.normpath(pinned).replace(
+                        "/bin/python3", "/bin/../bin/python3")}
+        for bad in variants:
+            with self.subTest(interpreter=bad):
+                with self.assertRaises(AssertionError):
+                    assert_isolated(str(home), *paths, interpreter=bad)
+        # render_launcher refuses the real interpreter before writing anything.
+        outdir = self.root / "render-deny"
+        outdir.mkdir()
+        with self.assertRaises(AssertionError):
+            self.render_launcher(outdir, pinned, SCRIPT, home)
+        self.assertEqual(list(outdir.iterdir()), [])
+        # The spawn helper refuses before Popen is ever invoked.
+        with patch.object(subprocess, "run") as mock_run:
+            with self.assertRaises(AssertionError):
+                self.run_python([pinned, "--version"])
+        mock_run.assert_not_called()
+
+    def test_fixture_socket_paths_stay_short(self):
+        # AF_UNIX sun_path is 104 bytes on macOS; a long TMPDIR must surface as
+        # a clear failure here, not an obscure bind error in a fixture.
+        self.assertLessEqual(len(os.fsencode(str(self.ctx.socket_path))), 100)
+        longest = (self.root / "00000000" / "Library" / "Application Support"
+                   / "pigi" / "agent.sock")
+        self.assertLessEqual(len(os.fsencode(str(longest))), 100)
 
     def test_main_harness_refuses_real_home(self):
         with patch.object(pigi_oneshot, "main") as mock_main:
@@ -977,11 +1209,11 @@ class OneshotTests(unittest.TestCase):
     def test_main_contract_end_to_end(self):
         valid = {"account": ACCOUNT, "senders": [ALLOWED]}
 
-        home, _ = self.make_home("m6-missing")  # no config file
+        home, _ = self.make_home("h6a")  # no config file
         code, _, doc = self.invoke_main(["accounts"], home)
         self.assertEqual((code, doc), (6, CONFIG_DOC))
 
-        home, _ = self.make_home("m6-mode")
+        home, _ = self.make_home("h6b")
         unsafe = home / "Library" / "Application Support" / "pigi" / "oneshot.json"
         unsafe.write_text(json.dumps(valid))
         os.chmod(unsafe, 0o644)
@@ -993,18 +1225,18 @@ class OneshotTests(unittest.TestCase):
             code, _, doc = self.invoke_main(argv, home)
             self.assertEqual((code, doc), (2, USAGE_DOC))
 
-        home, _ = self.make_home("m7", valid)
+        home, _ = self.make_home("h7", valid)
         boom = patch.object(pigi_oneshot, "run_command",
                             side_effect=RuntimeError("boom"))
         code, _, doc = self.invoke_main(["accounts"], home, patches=(boom,))
         self.assertEqual((code, doc), (7, INTERNAL_DOC))
 
-        home, _ = self.make_home("m5", valid)  # config ok, socket missing
+        home, _ = self.make_home("h5", valid)  # config ok, socket missing
         code, _, doc = self.invoke_main(["accounts"], home)
         self.assertEqual(code, 5)
         self.assertIn(doc["error"], FIXED_ERROR_CODES)
 
-        home, _ = self.make_home("m0", valid, agent=True)
+        home, _ = self.make_home("h0", valid, agent=True)
         self.table["accounts"] = lambda params: accounts_result()
         code, out, doc = self.invoke_main(["accounts"], home)
         self.assertEqual(code, 0)

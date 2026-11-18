@@ -29,9 +29,16 @@ command line — is refused with exit 9. The reason: a Python interpreter runs
 its site hooks (`sitecustomize`, `usercustomize`, `.pth` files, `PYTHONPATH`
 modules) *before* the script's first line, so no in-script check can undo that;
 entry has to be controlled outside the script. The launcher therefore scrubs
-the environment with `env -i`, execs a pinned interpreter with
+the environment with `env -i`, runs a pinned interpreter with
 `-I -S -B -X utf8`, and marks the run with the trusted-entry flag the script's
 gate requires (see Hardening).
+
+The launcher must be executed **directly** — `./pigi_oneshot.sh` or
+`/bin/sh pigi_oneshot.sh`. Wrapping it in bash — `bash pigi_oneshot.sh`,
+`bash -c "…pigi_oneshot.sh…"`, `/bin/bash <launcher>` — is **forbidden**: bash
+reads `$BASH_ENV` before the script's first line, which no launcher code can
+prevent. `/bin/sh` and direct execution do not trigger `BASH_ENV` (observed on
+macOS).
 
 | Subcommand | Effect |
 | --- | --- |
@@ -103,8 +110,8 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | 3 | sender not on the allowlist | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
 | 4 | `not_found` | `{"contentTrust":"untrusted","error":"not_found"}` |
 | 5 | upstream/transport/MCP error | `{"contentTrust":"untrusted","error":<fixed code>}` |
-| 6 | config or environment failure (missing/unsafe config, missing pinned interpreter) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
-| 7 | internal error | `{"contentTrust":"untrusted","error":"internal_error"}` |
+| 6 | config or environment failure — missing/unsafe config, missing pinned interpreter, or pinned interpreter fails to execute (exec status 126/127, normalized by the launcher) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
+| 7 | internal error — also an interpreter crash/signal or any unexpected child status, normalized by the launcher | `{"contentTrust":"untrusted","error":"internal_error"}` |
 | 8 | success but output truncated; data incomplete — do not treat as complete | truncated envelope with `"truncated":true` |
 | 9 | untrusted entry — not launched by `pigi_oneshot.sh` | `{"contentTrust":"untrusted","error":"untrusted_entry"}` |
 
@@ -144,6 +151,14 @@ environment — `HOME`, `PATH`, `LANG`, `LC_ALL`, and the flag
 script is not a regular file, the launcher prints
 `{"contentTrust":"untrusted","error":"configuration_unavailable"}` on stdout
 and exits 6 — fail closed, before the interpreter runs.
+
+The launcher does not `exec` the child: it runs it with stderr sent to
+`/dev/null`, captures stdout, and normalizes the exit status — the script's
+own codes (0, 2–9) pass through with their JSON unchanged; an interpreter that
+fails to execute (126/127) becomes exit 6; a signal, crash, or any other
+status becomes exit 7 `internal_error` with the captured output discarded.
+That keeps the contract — stderr always empty, stdout exactly one JSON
+document — true for every exit path, including interpreter startup failures.
 
 `pigi_oneshot.py` itself opens with a gate — before any import other than
 `os`/`sys` — that requires exactly that flag value *and* `sys.flags`
@@ -194,6 +209,9 @@ creating another audit object). Every `tools/call` still lands in the adapter's
 - `/bin/sh` startup, the dyld/kernel exec environment, and the pinned
   interpreter's own installation integrity are outside what the launcher can
   control.
+- Output integrity relies on the pinned interpreter actually running the
+  script: a replaced interpreter that exits 0 or 2–9 with arbitrary stdout is
+  not detected — only exec failure (126/127) and crashes are normalized.
 - The pinned literals inside `pigi_oneshot.sh` must be edited only as rendered
   values at rollout (the installed copy is never edited in place by tests).
 - Exit 5 covers any upstream, transport or MCP failure; the fixed `error` codes

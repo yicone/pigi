@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Hardened one-shot reader over the account-scoped pigi-mcp adapter. Python 3.10+, stdlib only."""
+"""Hardened one-shot reader over the account-scoped pigi-mcp adapter. Python 3.10+, stdlib only.
+
+The historical command line is the billing profile. A leading argv token
+selects billing or full; the environment never does. The full profile's
+commands live in pigi_oneshot_full.py.
+"""
 # Only os and sys may be imported before the trusted-entry gate: both are
 # already in sys.modules at interpreter startup, so nothing PYTHONPATH-
 # controlled can run before the refusal below. Every other import, stdlib or
@@ -62,6 +67,11 @@ except ImportError:
 MAX_STDOUT = 65_536
 TRUNCATION_NOTICE = "pigi-oneshot: output truncated at 65536 bytes"
 CONFIG_PARTS = ("Library", "Application Support", "pigi", "oneshot.json")
+# Profile names are fixed argv tokens. A missing token stays the billing
+# command line so the deployed Billing invocation does not change.
+PROFILE_BILLING = "billing"
+PROFILE_FULL = "full"
+PROFILES = (PROFILE_BILLING, PROFILE_FULL)
 SEARCH_QUERY = "Cursor"
 MESSAGE_ID = re.compile(r"[A-Za-z0-9._@=+-]{1,256}")
 CHILD_TIMEOUT = 20
@@ -80,31 +90,46 @@ class ConfigError(Exception):
     pass
 
 
+def valid_account(account):
+    """True for a non-blank account of at most 1024 UTF-8 bytes. Not stripped."""
+    return (isinstance(account, str) and bool(account.strip())
+            and len(account.encode("utf-8")) <= 1024)
+
+
+def read_config_file(path):
+    """Read one outside config file, or raise ConfigError / OSError.
+
+    The file must be a regular 0600 inode, one hard link, owned by the
+    effective user, and not a symlink. Its parent must be a real directory
+    owned by that user and not group- or world-writable.
+    """
+    parent = path.parent.lstat()
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022):
+        raise ConfigError
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise ConfigError
+        data = os.read(fd, MAX_STDOUT + 1)
+        if len(data) > MAX_STDOUT:
+            raise ConfigError
+    finally:
+        os.close(fd)
+    return data
+
+
 def load_config(home):
     """Return {"account": str, "senders": frozenset}; raise ConfigError otherwise."""
     try:
-        path = Path(home).joinpath(*CONFIG_PARTS)
-        parent = path.parent.lstat()
-        if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid()
-                or stat.S_IMODE(parent.st_mode) & 0o022):
-            raise ConfigError
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
-                raise ConfigError
-            data = os.read(fd, MAX_STDOUT + 1)
-            if len(data) > MAX_STDOUT:
-                raise ConfigError
-        finally:
-            os.close(fd)
+        data = read_config_file(Path(home).joinpath(*CONFIG_PARTS))
         doc = json.loads(data)
         if not isinstance(doc, dict) or set(doc) != {"account", "senders"}:
             raise ConfigError
         account, senders = doc["account"], doc["senders"]
-        if (not isinstance(account, str) or not account.strip()
-                or len(account.encode("utf-8")) > 1024):
+        if not valid_account(account):
             raise ConfigError
         if (not isinstance(senders, list) or not senders or len(senders) > 64
                 or any(not isinstance(item, str) or not item.strip()
@@ -120,7 +145,8 @@ class Context:
     """Execution context; tests inject the socket, audit path, interpreter and clock."""
 
     def __init__(self, account, senders, socket_path=DEFAULT_SOCKET,
-                 audit_db=DEFAULT_AUDIT, python=None, home=None, now_ms=None):
+                 audit_db=DEFAULT_AUDIT, python=None, home=None, now_ms=None,
+                 profile=None):
         self.account = account
         self.senders = frozenset(senders)
         self.socket_path = socket_path
@@ -128,6 +154,7 @@ class Context:
         self.python = python or sys.executable
         self.home = PINNED_HOME if home is None else home
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
+        self.profile = PROFILE_BILLING if profile is None else profile
 
 
 class UpstreamError(Exception):
@@ -444,6 +471,8 @@ def parse_args(argv):
 
 
 def run_command(args, ctx):
+    if ctx.profile != PROFILE_BILLING:
+        return EXIT_USAGE, USAGE_ERROR_JSON.encode("ascii")
     try:
         if args.command == "accounts":
             code, payload = command_accounts(args, ctx)
@@ -473,6 +502,18 @@ def execute(argv, ctx):
         return EXIT_INTERNAL, INTERNAL_ERROR_JSON.encode("ascii")
 
 
+def select_profile(argv):
+    """Return (profile, remaining argv). The environment is not consulted.
+
+    A leading `billing` or `full` token is the only selector. Any other argv,
+    including the historical billing command line, stays on the billing profile
+    and is rejected by that parser before config or socket use.
+    """
+    if argv and argv[0] in PROFILES:
+        return argv[0], argv[1:]
+    return PROFILE_BILLING, argv
+
+
 def run_main(argv):
     """Whole CLI flow as (exit_code, stdout_bytes); every failure maps to JSON."""
     try:
@@ -480,15 +521,27 @@ def run_main(argv):
             return EXIT_UNTRUSTED_ENTRY, UNTRUSTED_ENTRY_JSON.encode("ascii")
         os.umask(0o077)
         # Reject arguments before any config read or socket use.
+        profile, rest = select_profile(argv)
         try:
-            args = parse_args(argv)
+            if profile == PROFILE_FULL:
+                import pigi_oneshot_full as full_profile
+                args = full_profile.parse_args(rest)
+            else:
+                args = parse_args(rest)
         except SystemExit:
             return EXIT_USAGE, USAGE_ERROR_JSON.encode("ascii")
         home = PINNED_HOME
+        socket_path = Path(home) / "Library/Application Support/pigi/agent.sock"
+        audit_db = Path(home) / "Library/Application Support/pigi-mcp/audit.sqlite3"
+        if profile == PROFILE_FULL:
+            config = full_profile.load_config(home)
+            ctx = Context(config["account"], (), home=home, socket_path=socket_path,
+                          audit_db=audit_db, profile=PROFILE_FULL)
+            return full_profile.run_command(args, ctx)
         config = load_config(home)
         ctx = Context(config["account"], config["senders"], home=home,
-                      socket_path=Path(home) / "Library/Application Support/pigi/agent.sock",
-                      audit_db=Path(home) / "Library/Application Support/pigi-mcp/audit.sqlite3")
+                      socket_path=socket_path, audit_db=audit_db,
+                      profile=PROFILE_BILLING)
         return run_command(args, ctx)
     except ConfigError:
         return EXIT_CONFIG, CONFIG_ERROR_JSON.encode("ascii")

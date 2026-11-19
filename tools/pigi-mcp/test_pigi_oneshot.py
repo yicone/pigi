@@ -17,15 +17,18 @@ from unittest.mock import patch
 
 import audit
 import pigi_oneshot
+import pigi_oneshot_full
 from pigi_mcp import TRUST_NOTICE
 import transport
 
 SCRIPT = Path(__file__).with_name("pigi_oneshot.py")
+FULL_SCRIPT = SCRIPT.with_name("pigi_oneshot_full.py")
 LAUNCHER = SCRIPT.with_name("pigi_oneshot.sh")
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DOCS = REPO_ROOT / "docs" / "pigi-oneshot.md"
 ORIGINAL_PINNED_HOME = pigi_oneshot.PINNED_HOME
 ACCOUNT = "target@example.com"
+FULL_ACCOUNT = "full@example.net"
 ALLOWED = "allowed@example.com"
 OTHER = "other@example.org"
 NOW = 1_800_000_000_000
@@ -1158,7 +1161,7 @@ class OneshotTests(unittest.TestCase):
         self.assertTrue(str(self.ctx.socket_path).startswith(self.temp.name))
         domains = {"example.com", "example.org", "example.net"}
         pattern = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
-        for path in (SCRIPT, LAUNCHER, Path(__file__), DOCS):
+        for path in (SCRIPT, FULL_SCRIPT, LAUNCHER, Path(__file__), DOCS):
             self.assertTrue(path.exists(), path)
             for match in pattern.finditer(path.read_text()):
                 self.assertIn(match.group(1).lower(), domains, (path, match.group(0)))
@@ -1415,6 +1418,409 @@ class OneshotTests(unittest.TestCase):
         code, out, doc = self.invoke_main(["get", "m1"], home)
         self.assertEqual((code, doc["truncated"]), (8, True))
         self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+
+    def full_ctx(self):
+        return pigi_oneshot.Context(
+            FULL_ACCOUNT, (), socket_path=self.agent.endpoint,
+            audit_db=self.root / "audit.sqlite3", python=synthetic_python(),
+            home=self.temp.name, now_ms=lambda: NOW, profile="full")
+
+    def invoke_full(self, argv, ctx=None):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = pigi_oneshot_full.execute(argv, ctx or self.full_ctx())
+        self.assertEqual(err.getvalue(), "")
+        return code, out
+
+    def write_profile_config(self, home, name, doc, mode=0o600):
+        path = Path(home) / "Library" / "Application Support" / "pigi" / name
+        path.write_text(json.dumps(doc))
+        os.chmod(path, mode)
+        return path
+
+    def test_profile_token_is_argv_only(self):
+        self.assertEqual(pigi_oneshot.select_profile(["search"]),
+                         ("billing", ["search"]))
+        self.assertEqual(pigi_oneshot.select_profile(["billing", "search"]),
+                         ("billing", ["search"]))
+        self.assertEqual(pigi_oneshot.select_profile(["full", "list"]),
+                         ("full", ["list"]))
+        self.assertEqual(pigi_oneshot.select_profile(["FULL", "list"]),
+                         ("billing", ["FULL", "list"]))
+        self.assertEqual(pigi_oneshot.select_profile([]), ("billing", []))
+        billing = {"account": ACCOUNT, "senders": [ALLOWED]}
+        home, listener = self.make_home("sel", billing, agent=True)
+        self.write_profile_config(home, "oneshot-full.json", {"account": FULL_ACCOUNT})
+        marker = home / "Library" / "Application Support" / "pigi" / "profile.json"
+        marker.write_text('{"profile": "full"}')
+        os.chmod(marker, 0o666)
+
+        def accounts(params):
+            return {"accounts": [{"account": params["account"], "kind": "imap"}],
+                    "contentTrust": "untrusted", "capabilities": CAPS}
+
+        self.table["accounts"] = accounts
+        self.table["search"] = lambda params: search_result([])
+        with patch.dict(os.environ, {"PIGI_ONESHOT_PROFILE": "full",
+                                     "PIGI_PROFILE": "full"}):
+            code, _, doc = self.invoke_main(["accounts"], home)
+            self.assertEqual(code, 0)
+            self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
+            code, _, _ = self.invoke_main(["search"], home)
+            self.assertEqual(code, 0)
+            self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
+            self.assertEqual(listener.requests[-1]["params"]["query"], "Cursor")
+            code, _, doc = self.invoke_main(["billing", "accounts"], home)
+            self.assertEqual(code, 0)
+            self.assertEqual(doc["accounts"], [{"account": ACCOUNT, "kind": "imap"}])
+            self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
+            code, _, doc = self.invoke_main(["full", "accounts"], home)
+            self.assertEqual(code, 0)
+            self.assertEqual(doc["accounts"], [{"account": FULL_ACCOUNT, "kind": "imap"}])
+            self.assertEqual(listener.requests[-1]["params"]["account"], FULL_ACCOUNT)
+            self.assertNotIn(ACCOUNT, json.dumps(doc))
+        self.assertEqual(self.agent.requests, [])
+
+    def test_billing_command_line_still_rejects_list(self):
+        for argv in (["list"], ["billing", "list"], ["full"],
+                     ["full", "get_verification_code"], ["no-such", "accounts"]):
+            with self.subTest(argv=argv):
+                result = self.cli(argv)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertEqual(self.agent.requests, [])
+
+    def test_billing_get_full_is_a_message_id(self):
+        self.table["get"] = lambda params: get_result(make_message("full"), "body")
+        code, out = self.invoke(["get", "full"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.parse(out)["text"], "body")
+        self.assertEqual(self.agent.requests[0]["params"],
+                         {"account": ACCOUNT, "messageID": "full"})
+
+    def test_full_commands_on_fake_socket(self):
+        ctx = self.full_ctx()
+
+        def own(message_id, sender=OTHER):
+            return make_message(message_id, sender, account=FULL_ACCOUNT)
+
+        self.table["accounts"] = lambda params: {
+            "accounts": [{"account": params["account"], "kind": "imap"}],
+            "contentTrust": "untrusted", "capabilities": CAPS}
+        code, out = self.invoke_full(["accounts"], ctx)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.parse(out)["accounts"],
+                         [{"account": FULL_ACCOUNT, "kind": "imap"}])
+        self.assertEqual(self.agent.requests[-1]["params"]["account"], FULL_ACCOUNT)
+
+        self.table["list"] = lambda params: search_result([own("m1")])
+        code, out = self.invoke_full(["list"], ctx)
+        self.assertEqual(code, 0)
+        doc = self.parse(out)
+        self.assertEqual(doc["command"], "list")
+        self.assertEqual(doc["items"][0]["fromEmail"], OTHER)
+        self.assertNotIn("filteredOut", doc)
+        params = self.agent.requests[-1]["params"]
+        self.assertEqual(params, {"account": FULL_ACCOUNT,
+                                  "since": NOW - 7 * 86_400_000, "limit": 10})
+        code, out = self.invoke_full(["list", "--since-days", "30", "--limit", "20"], ctx)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.agent.requests[-1]["params"]["limit"], 20)
+        self.assertEqual(self.agent.requests[-1]["params"]["since"], NOW - 30 * 86_400_000)
+        self.assertNotIn("offset", self.agent.requests[-1]["params"])
+
+        self.table["search"] = lambda params: search_result([own("m2")])
+        code, out = self.invoke_full(["search", "--query", "发票 hello"], ctx)
+        self.assertEqual(code, 0)
+        doc = self.parse(out)
+        self.assertEqual(doc["items"][0]["messageID"], "m2")
+        self.assertNotIn("filteredOut", doc)
+        self.assertIn(OTHER, out.decode("utf-8"))
+        self.assertEqual(self.agent.requests[-1]["params"]["query"], "发票 hello")
+        self.assertNotEqual(self.agent.requests[-1]["params"]["query"], "Cursor")
+
+        self.table["get"] = lambda params: get_result(own("m3"), "full-body")
+        code, out = self.invoke_full(["get", "m3"], ctx)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.parse(out)["text"], "full-body")
+        self.assertEqual(self.parse(out)["contentTrust"], "untrusted")
+
+        def batch(params):
+            if params["messageID"] == "gone":
+                raise AgentError("not_found")
+            if params["messageID"] == "foreign":
+                return get_result(make_message("foreign", account=ACCOUNT), SENTINEL)
+            return get_result(own(params["messageID"]), "ok-body")
+
+        self.table["get"] = batch
+        code, out = self.invoke_full(["get-batch", "a", "b"], ctx)
+        self.assertEqual(code, 0)
+        self.assertEqual([entry["status"] for entry in self.parse(out)["results"]],
+                         ["ok", "ok"])
+        self.assertEqual(self.methods_seen().count("get"), 3)
+        code, out = self.invoke_full(["get-batch", "a", "foreign", "gone"], ctx)
+        self.assertEqual(code, 5)
+        doc = self.parse(out)
+        self.assertEqual([entry["status"] for entry in doc["results"]],
+                         ["ok", "error", "not_found"])
+        self.assertNotIn("message", doc["results"][1])
+        self.assertNotIn(SENTINEL, out.decode("utf-8"))
+        self.assertIn(("list_messages", "ok"), self.audit_rows())
+        self.assertNotIn("get_verification_code",
+                         [row[0] for row in self.audit_rows()])
+
+    def test_full_bounds_rejected_without_socket(self):
+        rejected = [
+            ["list", "--since-days", "31"], ["list", "--since-days", "0"],
+            ["list", "--limit", "21"], ["list", "--limit", "0"],
+            ["list", "--offset", "1"], ["list", "--offset=0"],
+            ["list", "--account", FULL_ACCOUNT], ["list", "--status", "inbox"],
+            ["list", "--lim", "5"], ["list", "--since", "3"],
+            ["search"], ["search", "--query", ""], ["search", "--query", "   "],
+            ["search", "--query", "a\nb"], ["search", "--query", "a;b"],
+            ["search", "--query", "a/b"], ["search", "--query", "a" * 129],
+            ["search", "--query", "中" * 100],
+            ["search", "--query", "ok", "--since-days", "31"],
+            ["search", "--query", "\u202ehidden"],
+            ["get-batch"] + ["m%d" % i for i in range(6)], ["get-batch"],
+            ["get_verification_code"], ["codes"], ["--account", ACCOUNT, "list"],
+            ["--help"], [],
+        ]
+        for argv in rejected:
+            with self.subTest(argv=argv):
+                code, out = self.invoke_full(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(self.parse(out), USAGE_DOC)
+        self.assertEqual(self.agent.requests, [])
+        for argv in (["full", "list", "--limit", "21"],
+                     ["full", "search", "--query", "bad/query"],
+                     ["full", "get-batch"] + ["m%d" % i for i in range(6)]):
+            result = self.cli(argv)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.table["search"] = lambda params: search_result([])
+        code, _ = self.invoke_full(["search", "--query", "a" * 128])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.agent.requests[-1]["params"]["query"], "a" * 128)
+        code, _ = self.invoke_full(["search", "--query", "中" * 85])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.agent.requests[-1]["params"]["query"].encode("utf-8")), 255)
+
+    def test_profile_isolation_and_foreign_account(self):
+        code, out = self.invoke_full(["list"], self.ctx)
+        self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        code, out = self.invoke(["accounts"], self.full_ctx())
+        self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        self.assertEqual(self.agent.requests, [])
+
+        billing = {"account": ACCOUNT, "senders": [ALLOWED]}
+        home, listener = self.make_home("iso", billing, agent=True)
+        self.write_profile_config(home, "oneshot-full.json", {"account": FULL_ACCOUNT})
+
+        def search(params):
+            return search_result([make_message(
+                "m", OTHER, account=params["account"])])
+
+        def get(params):
+            if params["account"] == FULL_ACCOUNT:
+                return get_result(make_message(
+                    params["messageID"], OTHER, account=FULL_ACCOUNT), "full-body")
+            return get_result(make_message(params["messageID"], OTHER), SENTINEL)
+
+        self.table["search"] = search
+        self.table["get"] = get
+        code, out, doc = self.invoke_main(["search"], home)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["filteredOut"], 1)
+        self.assertEqual(doc["items"], [])
+        self.assertNotIn(OTHER, out.decode("utf-8"))
+        self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
+        self.assertEqual(listener.requests[-1]["params"]["query"], "Cursor")
+        code, out, doc = self.invoke_main(["billing", "get", "m1"], home)
+        self.assertEqual(code, 3)
+        self.assertFalse(doc["allowed"])
+        self.assertNotIn(SENTINEL, out.decode("utf-8"))
+        before = len(listener.requests)
+        code, _, doc = self.invoke_main(
+            ["full", "--account", ACCOUNT, "get", "m1"], home)
+        self.assertEqual((code, doc), (2, USAGE_DOC))
+        self.assertEqual(len(listener.requests), before)
+        code, out, doc = self.invoke_main(
+            ["full", "search", "--query", "synthetic"], home)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["items"][0]["fromEmail"], OTHER)
+        self.assertNotIn("filteredOut", doc)
+        self.assertEqual(listener.requests[-1]["params"]["account"], FULL_ACCOUNT)
+        self.assertEqual(listener.requests[-1]["params"]["query"], "synthetic")
+        code, out, doc = self.invoke_main(["full", "get", "m9"], home)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["text"], "full-body")
+        self.assertEqual(listener.requests[-1]["params"]["account"], FULL_ACCOUNT)
+
+        self.table["get"] = lambda params: get_result(
+            make_message("m1", OTHER, subject="SUBJ_SENTINEL"), SENTINEL)
+        code, out = self.invoke_full(["get", "m1"])
+        self.assertEqual(code, 5)
+        self.assertEqual(self.parse(out)["error"], "invalid_response")
+        for leak in (SENTINEL, "SUBJ_SENTINEL", ACCOUNT):
+            self.assertNotIn(leak, out.decode("utf-8"))
+        self.table["list"] = lambda params: search_result([
+            make_message("foreign", account=ACCOUNT),
+            make_message("own", account=FULL_ACCOUNT)])
+        code, out = self.invoke_full(["list"])
+        self.assertEqual(code, 5)
+        self.assertNotIn("foreign", out.decode("utf-8"))
+        with patch.object(pigi_oneshot, "single_call", return_value=(
+                "ok", {"accounts": [{"account": ACCOUNT, "kind": "imap"},
+                                    {"account": FULL_ACCOUNT, "kind": "imap"}],
+                       "contentTrust": "untrusted"})):
+            code, out = pigi_oneshot_full.execute(["accounts"], self.full_ctx())
+        self.assertEqual(code, 5)
+        self.assertNotIn(ACCOUNT, out.decode("utf-8"))
+
+    def test_full_config_fails_closed(self):
+        home = self.root / "fullcfg"
+        config_dir = home / "Library" / "Application Support" / "pigi"
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        config_dir.mkdir(parents=True, mode=0o700)
+        billing = config_dir / "oneshot.json"
+        billing.write_text(json.dumps({"account": ACCOUNT, "senders": [ALLOWED]}))
+        os.chmod(billing, 0o600)
+        path = config_dir / "oneshot-full.json"
+        path.write_text(json.dumps({"account": FULL_ACCOUNT}))
+        os.chmod(path, 0o644)
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        self.assertEqual(pigi_oneshot.load_config(str(home))["account"], ACCOUNT)
+        os.chmod(path, 0o600)
+        link = config_dir / "extra.json"
+        os.link(path, link)
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        link.unlink()
+        path.unlink()
+        path.symlink_to(billing)
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        path.unlink()
+        for doc in ({}, {"senders": [ALLOWED]},
+                    {"account": FULL_ACCOUNT, "senders": [ALLOWED]},
+                    {"account": FULL_ACCOUNT, "extra": 1},
+                    {"account": "  "}, {"account": 5},
+                    {"account": "x" * 1025}):
+            path.write_text(json.dumps(doc))
+            os.chmod(path, 0o600)
+            with self.assertRaises(pigi_oneshot.ConfigError):
+                pigi_oneshot_full.load_config(str(home))
+        path.write_text("not json")
+        os.chmod(path, 0o600)
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        os.chmod(config_dir, 0o777)
+        path.write_text(json.dumps({"account": FULL_ACCOUNT}))
+        os.chmod(path, 0o600)
+        with self.assertRaises(pigi_oneshot.ConfigError):
+            pigi_oneshot_full.load_config(str(home))
+        os.chmod(config_dir, 0o700)
+        loaded = pigi_oneshot_full.load_config(str(home))
+        self.assertEqual(loaded, {"account": FULL_ACCOUNT})
+        self.assertEqual(pigi_oneshot.load_config(str(home))["senders"],
+                         frozenset({ALLOWED}))
+
+    def test_missing_full_config_does_not_affect_billing(self):
+        home, listener = self.make_home(
+            "miss", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
+        code, _, doc = self.invoke_main(["full", "accounts"], home)
+        self.assertEqual((code, doc), (6, CONFIG_DOC))
+        self.assertEqual(listener.requests, [])
+
+        def accounts(params):
+            return {"accounts": [{"account": params["account"], "kind": "imap"}],
+                    "contentTrust": "untrusted", "capabilities": CAPS}
+
+        self.table["accounts"] = accounts
+        code, _, doc = self.invoke_main(["accounts"], home)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["accounts"][0]["account"], ACCOUNT)
+        self.write_profile_config(home, "oneshot-full.json",
+                                  {"account": FULL_ACCOUNT}, mode=0o644)
+        code, _, doc = self.invoke_main(["full", "list"], home)
+        self.assertEqual((code, doc), (6, CONFIG_DOC))
+        code, _, doc = self.invoke_main(["accounts"], home)
+        self.assertEqual(code, 0)
+        called = []
+
+        def explode(home_arg):
+            called.append(home_arg)
+            raise AssertionError("config was read")
+
+        with patch.object(pigi_oneshot, "load_config", explode), \
+                patch.object(pigi_oneshot_full, "load_config", explode):
+            for argv in (["other", "list"], ["full", "list", "--limit", "21"],
+                         ["full", "search", "--query", "a/b"]):
+                code, _, doc = self.invoke_main(argv, home)
+                self.assertEqual((code, doc), (2, USAGE_DOC))
+        self.assertEqual(called, [])
+
+    def test_full_truncation_stays_valid_json(self):
+        big = [make_message("m%d" % i, OTHER, account=FULL_ACCOUNT, snippet="A" * 30_000)
+               for i in range(3)]
+        self.table["list"] = lambda params: search_result(big)
+        code, out = self.invoke_full(["list", "--limit", "20"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["command"], "list")
+        self.assertEqual(doc["contentTrust"], "untrusted")
+        self.assertNotIn("filteredOut", doc)
+        self.assertEqual(len(doc["items"]) + doc["omittedItems"], 3)
+        message = make_message("m1", account=FULL_ACCOUNT)
+        self.table["get"] = lambda params: get_result(message, "y" * 100_000)
+        code, out = self.invoke_full(["get", "m1"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        self.assertTrue(self.parse(out)["textTruncated"])
+
+    def test_full_module_has_no_write_or_code_path(self):
+        source = FULL_SCRIPT.read_text()
+        for forbidden in ("get_verification_code", '"codes"', "mail.db",
+                          "Keychain", "SecItem", "urllib", "webbrowser", "smtplib"):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("list_messages", source)
+        billing = SCRIPT.read_text()
+        for forbidden in ('"list"', '"codes"', "get_verification_code", "list_messages"):
+            self.assertNotIn(forbidden, billing)
+
+    def test_launcher_forwards_visible_full_token(self):
+        home, _ = self.make_home("lfull")
+        launch_dir = self.root / "lfull-sh"
+        launch_dir.mkdir()
+        launcher = self.render_launcher(launch_dir, synthetic_python(), SCRIPT, home)
+        env, canaries = self.make_hooks()
+        result = subprocess.run(
+            [str(launcher), "full", "search", "--since-days", "31"],
+            capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertFalse(canaries["bash_env"].exists())
+
+    def test_docs_describe_both_profiles(self):
+        doc = DOCS.read_text()
+        self.assertIn("oneshot.json", doc)
+        self.assertIn("oneshot-full.json", doc)
+        self.assertIn("pigi_oneshot.sh full", doc)
+        self.assertIn("pigi_oneshot.sh billing", doc)
+        self.assertIn("0600", doc)
+        self.assertIn("任何邮件都会进入调用方上下文", doc)
+        self.assertIn("contentTrust", doc)
+        self.assertIn("256", doc)
+        self.assertIn("1–30", doc)
+        transition = (REPO_ROOT / "docs" / "billing-ssh-transition.md").read_text()
+        self.assertIn("billing profile", transition)
+        self.assertIn("oneshot-full.json", transition)
 
 
 if __name__ == "__main__":

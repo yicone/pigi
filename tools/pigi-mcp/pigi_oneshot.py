@@ -520,6 +520,12 @@ def run_main(argv):
         if not trusted_entry():
             return EXIT_UNTRUSTED_ENTRY, UNTRUSTED_ENTRY_JSON.encode("ascii")
         os.umask(0o077)
+        # The launcher executes this file as __main__. Bind that module under
+        # its import name before any sibling import, so configuration errors
+        # raised by the sibling are the same class this function catches.
+        # A second loaded copy would miss this handler and exit 7.
+        if __name__ == "__main__":
+            sys.modules["pigi_oneshot"] = sys.modules[__name__]
         # Reject arguments before any config read or socket use.
         profile, rest = select_profile(argv)
         try:

@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import pwd
 import re
 import socket
@@ -1806,6 +1807,78 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(result.stderr, b"")
         self.assertEqual(self.parse(result.stdout), USAGE_DOC)
         self.assertFalse(canaries["bash_env"].exists())
+
+    def test_launcher_full_config_failures_exit_six(self):
+        """Real .sh entry, not an in-process main() call.
+
+        The script runs as __main__. Configuration failures must still be
+        exit 6, and must not open the socket.
+        """
+        home, listener = self.make_home(
+            "entry", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        for name in ("pigi_oneshot.py", "pigi_oneshot_full.py", "pigi_mcp.py",
+                     "transport.py", "audit.py"):
+            shutil.copyfile(SCRIPT.parent / name, runtime / name)
+        script = runtime / "pigi_oneshot.py"
+        pinned = 'PINNED_HOME = "/Users/tr"'
+        text = script.read_text()
+        self.assertEqual(text.count(pinned), 1)
+        script.write_text(text.replace(pinned, "PINNED_HOME = " + repr(str(home)), 1))
+        self.assertEqual(SCRIPT.read_text().count(pinned), 1)
+        launcher = self.render_launcher(runtime, synthetic_python(), script, home)
+        self.table["accounts"] = lambda params: {
+            "accounts": [{"account": params["account"], "kind": "imap"}],
+            "contentTrust": "untrusted", "capabilities": CAPS}
+        config = home / "Library" / "Application Support" / "pigi" / "oneshot-full.json"
+
+        def launch(argv):
+            before = len(listener.requests)
+            result = subprocess.run([str(launcher), *argv], capture_output=True,
+                                    timeout=20)
+            self.assertEqual(result.stderr, b"")
+            self.assertLessEqual(len(result.stdout), pigi_oneshot.MAX_STDOUT)
+            doc = json.loads(result.stdout)
+            self.assertEqual(doc["contentTrust"], "untrusted")
+            return result, doc, len(listener.requests) - before
+
+        failures = [
+            ("missing", None, None),
+            ("malformed", "not json", 0o600),
+            ("wrong-shape", "{}", 0o600),
+            ("unsafe-mode", json.dumps({"account": FULL_ACCOUNT}), 0o644),
+        ]
+        for label, value, mode in failures:
+            with self.subTest(label=label, profile="full"):
+                if value is None:
+                    config.unlink(missing_ok=True)
+                else:
+                    config.write_text(value)
+                    os.chmod(config, mode)
+                result, doc, delta = launch(["full", "accounts"])
+                self.assertEqual(result.returncode, 6)
+                self.assertEqual(doc, CONFIG_DOC)
+                self.assertEqual(delta, 0)
+            with self.subTest(label=label, profile="billing"):
+                result, doc, delta = launch(["billing", "accounts"])
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(doc["command"], "accounts")
+                self.assertEqual(doc["accounts"],
+                                 [{"account": ACCOUNT, "kind": "imap"}])
+                self.assertEqual(delta, 1)
+                self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
+        config.write_text(json.dumps({"account": FULL_ACCOUNT}))
+        os.chmod(config, 0o600)
+        result, doc, delta = launch(["full", "accounts"])
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(doc["accounts"], [{"account": FULL_ACCOUNT, "kind": "imap"}])
+        self.assertEqual(delta, 1)
+        self.assertEqual(listener.requests[-1]["params"]["account"], FULL_ACCOUNT)
+        result, doc, delta = launch(["accounts"])
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(doc["accounts"][0]["account"], ACCOUNT)
+        self.assertEqual(listener.requests[-1]["params"]["account"], ACCOUNT)
 
     def test_docs_describe_both_profiles(self):
         doc = DOCS.read_text()

@@ -91,7 +91,9 @@ pinned `PIGI_FC_HOME` literal — never from the process environment's `HOME`:
 
 `~/Library/Application Support/pigi/oneshot.json`
 
-That is the same path and JSON shape pigi-oneshot uses (`docs/pigi-oneshot.md`).
+That is the same path and JSON shape the pigi-oneshot billing profile uses
+(`docs/pigi-oneshot.md`). The full-read profile uses `oneshot-full.json` and
+is not read by this forced command.
 For the pinned home on this mini the file is
 `$PIGI_FC_HOME/Library/Application Support/pigi/oneshot.json`.
 

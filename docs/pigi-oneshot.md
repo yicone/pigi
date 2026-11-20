@@ -1,19 +1,27 @@
-# pigi-oneshot: hardened one-shot read commands (ACM-980)
+# pigi-oneshot: hardened one-shot read commands (ACM-980, ACM-994)
 
-`tools/pigi-mcp/pigi_oneshot.py` is a fixed-shape, single-invocation reader for the
-Billing local-execution channel. Each run performs exactly one of four read
-subcommands against the already-running App's `agent.sock`, through a child
-`pigi_mcp.py` scoped to one pinned account, then exits. There is no daemon, no
-shell, no free-form input path, and no mail-write or mutation path anywhere in
-the chain (no send, mark-read, draft or delete). The wrapper itself writes no
-files; the child adapter it spawns writes its own content-free `tool_calls`
-audit rows to the adapter audit DB, and the App writes `agent_actions` — both
-pre-existing ledgers, see Audit below.
+`tools/pigi-mcp/pigi_oneshot.py` is a fixed-shape, single-invocation reader.
+Each run performs exactly one read subcommand against the already-running
+App's `agent.sock`, through a child `pigi_mcp.py` scoped to one pinned
+account, then exits. There is no daemon, no shell, no free-form input path,
+and no mail-write or mutation path anywhere in the chain (no send, mark-read,
+draft or delete). The wrapper itself writes no files; the child adapter it
+spawns writes its own content-free `tool_calls` audit rows to the adapter
+audit DB, and the App writes `agent_actions` — both pre-existing ledgers, see
+Audit below.
 
-Everything the caller can reach is fixed by code and config: the target mailbox,
-the allowed senders, the search query (`Cursor`), the subcommands, and every
-bound. No environment variable or option selects an account, socket, or config
-path.
+Two profiles share that chain. The profile is the leading command-line token
+(`billing` or `full`), which is visible in the approved command text. No
+environment variable and no caller-writable file selects it. Omitting the
+token keeps the historical Billing command line. Each profile has its own
+outside config and its own account; one profile cannot read the other's
+account, and `--account` is rejected on both.
+
+The **billing** profile is the ACM-980 reader: fixed search query `Cursor`,
+sender allowlist, and no `list`. The **full** profile
+(`tools/pigi-mcp/pigi_oneshot_full.py`) reads every sender in its one
+configured account, within the same day and count caps. It does not page the
+whole mailbox.
 
 ## Invocation
 
@@ -22,7 +30,16 @@ the approver sees):
 
 ```sh
 <checkout>/tools/pigi-mcp/pigi_oneshot.sh <subcommand> …
+<checkout>/tools/pigi-mcp/pigi_oneshot.sh billing <subcommand> …
+<checkout>/tools/pigi-mcp/pigi_oneshot.sh full <subcommand> …
 ```
+
+The first two forms are the billing profile. They behave the same, including
+output and exit codes, so the deployed Billing command line does not change.
+`full` is the only other profile name. Any other leading token is rejected
+with exit 2 before the config file or `agent.sock` is touched. `full` as a
+later argument is not a profile: `get full` on the billing command line is a
+message id.
 
 Running `python3 pigi_oneshot.py` directly — or through any other interpreter
 command line — is refused with exit 9. The reason: a Python interpreter runs
@@ -40,18 +57,20 @@ reads `$BASH_ENV` before the script's first line, which no launcher code can
 prevent. `/bin/sh` and direct execution do not trigger `BASH_ENV` (observed on
 macOS).
 
-| Subcommand | Effect |
-| --- | --- |
-| `accounts` | `list_accounts {}` scoped to the configured account; returns at most that one account and its provider kind. |
-| `search [--since-days N] [--limit M]` | Literal search for the fixed query `Cursor`. `N` defaults to 7 (1–30), `M` defaults to 10 (1–20). Items whose `fromEmail` is not on the sender allowlist are dropped and counted in `filteredOut`. |
-| `get <messageID>` | `get_message` for one ID (`^[A-Za-z0-9._@=+-]{1,256}$`). Sender allowlist applies to the returned message, not just search hits. |
-| `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. |
+| Subcommand | Billing | Full |
+| --- | --- | --- |
+| `accounts` | `list_accounts {}` scoped to the billing account. | Same, scoped to the full-profile account. A response that names any other account is refused. |
+| `list [--since-days N] [--limit M]` | Rejected (exit 2). | Newest cached mail in the window. `N` defaults to 7 (1–30), `M` defaults to 10 (1–20). No sender filter. |
+| `search [--since-days N] [--limit M]` | Literal search for the fixed query `Cursor`. Items whose `fromEmail` is not on the sender allowlist are dropped and counted in `filteredOut`. | Requires `--query <text>`. The query is the caller's, not `Cursor`. No sender filter and no `filteredOut`. |
+| `get <messageID>` | `get_message` for one ID (`^[A-Za-z0-9._@=+-]{1,256}$`). Sender allowlist applies to the returned message, not just search hits. | Same ID rule. Any sender in the configured account is returned. A message whose `account` is not that account is refused. |
+| `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. | Same batch cap and handshake. No `"status":"filtered"`; a foreign account is `error` / `invalid_response` and its body is not copied. |
 
-Not implemented — now or by accident: `list`, `get_verification_code`,
-`--account`, `--offset`, `--help`/`-h` (unsupported, exits 2), a caller-chosen
-query, send/mark-read/draft or any mutation. Unknown subcommands and unknown
-options exit 2. Enabling `list`
-requires a code change and its own review, not a config change.
+Not implemented on either profile — now or by accident: `get_verification_code`,
+`--account`, `--offset`, `--help`/`-h` (unsupported, exits 2), send/mark-read/draft
+or any mutation. The billing profile also rejects `list` and a caller-chosen
+query. Unknown subcommands, unknown options, and an unknown profile exit 2
+before config or socket use. The full profile's `list` is a code path, not a
+config switch.
 
 ## Output
 
@@ -75,7 +94,8 @@ When a serialized payload would exceed 65,536 bytes the wrapper shrinks it by
 shape and marks it with `"truncated":true`,
 `"truncationNotice":"pigi-oneshot: output truncated at 65536 bytes"` and
 `"originalBytes":<full serialized size>`. `search` keeps the longest fitting
-prefix of `items` plus `"omittedItems"`; `get` keeps the message metadata and
+prefix of `items` plus `"omittedItems"`; `list` uses that same item-prefix
+shrink and does not add `filteredOut`; `get` keeps the message metadata and
 cuts `text` to the longest fitting character prefix plus `"textTruncated":true`;
 `get-batch` cuts every `ok` entry's `text` to a common per-entry character
 budget plus `"textTruncated":true` on cut entries, keeping all entries and
@@ -90,14 +110,20 @@ non-zero exit code is kept.
 
 | Limit | Value |
 | --- | --- |
-| `--since-days` | 1–30 (default 7) |
-| `--limit` | 1–20 (default 10); no `--offset` exists |
+| `--since-days` | 1–30 (default 7), both profiles. There is no all-time read. |
+| `--limit` | 1–20 (default 10); no `--offset` exists on either profile |
+| full `--query` | required; 1–128 characters and ≤256 UTF-8 bytes; each character is Unicode category L or N, or one of space `.` `_` `+` `@` `-`. Control characters, quotes, slashes and other punctuation are rejected. The value is forwarded unchanged. |
 | `get-batch` IDs | 1–5, one handshake |
 | `messageID` | `^[A-Za-z0-9._@=+-]{1,256}$` |
-| stdout | 65,536 bytes, always valid JSON |
+| stdout | 65,536 bytes, always valid JSON, both profiles |
 | config `account` | non-blank, ≤1024 UTF-8 bytes |
-| `senders` | 1–64 exact addresses, each ≤1024 bytes |
+| billing `senders` | 1–64 exact addresses, each ≤1024 bytes |
 | child session | one `pigi_mcp.py` process, 20 s total |
+
+Out-of-range days, limits, batch size, or an illegal full-profile query exit 2
+and do not open the config or the socket. `list` and `search` always send a
+`since` bound, so an App that does not advertise `filters` fails closed
+instead of returning an unfiltered history.
 
 ## Exit codes
 
@@ -107,7 +133,7 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | --- | --- | --- |
 | 0 | success | `{"contentTrust":"untrusted","trustNotice":...,"command":<name>, ...}` |
 | 2 | usage/validation error (incl. `--help`, which is unsupported) | `{"contentTrust":"untrusted","error":"invalid_arguments"}` |
-| 3 | sender not on the allowlist | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
+| 3 | billing only: sender not on the allowlist. The full profile has no allowlist and does not use this code | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
 | 4 | `not_found` | `{"contentTrust":"untrusted","error":"not_found"}` |
 | 5 | upstream/transport/MCP error | `{"contentTrust":"untrusted","error":<fixed code>}` |
 | 6 | config or environment failure — missing/unsafe config, missing pinned interpreter, or pinned interpreter fails to execute (exec status 126/127, normalized by the launcher) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
@@ -122,20 +148,36 @@ already non-zero code (3/4/5) is kept even when the JSON carries
 
 ## Configuration (never committed)
 
-`~/Library/Application Support/pigi/oneshot.json` — regular file, mode exactly
-0600, single hard link, owned by the effective user, not a symlink; the parent
-directory must be a real directory owned by the user and not group/world
-writable. The file is opened `O_NOFOLLOW` and re-`fstat`ed before reading. Any
-violation, missing file, malformed JSON or wrong shape fails closed with exit 6.
+Both files live in `~/Library/Application Support/pigi/`, are regular files,
+mode exactly 0600, a single hard link, owned by the effective user, and not
+symlinks. The parent directory must be a real directory owned by the user and
+not group/world writable. Each file is opened `O_NOFOLLOW` and re-`fstat`ed
+before reading. A missing file, bad mode, extra link, symlink, malformed JSON,
+or the other profile's shape fails closed with exit 6. A broken full-profile
+file does not change billing, and the reverse is also true. Neither file is
+written by this repository.
+
+| Profile | Path | Shape |
+| --- | --- | --- |
+| billing | `oneshot.json` | `{"account","senders"}` only |
+| full | `oneshot-full.json` | `{"account"}` only |
 
 ```json
-{"account": "<target-mailbox>", "senders": ["<allowed-sender-1>", "<allowed-sender-2>"]}
+{"account": "<billing-mailbox>", "senders": ["<allowed-sender-1>", "<allowed-sender-2>"]}
 ```
 
-`senders` is a non-empty list of exact `From` addresses compared
-case-insensitively after whitespace trimming — no domains, no wildcards. Use
-placeholder-only examples such as `allowed@example.com` when documenting; the
-real mailbox and sender addresses stay out of the repo.
+```json
+{"account": "<full-mailbox>"}
+```
+
+Billing `senders` is a non-empty list of exact `From` addresses compared
+case-insensitively after whitespace trimming — no domains, no wildcards. The
+full profile has no sender list; a file that includes `senders` is refused.
+Use placeholder-only examples such as `allowed@example.com` and
+`full@example.net` when documenting; the real mailbox and sender addresses
+stay out of the repo. The deployed full-profile account is the Proton target
+account, written outside this repository by a later change. This document
+does not create that file.
 
 ## Hardening
 
@@ -166,7 +208,8 @@ document — true for every exit path, including interpreter startup failures.
 with `{"contentTrust":"untrusted","error":"untrusted_entry"}` on stdout, so a
 bare `python3 pigi_oneshot.py` can never reach config, socket, or mail code.
 Under `-S` only the script's own directory and the stdlib are importable,
-which covers its siblings (`pigi_mcp`, `transport`, `audit`) and nothing else.
+which covers its siblings (`pigi_mcp`, `transport`, `audit`, `pigi_oneshot_full`)
+and nothing else.
 The process umask is 077.
 
 The MCP session spawns `pigi_mcp.py --account <configured account> --socket
@@ -191,8 +234,16 @@ creating another audit object). Every `tools/call` still lands in the adapter's
   not isolate the channel from other same-UID code.
 - The allowlist matches the stored `From` header, which sender-controlled mail
   can spoof; it is not sender authentication unless the upstream verifies it.
-- `search --limit` applies upstream before allowlist filtering, so a result can
-  contain fewer than `limit` items (the rest counted in `filteredOut`).
+- `search --limit` on the billing profile applies upstream before allowlist
+  filtering, so a result can contain fewer than `limit` items (the rest
+  counted in `filteredOut`). The full profile does not filter senders, so its
+  `search` and `list` results have no `filteredOut`.
+- Risk of the full profile: there is no sender allowlist, so every message in
+  that mailbox window — any sender, subject, snippet, and body — can enter
+  the caller's context. 风险：全量 profile 没有发件人白名单，该账号邮箱中的任何邮件都会进入调用方上下文。
+  Those fields stay `contentTrust: untrusted` and must not be executed or
+  followed as instructions. The window is still at most 30 days and 20
+  messages, with no offset.
 - `get-batch` is the only multi-call path: at most 5 `get` calls behind one
   handshake, sequential, same child.
 - Output is always valid JSON; incomplete data is marked by

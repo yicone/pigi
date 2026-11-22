@@ -102,8 +102,9 @@ The cursor is an opaque URL-safe base64 token (≤1024 characters) carrying the
 paging state, bound to the subcommand — and for `search`, to the exact query
 text. A malformed, truncated, foreign-command, wrong-query, or out-of-bounds
 cursor exits 2 with zero upstream calls; the bounds are `o >= 1` (offsets
-start at 1) and `s <= d <= 9007199254740991` (the anchor date lies inside the
-saved window and inside the server's millisecond range). A cursor's `s` must
+start at 1), `s <= d <= 9007199254740991` (the anchor date lies inside the
+saved window and inside the server's millisecond range), and `i` matching the
+`messageID` rule `get` uses. A cursor's `s` must
 also match a horizon minted by `--history` within the last 6 hours
 (`now−365d−6h <= s <= now−365d+60s`, allowing one minute of clock skew), so a
 paged walk must finish within 6 hours of `--history`; later or foreign-window
@@ -122,15 +123,16 @@ character budget so the page fits, the item carries
 envelope plus `"truncated":true`, `"truncationNotice"`, and `"originalBytes"`,
 exiting 8 — message identity is delivered, nothing is skipped, and callers
 can fetch the full text with `get <messageID>`. If the item still cannot fit
-with every cuttable field cut to 0 characters — a huge `messageID`, or a huge
+with every cuttable field cut to 0 characters — for example a huge
 non-string field — the run fails closed with
 `{"contentTrust":"untrusted","error":"page_item_too_large"}` (exit 5), no
 items and no cursor: the walk deliberately cannot continue past an
-undelivered message through this channel. A page that would need a
-`nextCursor` anchored on a row whose `messageID` cannot live in a cursor
-(longer than 256 bytes, or not printable ASCII) likewise fails closed with
-`invalid_response` (exit 5) rather than emitting a cursor the next call would
-reject.
+undelivered message through this channel. Message IDs carry one contract —
+the `^[A-Za-z0-9._@=+-]{1,256}$` rule `get` already uses: a page whose items
+include a messageID that fails it fails closed with `invalid_response`
+(exit 5), no items and no cursor — the walk deliberately cannot continue past
+a message whose body `get` could never fetch, and a cursor cannot be anchored
+on one either (real mailbox IDs are not claimed to conform).
 
 ## Output
 
@@ -159,10 +161,17 @@ shrink and does not add `filteredOut`; `get` keeps the message metadata and
 cuts `text` to the longest fitting character prefix plus `"textTruncated":true`;
 `get-batch` cuts every `ok` entry's `text` to a common per-entry character
 budget plus `"textTruncated":true` on cut entries, keeping all entries and
-statuses. If the result still does not fit — for example metadata fields alone
-are huge — the output is the minimal envelope
+statuses. On the full profile only, when message metadata alone overflows the
+cap, `get`/`get-batch` retry once with every message's non-identity string
+fields cut to 512 characters (`account`, `messageID`, `date` are never cut)
+and marked `"truncatedFields"` on the message — identity plus `text` are
+still delivered, so a message a paged page cut is recoverable through
+`get <messageID>`; if the body is also huge, `text` is prefix-cut with
+`"textTruncated":true` as usual. If the result still does not fit — for
+example a huge non-string field — the output is the minimal envelope
 `{contentTrust, trustNotice, command, truncated, truncationNotice,
-originalBytes}` with no mail data, which always fits. Truncated output remains
+originalBytes}` with no mail data, which always fits; that residual is not
+recoverable through this channel. Truncated output remains
 valid JSON; a successful-but-truncated command exits 8, while an already
 non-zero exit code is kept.
 

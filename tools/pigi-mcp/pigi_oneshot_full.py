@@ -25,6 +25,7 @@ MAX_SAFE_MS = 9_007_199_254_740_991
 CURSOR_TTL_MS = 6 * 3_600_000
 CLOCK_SKEW_MS = 60_000
 IDENTITY_FIELDS = {"account", "messageID", "date"}
+META_BUDGET = 512
 
 
 def config_path(home):
@@ -83,9 +84,8 @@ def cursor(value):
                 or type(doc["o"]) is not int or not 1 <= doc["o"] <= 1_000_000
                 or type(doc["d"]) is not int
                 or not doc["s"] <= doc["d"] <= MAX_SAFE_MS
-                or not isinstance(doc["i"], str) or not doc["i"]
-                or len(doc["i"]) > 256
-                or not (doc["i"].isascii() and doc["i"].isprintable())):
+                or not isinstance(doc["i"], str)
+                or not pigi_oneshot.MESSAGE_ID.fullmatch(doc["i"])):
             raise ValueError
         return doc
     except (ValueError, TypeError, UnicodeEncodeError):
@@ -175,10 +175,9 @@ def next_cursor(args, since, offset, item):
 
 def anchor_safe(since, offset, item):
     """True when item can anchor a cursor this tool's own parser accepts."""
-    message_id = item["messageID"]
     return (since <= item["date"] <= MAX_SAFE_MS and offset <= 1_000_000
-            and 0 < len(message_id) <= 256
-            and message_id.isascii() and message_id.isprintable())
+            and pigi_oneshot.MESSAGE_ID.fullmatch(item["messageID"])
+            is not None)
 
 
 def cut_item(item, budget):
@@ -193,6 +192,21 @@ def cut_item(item, budget):
     if fields:
         cut["truncatedFields"] = sorted(fields)
     return cut
+
+
+def cut_get_metadata(payload, command):
+    """Copy of a get/get-batch payload with each message's non-identity str
+    fields capped at META_BUDGET, so emit can still fit identity + text."""
+    if command == "get" and isinstance(payload.get("message"), dict):
+        return dict(payload, message=cut_item(payload["message"], META_BUDGET))
+    if command == "get-batch" and isinstance(payload.get("results"), list):
+        return dict(payload, results=[
+            dict(entry, message=cut_item(entry["message"], META_BUDGET))
+            if (entry.get("status") == "ok"
+                and isinstance(entry.get("message"), dict))
+            else entry
+            for entry in payload["results"]])
+    return None
 
 
 def cut_single_item(payload, item):
@@ -262,6 +276,12 @@ def command_page(args, ctx):
     if not remaining and later is not None:
         return pigi_oneshot.EXIT_UPSTREAM, pigi_oneshot.upstream_failure("cursor_stale")
     take = remaining[:args.limit]
+    # Every item a page would deliver must be fetchable via `get`: an id that
+    # fails the single MESSAGE_ID contract closes the walk, never a skip.
+    if not all(pigi_oneshot.MESSAGE_ID.fullmatch(item["messageID"])
+               for item in take):
+        return pigi_oneshot.EXIT_UPSTREAM, \
+            pigi_oneshot.upstream_failure("invalid_response")
     # A page must not drop items the cursor then skips: emit a shorter prefix
     # instead of the usual shrink. One item that still does not fit is
     # delivered with its non-identity text fields cut (exit 8), never skipped.
@@ -363,7 +383,29 @@ def emit_full(payload):
         out = pigi_oneshot.serialize(shrunk)
         if len(out) <= pigi_oneshot.MAX_STDOUT:
             return out, True
-    return pigi_oneshot.emit(payload)
+    out, truncated = pigi_oneshot.emit(payload)
+    if not truncated or command not in {"get", "get-batch"}:
+        return out, truncated
+    data_key = "message" if command == "get" else "results"
+    if data_key in pigi_oneshot.json.loads(out):
+        return out, truncated
+    # Message metadata alone overflowed the cap: cut it to META_BUDGET so
+    # emit can still deliver identity + text, then keep originalBytes honest
+    # (the serialized size of the uncut payload).
+    cut = cut_get_metadata(payload, command)
+    if cut is None:
+        return out, truncated
+    cut_out, _ = pigi_oneshot.emit(cut)
+    doc = pigi_oneshot.json.loads(cut_out)
+    if data_key not in doc:
+        return out, truncated
+    doc["truncated"] = True
+    doc["truncationNotice"] = pigi_oneshot.TRUNCATION_NOTICE
+    doc["originalBytes"] = len(body)
+    cut_out = pigi_oneshot.serialize(doc)
+    if len(cut_out) <= pigi_oneshot.MAX_STDOUT:
+        return cut_out, True
+    return out, truncated
 
 
 def run_command(args, ctx):

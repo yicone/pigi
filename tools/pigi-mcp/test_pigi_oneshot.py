@@ -2123,6 +2123,96 @@ class OneshotTests(unittest.TestCase):
                          2)
         self.assertEqual(docs[-1]["page"], {"end": True, "nextCursor": None})
 
+    def test_full_get_huge_metadata_still_recoverable(self):
+        """The exit-8 recipe on a paged page — `get <messageID>` — must work
+        for the very message the page cut: metadata is cut to META_BUDGET so
+        identity and text are still delivered."""
+        day = 86_400_000
+        message = make_message("huge", OTHER, account=FULL_ACCOUNT, date=NOW,
+                               snippet="H" * 100_000)
+        # (a) the review repro: paged delivery cuts snippet; get recovers.
+        self.table["list"] = self.paged_server([
+            message,
+            make_message("tail", OTHER, account=FULL_ACCOUNT,
+                         date=NOW - day)])
+        code, out = self.invoke_full(["list", "--history", "--limit", "5"])
+        self.assertEqual(code, 8)
+        self.assertEqual(self.parse(out)["items"][0]["truncatedFields"],
+                         ["snippet"])
+        self.table["get"] = lambda params: get_result(message, "short body")
+        code, out = self.invoke_full(["get", "huge"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertIsInstance(doc["originalBytes"], int)
+        self.assertGreater(doc["originalBytes"], pigi_oneshot.MAX_STDOUT)
+        got = doc["message"]
+        self.assertEqual(got["messageID"], "huge")
+        self.assertEqual(got["account"], FULL_ACCOUNT)
+        self.assertEqual(got["date"], NOW)
+        self.assertEqual(got["snippet"], "H" * 512)
+        self.assertEqual(got["truncatedFields"], ["snippet"])
+        self.assertEqual(doc["text"], "short body")
+        self.assertNotIn("textTruncated", doc)
+
+        # (b) get-batch: the huge entry is delivered cut, the normal one
+        # untouched.
+        def batch(params):
+            if params["messageID"] == "huge":
+                return get_result(message, "short body")
+            return get_result(
+                make_message(params["messageID"], OTHER,
+                             account=FULL_ACCOUNT), "ok")
+
+        self.table["get"] = batch
+        code, out = self.invoke_full(["get-batch", "huge", "m1"])
+        self.assertEqual(code, 8)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        results = doc["results"]
+        self.assertEqual([entry["status"] for entry in results], ["ok", "ok"])
+        self.assertEqual(results[0]["message"]["truncatedFields"], ["snippet"])
+        self.assertEqual(len(results[0]["message"]["snippet"]), 512)
+        self.assertEqual(results[0]["text"], "short body")
+        self.assertEqual(results[1]["message"]["messageID"], "m1")
+        self.assertNotIn("truncatedFields", results[1]["message"])
+        self.assertEqual(results[1]["text"], "ok")
+
+        # (c) huge metadata AND huge text: message cut, text prefix-cut.
+        self.table["get"] = lambda params: get_result(message, "T" * 100_000)
+        code, out = self.invoke_full(["get", "huge"])
+        self.assertEqual(code, 8)
+        doc = self.parse(out)
+        self.assertEqual(doc["message"]["truncatedFields"], ["snippet"])
+        self.assertTrue(doc["textTruncated"])
+        self.assertTrue(doc["text"].startswith("T"))
+        self.assertLess(len(doc["text"]), 100_000)
+
+        # (d) a huge non-str field is not recoverable: minimal envelope.
+        odd = make_message("odd", OTHER, account=FULL_ACCOUNT, date=NOW,
+                           blob=list(range(40_000)))
+        self.table["get"] = lambda params: get_result(odd, "short body")
+        code, out = self.invoke_full(["get", "odd"])
+        self.assertEqual(code, 8)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertNotIn("message", doc)
+        self.assertNotIn("text", doc)
+
+        # (f) Billing keeps the old shape: no metadata retry — a
+        # huge-metadata get is still the minimal envelope.
+        self.table["get"] = lambda params: get_result(
+            make_message("m1", ALLOWED, account=ACCOUNT,
+                         snippet="H" * 100_000),
+            "short body")
+        code, out = self.invoke(["get", "m1"])
+        self.assertEqual(code, 8)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertNotIn("message", doc)
+        self.assertNotIn("text", doc)
+
     def test_full_history_page_item_too_large_fails_closed(self):
         """An item that cannot fit even with every cuttable field cut to 0
         fails closed: exit 5 page_item_too_large, nothing delivered."""
@@ -2145,36 +2235,53 @@ class OneshotTests(unittest.TestCase):
                           "error": "page_item_too_large"})
         self.assertNotIn("items", self.parse(out))
         self.assertNotIn("page", self.parse(out))
-        # A messageID too big to ever fit is also undeliverable: identity
-        # fields are never cut.
-        rows = [make_message("X" * 70_000, OTHER, account=FULL_ACCOUNT,
-                             date=NOW)]
-        self.table["list"] = self.paged_server(rows)
-        code, out = self.invoke_full(["list", "--history", "--limit", "5"])
-        self.assertEqual(code, 5)
-        self.assertEqual(self.parse(out)["error"], "page_item_too_large")
 
-    def test_full_history_unanchorable_id_fails_closed(self):
-        """A row whose messageID cannot be embedded in a cursor this tool
-        accepts must not emit a nextCursor the parser would reject."""
+    def test_full_history_undeliverable_id_fails_closed(self):
+        """One contract: any messageID get() would reject closes the walk —
+        no items, no cursor, wherever the row sits on the page."""
         day = 86_400_000
-        for bad_id in ("X" * 300, "bad\nid", "X" * 70_000):
-            with self.subTest(bad_id=bad_id[:10]):
-                rows = [make_message("m0", OTHER, account=FULL_ACCOUNT,
-                                     date=NOW),
-                        make_message(bad_id, OTHER, account=FULL_ACCOUNT,
-                                     date=NOW - day),
-                        make_message("m2", OTHER, account=FULL_ACCOUNT,
-                                     date=NOW - 2 * day)]
-                self.table["list"] = self.paged_server(rows)
-                code, out = self.invoke_full(
-                    ["list", "--history", "--limit", "2"])
-                self.assertEqual(code, 5)
-                self.assertEqual(
-                    self.parse(out),
-                    {"contentTrust": "untrusted",
-                     "error": "invalid_response"})
-                self.assertNotIn("items", self.parse(out))
+        bad_ids = ["bad/id", "bad id", "bad:id", "bad\nid", "x" * 257, "中",
+                   "X" * 70_000]
+        for bad_id in bad_ids:
+            for position in (0, 1, 2):
+                with self.subTest(bad_id=bad_id[:10], position=position):
+                    rows = [make_message("m0", OTHER, account=FULL_ACCOUNT,
+                                         date=NOW),
+                            make_message("m1", OTHER, account=FULL_ACCOUNT,
+                                         date=NOW - day),
+                            make_message("m2", OTHER, account=FULL_ACCOUNT,
+                                         date=NOW - 2 * day)]
+                    rows[position] = make_message(
+                        bad_id, OTHER, account=FULL_ACCOUNT,
+                        date=NOW - position * day)
+                    self.table["list"] = self.paged_server(rows)
+                    code, out = self.invoke_full(
+                        ["list", "--history", "--limit", "5"])
+                    self.assertEqual(code, 5)
+                    self.assertEqual(
+                        self.parse(out),
+                        {"contentTrust": "untrusted",
+                         "error": "invalid_response"})
+                    self.assertNotIn("items", self.parse(out))
+                    self.assertNotIn("page", self.parse(out))
+        # A page ending before the bad row still succeeds; the next fails.
+        rows = [make_message("m0", OTHER, account=FULL_ACCOUNT, date=NOW),
+                make_message("m1", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - day),
+                make_message("bad/id", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - 2 * day),
+                make_message("m3", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - 3 * day)]
+        self.table["list"] = self.paged_server(rows)
+        code, out = self.invoke_full(["list", "--history", "--limit", "2"])
+        self.assertEqual(code, 0)
+        doc = self.parse(out)
+        self.assertEqual([item["messageID"] for item in doc["items"]],
+                         ["m0", "m1"])
+        code, out = self.invoke_full(
+            ["list", "--cursor", doc["page"]["nextCursor"], "--limit", "2"])
+        self.assertEqual(code, 5)
+        self.assertEqual(self.parse(out)["error"], "invalid_response")
 
     def test_full_history_emitted_cursors_round_trip(self):
         """Every nextCursor emitted is accepted by this tool's own parser
@@ -2193,6 +2300,9 @@ class OneshotTests(unittest.TestCase):
                 horizon - pigi_oneshot_full.CURSOR_TTL_MS
                 <= args.cursor["s"]
                 <= horizon + pigi_oneshot_full.CLOCK_SKEW_MS)
+            # The anchor id is always one `get` would accept.
+            self.assertEqual(pigi_oneshot.message_id(args.cursor["i"]),
+                             args.cursor["i"])
 
     def test_full_paging_arguments_rejected_without_socket(self):
         day = 86_400_000
@@ -2211,6 +2321,9 @@ class OneshotTests(unittest.TestCase):
             self.page_cursor_doc(i=5),                          # non-str id
             self.page_cursor_doc(i=""),
             self.page_cursor_doc(i="x" * 257),
+            self.page_cursor_doc(i="bad/id"),                   # not gettable
+            self.page_cursor_doc(i="bad id"),
+            self.page_cursor_doc(i="bad:id"),
             self.page_cursor_doc(i="has\nnewline"),
             self.page_cursor_doc(i="中"),                       # non-ASCII id
             self.page_cursor_doc(c="bogus"),
@@ -2300,6 +2413,8 @@ class OneshotTests(unittest.TestCase):
             {"d": pigi_oneshot_full.MAX_SAFE_MS + 1},
             {"s": pigi_oneshot_full.MAX_SAFE_MS + 1},
             {"s": real_now - 365 * day, "d": real_now - 366 * day},
+            {"i": "bad/id"},
+            {"i": "bad id"},
         ]
         horizon_cases = [
             {"s": 1},

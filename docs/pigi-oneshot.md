@@ -100,20 +100,37 @@ unchanged and carries no `page` key.
 
 The cursor is an opaque URL-safe base64 token (≤1024 characters) carrying the
 paging state, bound to the subcommand — and for `search`, to the exact query
-text. A malformed, truncated, foreign-command, wrong-query, or out-of-window
-cursor exits 2 with zero upstream calls. A cursor's `since` must lie within
-`now−366d … now`, so a token stays usable about one day beyond the 365-day
-horizon; after that, restart with `--history`. If the mailbox shifted so far
-that the saved position can no longer be located — more than roughly 40 rows
-moved before the anchor — the run fails closed with
+text. A malformed, truncated, foreign-command, wrong-query, or out-of-bounds
+cursor exits 2 with zero upstream calls; the bounds are `o >= 1` (offsets
+start at 1) and `s <= d <= 9007199254740991` (the anchor date lies inside the
+saved window and inside the server's millisecond range). A cursor's `s` must
+also match a horizon minted by `--history` within the last 6 hours
+(`now−365d−6h <= s <= now−365d+60s`, allowing one minute of clock skew), so a
+paged walk must finish within 6 hours of `--history`; later or foreign-window
+cursors exit 2 and the caller restarts with `--history`. If the mailbox
+shifted so far that the saved position can no longer be located — more than
+roughly 40 rows moved before the anchor — the run fails closed with
 `{"contentTrust":"untrusted","error":"cursor_stale"}` (exit 5) and no items;
 restart with `--history`.
 
 A paged page never uses the item-dropping shrink: the wrapper emits a shorter
 prefix and recomputes the cursor, so no item is skipped. If a single item
-alone exceeds the 65,536-byte cap, the run falls back to the normal truncated
-envelope (exit 8) with `page.nextCursor` still advancing past that item —
-exit-8 pages must not be treated as complete.
+alone exceeds the 65,536-byte cap it is still delivered: its non-identity
+string fields (never `account`, `messageID`, or `date`) are cut to a common
+character budget so the page fits, the item carries
+`"truncatedFields":[<sorted names>]`, and the page is the normal paged
+envelope plus `"truncated":true`, `"truncationNotice"`, and `"originalBytes"`,
+exiting 8 — message identity is delivered, nothing is skipped, and callers
+can fetch the full text with `get <messageID>`. If the item still cannot fit
+with every cuttable field cut to 0 characters — a huge `messageID`, or a huge
+non-string field — the run fails closed with
+`{"contentTrust":"untrusted","error":"page_item_too_large"}` (exit 5), no
+items and no cursor: the walk deliberately cannot continue past an
+undelivered message through this channel. A page that would need a
+`nextCursor` anchored on a row whose `messageID` cannot live in a cursor
+(longer than 256 bytes, or not printable ASCII) likewise fails closed with
+`invalid_response` (exit 5) rather than emitting a cursor the next call would
+reject.
 
 ## Output
 
@@ -156,7 +173,7 @@ non-zero exit code is kept.
 | `--since-days` | 1–30 (default 7), both profiles; mutually exclusive with `--history`/`--cursor` on full. There is no all-time read. |
 | `--limit` | 1–20 (default 10), per call or per page; no `--offset` exists on either profile |
 | full `--history` | pages `list`/`search` backwards from newest; hard 365-day `since` bound, fixed in code |
-| full `--cursor` | opaque token, ≤1024 characters; bound to the subcommand and, for `search`, the query; usable about one day beyond the horizon |
+| full `--cursor` | opaque token, ≤1024 characters; bound to the subcommand and, for `search`, the query; usable for 6 hours after `--history` (`o>=1`, `s<=d<=9007199254740991`, horizon-pinned), then exit 2 — restart with `--history` |
 | full `--query` | required; 1–128 characters and ≤256 UTF-8 bytes; each character is Unicode category L or N, or one of space `.` `_` `+` `@` `-`. Control characters, quotes, slashes and other punctuation are rejected. The value is forwarded unchanged. |
 | `get-batch` IDs | 1–5, one handshake |
 | `messageID` | `^[A-Za-z0-9._@=+-]{1,256}$` |
@@ -180,10 +197,10 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | 2 | usage/validation error (incl. `--help`, which is unsupported); also a paging-option combination, a malformed/expired/foreign `--cursor`, or a paging option on the billing profile | `{"contentTrust":"untrusted","error":"invalid_arguments"}` |
 | 3 | billing only: sender not on the allowlist. The full profile has no allowlist and does not use this code | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
 | 4 | `not_found` | `{"contentTrust":"untrusted","error":"not_found"}` |
-| 5 | upstream/transport/MCP error; also `cursor_stale`, a paged read whose anchor moved out of reach — restart with `--history` | `{"contentTrust":"untrusted","error":<fixed code>}` |
+| 5 | upstream/transport/MCP error; also `cursor_stale` (a paged read whose anchor moved out of reach) and `page_item_too_large` (a paged item that cannot be delivered even with all text fields cut — the walk cannot continue past it, by design nothing is skipped) — restart with `--history` | `{"contentTrust":"untrusted","error":<fixed code>}` |
 | 6 | config or environment failure — missing/unsafe config, missing pinned interpreter, or pinned interpreter fails to execute (exec status 126/127, normalized by the launcher) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
 | 7 | internal error — also an interpreter crash/signal or any unexpected child status, normalized by the launcher | `{"contentTrust":"untrusted","error":"internal_error"}` |
-| 8 | success but output truncated; data incomplete — do not treat as complete. A paged single oversized item lands here, with `page.nextCursor` still advancing past it | truncated envelope with `"truncated":true` |
+| 8 | success but output truncated; data incomplete — do not treat as complete. On a paged page it means one item's text fields were cut (`truncatedFields`): message identity delivered, nothing skipped — use `get <messageID>` for the full text | truncated envelope with `"truncated":true` |
 | 9 | untrusted entry — not launched by `pigi_oneshot.sh` | `{"contentTrust":"untrusted","error":"untrusted_entry"}` |
 
 `get-batch` maps per-entry outcomes to the worst exit code by precedence

@@ -21,6 +21,10 @@ HISTORY_MAX_DAYS = 365
 BACK = 40
 WINDOW = 100
 CURSOR_MAX_CHARS = 1024
+MAX_SAFE_MS = 9_007_199_254_740_991
+CURSOR_TTL_MS = 6 * 3_600_000
+CLOCK_SKEW_MS = 60_000
+IDENTITY_FIELDS = {"account", "messageID", "date"}
 
 
 def config_path(home):
@@ -74,9 +78,11 @@ def cursor(value):
                 or type(doc["v"]) is not int or doc["v"] != 1
                 or not isinstance(doc["c"], str)
                 or not isinstance(doc["q"], str)
-                or type(doc["s"]) is not int or doc["s"] <= 0
-                or type(doc["o"]) is not int or not 0 <= doc["o"] <= 1_000_000
-                or type(doc["d"]) is not int or doc["d"] < 0
+                or type(doc["s"]) is not int
+                or not 0 < doc["s"] <= MAX_SAFE_MS
+                or type(doc["o"]) is not int or not 1 <= doc["o"] <= 1_000_000
+                or type(doc["d"]) is not int
+                or not doc["s"] <= doc["d"] <= MAX_SAFE_MS
                 or not isinstance(doc["i"], str) or not doc["i"]
                 or len(doc["i"]) > 256
                 or not (doc["i"].isascii() and doc["i"].isprintable())):
@@ -167,6 +173,55 @@ def next_cursor(args, since, offset, item):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def anchor_safe(since, offset, item):
+    """True when item can anchor a cursor this tool's own parser accepts."""
+    message_id = item["messageID"]
+    return (since <= item["date"] <= MAX_SAFE_MS and offset <= 1_000_000
+            and 0 < len(message_id) <= 256
+            and message_id.isascii() and message_id.isprintable())
+
+
+def cut_item(item, budget):
+    """Copy of item with each non-identity str field capped at budget chars."""
+    cut, fields = dict(item), []
+    for key, value in item.items():
+        if (key in IDENTITY_FIELDS or not isinstance(value, str)
+                or len(value) <= budget):
+            continue
+        cut[key] = value[:budget]
+        fields.append(key)
+    if fields:
+        cut["truncatedFields"] = sorted(fields)
+    return cut
+
+
+def cut_single_item(payload, item):
+    """One item too big for a page: cut its non-identity str fields to a
+    common budget so the message is delivered (never skipped)."""
+    original = len(pigi_oneshot.serialize(payload))
+    longest = max((len(value) for key, value in item.items()
+                   if key not in IDENTITY_FIELDS and isinstance(value, str)),
+                  default=0)
+
+    def at_budget(budget):
+        return dict(payload, items=[cut_item(item, budget)], truncated=True,
+                    truncationNotice=pigi_oneshot.TRUNCATION_NOTICE,
+                    originalBytes=original)
+
+    low, high = 0, longest
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(pigi_oneshot.serialize(at_budget(middle))) <= pigi_oneshot.MAX_STDOUT:
+            low = middle
+        else:
+            high = middle - 1
+    cut_payload = at_budget(low)
+    if len(pigi_oneshot.serialize(cut_payload)) > pigi_oneshot.MAX_STDOUT:
+        return pigi_oneshot.EXIT_UPSTREAM, \
+            pigi_oneshot.upstream_failure("page_item_too_large")
+    return pigi_oneshot.EXIT_TRUNCATED, cut_payload
+
+
 def command_accounts(args, ctx):
     status, value = pigi_oneshot.single_call(ctx, "list_accounts", {})
     if status == "error":
@@ -208,19 +263,23 @@ def command_page(args, ctx):
         return pigi_oneshot.EXIT_UPSTREAM, pigi_oneshot.upstream_failure("cursor_stale")
     take = remaining[:args.limit]
     # A page must not drop items the cursor then skips: emit a shorter prefix
-    # instead of the usual shrink. One item that still does not fit falls back
-    # to emit_full's shrink (exit 8) with a cursor that advances past it.
+    # instead of the usual shrink. One item that still does not fit is
+    # delivered with its non-identity text fields cut (exit 8), never skipped.
     n = len(take)
     while True:
         cut = take[:n]
         more = len(remaining) > n or later is not None
+        if more and cut and not anchor_safe(since, offset + start + n, cut[-1]):
+            return pigi_oneshot.EXIT_UPSTREAM, \
+                pigi_oneshot.upstream_failure("invalid_response")
         token = (next_cursor(args, since, offset + start + n, cut[-1])
                  if more and cut else None)
         payload = pigi_oneshot.envelope(args.command, {
             "items": cut, "page": {"end": not more, "nextCursor": token}})
-        if (n <= 1
-                or len(pigi_oneshot.serialize(payload)) <= pigi_oneshot.MAX_STDOUT):
+        if len(pigi_oneshot.serialize(payload)) <= pigi_oneshot.MAX_STDOUT:
             return pigi_oneshot.EXIT_OK, payload
+        if n <= 1:
+            return cut_single_item(payload, take[0])
         n -= 1
 
 
@@ -299,8 +358,6 @@ def emit_full(payload):
             adapted["filteredOut"] = 0
         shrunk = pigi_oneshot.shrink_payload(adapted, len(body))
         shrunk["command"] = command
-        if "page" in payload:
-            shrunk["page"] = payload["page"]
         if "filteredOut" not in payload:
             shrunk.pop("filteredOut", None)
         out = pigi_oneshot.serialize(shrunk)
@@ -314,8 +371,11 @@ def run_command(args, ctx):
         return pigi_oneshot.EXIT_USAGE, pigi_oneshot.USAGE_ERROR_JSON.encode("ascii")
     parsed = getattr(args, "cursor", None)
     if parsed is not None:
-        now = ctx.now_ms()
-        if not now - (HISTORY_MAX_DAYS + 1) * 86_400_000 <= parsed["s"] <= now:
+        # A cursor is bound to the horizon minted by --history: it stays
+        # valid for CURSOR_TTL_MS (plus CLOCK_SKEW_MS for clock drift).
+        horizon = ctx.now_ms() - HISTORY_MAX_DAYS * 86_400_000
+        if not (horizon - CURSOR_TTL_MS <= parsed["s"]
+                <= horizon + CLOCK_SKEW_MS):
             return pigi_oneshot.EXIT_USAGE, pigi_oneshot.USAGE_ERROR_JSON.encode("ascii")
     try:
         if args.command == "accounts":

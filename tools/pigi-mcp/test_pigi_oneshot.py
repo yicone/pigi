@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1823,7 +1824,9 @@ class OneshotTests(unittest.TestCase):
             codes.append(code)
             docs.append(doc)
             outs.append(out)
-            if code != 0 or doc["page"]["end"]:
+            if doc["page"]["end"]:
+                return codes, docs, outs
+            if not isinstance(doc["page"]["nextCursor"], str):
                 return codes, docs, outs
             tail = ["--cursor", doc["page"]["nextCursor"]]
         self.fail("history walk did not terminate")
@@ -2033,6 +2036,8 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(docs[-1]["page"], {"end": True, "nextCursor": None})
 
     def test_full_history_single_oversize_item_exit_eight(self):
+        """Review reproduction: an oversized message is delivered with its
+        text fields cut — identity delivered, nothing skipped — exit 8."""
         day = 86_400_000
         rows = [make_message("huge", OTHER, account=FULL_ACCOUNT, date=NOW,
                              snippet="H" * 100_000),
@@ -2044,7 +2049,18 @@ class OneshotTests(unittest.TestCase):
         self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
         doc = self.parse(out)
         self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["truncationNotice"],
+                         pigi_oneshot.TRUNCATION_NOTICE)
+        self.assertIsInstance(doc["originalBytes"], int)
+        self.assertGreater(doc["originalBytes"], pigi_oneshot.MAX_STDOUT)
         self.assertEqual(doc["command"], "list")
+        self.assertEqual(len(doc["items"]), 1)
+        item = doc["items"][0]
+        self.assertEqual(item["messageID"], "huge")
+        self.assertEqual(item["account"], FULL_ACCOUNT)
+        self.assertEqual(item["date"], NOW)
+        self.assertEqual(item["truncatedFields"], ["snippet"])
+        self.assertNotIn("omittedItems", doc)
         self.assertFalse(doc["page"]["end"])
         token = doc["page"]["nextCursor"]
         self.assertIsInstance(token, str)
@@ -2054,6 +2070,129 @@ class OneshotTests(unittest.TestCase):
         doc = self.parse(out)
         self.assertEqual([item["messageID"] for item in doc["items"]], ["tail"])
         self.assertEqual(doc["page"], {"end": True, "nextCursor": None})
+
+    def test_full_history_oversize_item_walk_loses_nothing(self):
+        """Every page fits, the union of messageIDs is complete and ordered,
+        and exit 8 appears on exactly the pages carrying a cut item."""
+        day = 86_400_000
+        rows = [make_message("m1", OTHER, account=FULL_ACCOUNT, date=NOW),
+                make_message("big", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - day, subject="S" * 40_000,
+                             snippet="B" * 100_000),
+                make_message("m3", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - 2 * day)]
+        for limit in (1, 20):
+            with self.subTest(limit=limit):
+                self.table["list"] = self.paged_server(rows)
+                codes, docs, outs = self.page_walk(["list"], limit)
+                self.assertTrue(all(
+                    len(out) <= pigi_oneshot.MAX_STDOUT for out in outs))
+                got = [item["messageID"] for doc in docs
+                       for item in doc["items"]]
+                self.assertEqual(got, ["m1", "big", "m3"])
+                cut_pages = [index for index, doc in enumerate(docs)
+                             if doc.get("truncated")]
+                self.assertEqual(len(cut_pages), 1)
+                index = cut_pages[0]
+                self.assertEqual(codes[index], 8)
+                self.assertEqual([code for code in codes if code != 8],
+                                 [0] * (len(codes) - 1))
+                item = docs[index]["items"][0]
+                self.assertEqual(item["messageID"], "big")
+                self.assertEqual(item["account"], FULL_ACCOUNT)
+                self.assertEqual(item["date"], NOW - day)
+                self.assertEqual(item["truncatedFields"],
+                                 ["snippet", "subject"])
+                self.assertEqual(docs[-1]["page"],
+                                 {"end": True, "nextCursor": None})
+        # Same guarantee with the oversized item first and last in the walk.
+        rows = [make_message("first", OTHER, account=FULL_ACCOUNT, date=NOW,
+                             snippet="F" * 100_000)]
+        rows += [make_message("m%02d" % i, OTHER, account=FULL_ACCOUNT,
+                              date=NOW - i * day) for i in range(1, 4)]
+        rows += [make_message("last", OTHER, account=FULL_ACCOUNT,
+                              date=NOW - 4 * day, snippet="L" * 100_000)]
+        self.table["list"] = self.paged_server(rows)
+        codes, docs, outs = self.page_walk(["list"], 10)
+        self.assertTrue(all(len(out) <= pigi_oneshot.MAX_STDOUT
+                            for out in outs))
+        got = [item["messageID"] for doc in docs for item in doc["items"]]
+        self.assertEqual(got, ["first", "m01", "m02", "m03", "last"])
+        self.assertEqual(codes.count(8), 2)
+        self.assertEqual(len([doc for doc in docs if doc.get("truncated")]),
+                         2)
+        self.assertEqual(docs[-1]["page"], {"end": True, "nextCursor": None})
+
+    def test_full_history_page_item_too_large_fails_closed(self):
+        """An item that cannot fit even with every cuttable field cut to 0
+        fails closed: exit 5 page_item_too_large, nothing delivered."""
+        day = 86_400_000
+        rows = [make_message("m0", OTHER, account=FULL_ACCOUNT, date=NOW),
+                make_message("blob", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - day,
+                             extra={"blob": list(range(40_000))}),
+                make_message("m2", OTHER, account=FULL_ACCOUNT,
+                             date=NOW - 2 * day)]
+        self.table["list"] = self.paged_server(rows)
+        code, out = self.invoke_full(["list", "--history", "--limit", "1"])
+        self.assertEqual(code, 0)
+        token = self.parse(out)["page"]["nextCursor"]
+        code, out = self.invoke_full(
+            ["list", "--cursor", token, "--limit", "1"])
+        self.assertEqual(code, 5)
+        self.assertEqual(self.parse(out),
+                         {"contentTrust": "untrusted",
+                          "error": "page_item_too_large"})
+        self.assertNotIn("items", self.parse(out))
+        self.assertNotIn("page", self.parse(out))
+        # A messageID too big to ever fit is also undeliverable: identity
+        # fields are never cut.
+        rows = [make_message("X" * 70_000, OTHER, account=FULL_ACCOUNT,
+                             date=NOW)]
+        self.table["list"] = self.paged_server(rows)
+        code, out = self.invoke_full(["list", "--history", "--limit", "5"])
+        self.assertEqual(code, 5)
+        self.assertEqual(self.parse(out)["error"], "page_item_too_large")
+
+    def test_full_history_unanchorable_id_fails_closed(self):
+        """A row whose messageID cannot be embedded in a cursor this tool
+        accepts must not emit a nextCursor the parser would reject."""
+        day = 86_400_000
+        for bad_id in ("X" * 300, "bad\nid", "X" * 70_000):
+            with self.subTest(bad_id=bad_id[:10]):
+                rows = [make_message("m0", OTHER, account=FULL_ACCOUNT,
+                                     date=NOW),
+                        make_message(bad_id, OTHER, account=FULL_ACCOUNT,
+                                     date=NOW - day),
+                        make_message("m2", OTHER, account=FULL_ACCOUNT,
+                                     date=NOW - 2 * day)]
+                self.table["list"] = self.paged_server(rows)
+                code, out = self.invoke_full(
+                    ["list", "--history", "--limit", "2"])
+                self.assertEqual(code, 5)
+                self.assertEqual(
+                    self.parse(out),
+                    {"contentTrust": "untrusted",
+                     "error": "invalid_response"})
+                self.assertNotIn("items", self.parse(out))
+
+    def test_full_history_emitted_cursors_round_trip(self):
+        """Every nextCursor emitted is accepted by this tool's own parser
+        and passes the horizon check run_command applies."""
+        day = 86_400_000
+        rows = [make_message("m%02d" % i, OTHER, account=FULL_ACCOUNT,
+                             date=NOW - i * day) for i in range(12)]
+        self.table["list"] = self.paged_server(rows)
+        codes, docs, _ = self.page_walk(["list"], 5)
+        self.assertEqual(codes, [0] * len(codes))
+        horizon = NOW - 365 * day
+        for doc in docs[:-1]:
+            token = doc["page"]["nextCursor"]
+            args = pigi_oneshot_full.parse_args(["list", "--cursor", token])
+            self.assertTrue(
+                horizon - pigi_oneshot_full.CURSOR_TTL_MS
+                <= args.cursor["s"]
+                <= horizon + pigi_oneshot_full.CLOCK_SKEW_MS)
 
     def test_full_paging_arguments_rejected_without_socket(self):
         day = 86_400_000
@@ -2077,6 +2216,12 @@ class OneshotTests(unittest.TestCase):
             self.page_cursor_doc(c="bogus"),
             self.page_cursor_doc(c="search"),                   # wrong subcommand
             self.page_cursor_doc(q=7),
+            self.page_cursor_doc(o=0),                        # offsets start at 1
+            self.page_cursor_doc(o=0, d=10**40),
+            self.page_cursor_doc(d=10**40),                   # above MAX_SAFE_MS
+            self.page_cursor_doc(d=pigi_oneshot_full.MAX_SAFE_MS + 1),
+            self.page_cursor_doc(s=pigi_oneshot_full.MAX_SAFE_MS + 1),
+            self.page_cursor_doc(d=NOW - 366 * day),          # d < s
         ]
         rejected = [
             ["list", "--history", "--cursor", token],
@@ -2115,47 +2260,77 @@ class OneshotTests(unittest.TestCase):
                 self.assertEqual(self.parse(out), USAGE_DOC)
         self.assertEqual(self.agent.requests, [])
 
-        # Structurally valid cursors outside the s window also exit 2 with no
-        # request, from run_command before any upstream call.
-        for fields in ({"s": NOW + 60_000}, {"s": NOW - 400 * day}):
+        # Structurally valid cursors whose s is off the --history horizon are
+        # rejected in run_command before any upstream call: a token is only
+        # usable for CURSOR_TTL_MS (+CLOCK_SKEW_MS drift) after its mint.
+        ttl = pigi_oneshot_full.CURSOR_TTL_MS
+        skew = pigi_oneshot_full.CLOCK_SKEW_MS
+        horizon = NOW - 365 * day
+        for fields in ({"s": NOW - 366 * day},
+                       {"s": horizon - ttl - 1},
+                       {"s": NOW - 364 * day},
+                       {"s": horizon + skew + 1},
+                       {"s": NOW, "d": NOW}):
             stale = self.page_cursor(self.page_cursor_doc(**fields))
             code, out = self.invoke_full(["list", "--cursor", stale])
             self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
         self.assertEqual(self.agent.requests, [])
-        # At the oldest allowed bound the cursor still parses and runs.
+        # Positive boundaries: a fresh mint, one second before expiry, and a
+        # far-future anchor all reach the socket.
         self.table["list"] = self.paged_server([])
-        edge = self.page_cursor(self.page_cursor_doc(s=NOW - 366 * day))
-        code, out = self.invoke_full(["list", "--cursor", edge])
-        self.assertEqual(code, 0)
-        self.assertEqual(len(self.agent.requests), 1)
-        self.assertEqual(self.parse(out)["page"],
-                         {"end": True, "nextCursor": None})
+        for fields in ({"s": horizon},
+                       {"s": horizon - ttl + 1000},
+                       {"o": 1, "d": pigi_oneshot_full.MAX_SAFE_MS}):
+            edge = self.page_cursor(self.page_cursor_doc(**fields))
+            code, out = self.invoke_full(["list", "--cursor", edge])
+            self.assertEqual((code, self.parse(out)["page"]),
+                             (0, {"end": True, "nextCursor": None}))
+        self.assertEqual(len(self.agent.requests), 3)
 
-        # The run_main path rejects before the socket too (config is read
-        # first); invoke_main uses the real clock, so use unambiguous times.
+        # The real-clock invoke_main/run_main path rejects the same bounds.
         home, listener = self.make_home(
             "pgt", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
         self.write_profile_config(home, "oneshot-full.json",
                                   {"account": FULL_ACCOUNT})
-        for fields in ({"s": 1}, {"s": 9_999_999_999_999}):
-            stale = self.page_cursor(self.page_cursor_doc(**fields))
-            code, _, doc = self.invoke_main(
-                ["full", "list", "--cursor", stale], home)
-            self.assertEqual((code, doc), (2, USAGE_DOC))
-        self.assertEqual(listener.requests, [])
-
-        # Parse-time rejections never reach the config file either.
+        real_now = int(time.time() * 1000)
+        structural = [
+            {"o": 0},
+            {"o": 0, "d": 10**40},
+            {"o": 1, "d": 10**40},
+            {"d": pigi_oneshot_full.MAX_SAFE_MS + 1},
+            {"s": pigi_oneshot_full.MAX_SAFE_MS + 1},
+            {"s": real_now - 365 * day, "d": real_now - 366 * day},
+        ]
+        horizon_cases = [
+            {"s": 1},
+            {"s": real_now - 366 * day},
+            {"s": real_now - 365 * day - ttl - 1},
+            {"s": real_now - 364 * day},
+            {"s": real_now},
+        ]
+        # Structural rejects exit at parse, before the config file is read;
+        # horizon rejects run in run_command after config, before the socket.
         def explode(home_arg):
             raise AssertionError("config was read")
 
         with patch.object(pigi_oneshot, "load_config", explode), \
                 patch.object(pigi_oneshot_full, "load_config", explode):
-            for argv in (["full", "list", "--history", "--cursor", token],
-                         ["full", "list", "--cursor", "not-a-token"],
-                         ["full", "get", "m1", "--cursor", token],
-                         ["full", "accounts", "--history"]):
+            bad = [["full", "list", "--history", "--cursor", token],
+                   ["full", "list", "--cursor", "not-a-token"],
+                   ["full", "get", "m1", "--cursor", token],
+                   ["full", "accounts", "--history"]]
+            bad += [["full", "list", "--cursor",
+                     self.page_cursor(self.page_cursor_doc(**fields))]
+                    for fields in structural]
+            for argv in bad:
                 code, _, doc = self.invoke_main(argv, home)
                 self.assertEqual((code, doc), (2, USAGE_DOC))
+        for fields in horizon_cases:
+            stale = self.page_cursor(self.page_cursor_doc(**fields))
+            code, _, doc = self.invoke_main(
+                ["full", "list", "--cursor", stale], home)
+            self.assertEqual((code, doc), (2, USAGE_DOC))
+        self.assertEqual(listener.requests, [])
 
     def test_billing_profile_rejects_paging_options(self):
         token = self.page_cursor(self.page_cursor_doc())
@@ -2216,6 +2391,66 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(params["offset"], 0)
         self.assertEqual(params["limit"], 100)
         self.assertEqual(params["account"], FULL_ACCOUNT)
+
+    def test_launcher_rejects_out_of_bounds_cursor(self):
+        """Real .sh entry: out-of-bounds cursors exit 2 before the socket
+        while parse-clean args reach the config check (exit 6)."""
+        home, listener = self.make_home(
+            "lb", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
+        self.write_profile_config(home, "oneshot-full.json",
+                                  {"account": FULL_ACCOUNT})
+        env, canaries = self.make_hooks()
+        launch_dir = self.root / "lb-sh"
+        launch_dir.mkdir()
+        runtime = self.root / "lb-runtime"
+        runtime.mkdir()
+        for name in ("pigi_oneshot.py", "pigi_oneshot_full.py", "pigi_mcp.py",
+                     "transport.py", "audit.py"):
+            shutil.copyfile(SCRIPT.parent / name, runtime / name)
+        script = runtime / "pigi_oneshot.py"
+        pinned = 'PINNED_HOME = "/Users/tr"'
+        text = script.read_text()
+        self.assertEqual(text.count(pinned), 1)
+        script.write_text(text.replace(
+            pinned, "PINNED_HOME = " + repr(str(home)), 1))
+        launcher = self.render_launcher(launch_dir, synthetic_python(),
+                                      script, home)
+        real_now = int(time.time() * 1000)
+        cases = [
+            ("structural", {"o": 0, "d": 10**40}),
+            ("horizon", {"s": real_now - 366 * 86_400_000}),
+        ]
+        for label, fields in cases:
+            for argv in (["full", "list"],
+                         ["full", "search", "--query", "ok"]):
+                with self.subTest(case=label, argv=argv[1]):
+                    doc_fields = dict(fields)
+                    if argv[1] == "search":
+                        doc_fields.update(
+                            c="search",
+                            q=pigi_oneshot_full.query_digest("ok"))
+                    token = self.page_cursor(
+                        self.page_cursor_doc(**doc_fields))
+                    result = subprocess.run(
+                        [str(launcher), *argv, "--cursor", token],
+                        capture_output=True, timeout=20, env=env)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertEqual(listener.requests, [])
+        self.assertFalse(canaries["bash_env"].exists())
+        # Contrast: --history parses fine, so a config-less home reaches the
+        # config check and exits 6 — rejection above happened earlier.
+        home2, _ = self.make_home("lb2")
+        script.write_text(text.replace(
+            pinned, "PINNED_HOME = " + repr(str(home2)), 1))
+        launcher2 = self.render_launcher(launch_dir, synthetic_python(),
+                                         script, home2)
+        result = subprocess.run([str(launcher2), "full", "list", "--history"],
+                                capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 6)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.parse(result.stdout), CONFIG_DOC)
 
     def test_docs_describe_history_paging(self):
         doc = DOCS.read_text()

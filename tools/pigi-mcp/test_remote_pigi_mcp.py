@@ -6,9 +6,16 @@ from unittest.mock import patch
 
 from pigi_mcp import MCPServer
 from remote_pigi_mcp import main, ssh_command
+import test_isolation
 import test_pigi_mcp as fixture
 from test_pigi_mcp import call, request
 from transport import ToolError
+
+
+def setUpModule():
+    # Every default that used to resolve to the real HOME is a sentinel here;
+    # the un-isolated repo entry points are refused before a process exists.
+    test_isolation.module_setup()
 
 
 class ScopeTests(unittest.TestCase):

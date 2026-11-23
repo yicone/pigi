@@ -19,9 +19,11 @@ import unittest
 from unittest.mock import patch
 
 import audit
+import pigi_mcp
 import pigi_oneshot
 import pigi_oneshot_full
 from pigi_mcp import TRUST_NOTICE
+import test_isolation
 import transport
 
 SCRIPT = Path(__file__).with_name("pigi_oneshot.py")
@@ -122,9 +124,9 @@ def assert_isolated(home, config_path, socket_path, audit_db, interpreter=None):
         for root in protected:
             if resolved == root or resolved.startswith(root + os.sep):
                 raise AssertionError("refusing real %s path: %s" % (label, resolved))
-    if os.path.realpath(socket_path) == os.path.realpath(transport.DEFAULT_SOCKET):
+    if os.path.realpath(socket_path) == os.path.realpath(test_isolation.REAL_SOCKET):
         raise AssertionError("refusing default socket path")
-    if os.path.realpath(audit_db) == os.path.realpath(audit.DEFAULT_AUDIT):
+    if os.path.realpath(audit_db) == os.path.realpath(test_isolation.REAL_AUDIT):
         raise AssertionError("refusing default audit path")
     if interpreter is not None:
         check_interpreter(interpreter)
@@ -209,7 +211,7 @@ def setUpModule():
     default_config = Path(ORIGINAL_PINNED_HOME).joinpath(*pigi_oneshot.CONFIG_PARTS)
     try:
         assert_isolated(ORIGINAL_PINNED_HOME, default_config,
-                        transport.DEFAULT_SOCKET, audit.DEFAULT_AUDIT,
+                        test_isolation.REAL_SOCKET, test_isolation.REAL_AUDIT,
                         interpreter=PINNED_LAUNCHER_PYTHON)
     except AssertionError:
         pass
@@ -226,6 +228,29 @@ def setUpModule():
             pass
         else:
             raise AssertionError("isolation guard ignored pinned interpreter")
+    # From here on every default that used to resolve to the real HOME is a
+    # sentinel under ISO.root; the tripwire at its agent.sock records any
+    # fallback so a default-path call fails the test that made it.
+    global ISO, RUN_SCRIPT
+    ISO = test_isolation.module_setup({
+        "oneshot.json": {"account": ACCOUNT, "senders": [ALLOWED]},
+        "oneshot-full.json": {"account": FULL_ACCOUNT}})
+    # The only pigi_oneshot copy anything may execute: the repo files with
+    # PINNED_HOME pointed at the sentinel home. The un-isolated originals are
+    # refused by test_isolation before a process exists.
+    runtime = ISO.root / "rt"
+    runtime.mkdir()
+    for name in ("pigi_oneshot.py", "pigi_oneshot_full.py", "pigi_mcp.py",
+                 "transport.py", "audit.py"):
+        shutil.copyfile(SCRIPT.parent / name, runtime / name)
+    script = runtime / "pigi_oneshot.py"
+    pinned = 'PINNED_HOME = "/Users/tr"'
+    text = script.read_text()
+    if text.count(pinned) != 1:
+        raise AssertionError("runtime copy: PINNED_HOME literal not unique")
+    script.write_text(text.replace(
+        pinned, "PINNED_HOME = " + repr(str(ISO.home)), 1))
+    RUN_SCRIPT = script
 
 
 class _BytesStdout:
@@ -353,6 +378,7 @@ class OneshotTests(unittest.TestCase):
         assert_isolated(self.temp.name, self.root / "oneshot.json",
                         self.ctx.socket_path, self.ctx.audit_db,
                         interpreter=self.ctx.python)
+        self.addCleanup(ISO.assert_quiet)
 
     def stop_agent(self):
         self.agent.stop()
@@ -384,7 +410,7 @@ class OneshotTests(unittest.TestCase):
     def cli(self, args):
         result = self.run_python(
             [synthetic_python(), "-I", "-S", "-B", "-X", "utf8",
-             str(SCRIPT), *args],
+             str(RUN_SCRIPT), *args],
             capture_output=True, timeout=20, env=self.trusted_env())
         self.assertEqual(result.stderr, b"")
         if result.stdout:
@@ -413,6 +439,7 @@ class OneshotTests(unittest.TestCase):
     def render_launcher(self, directory, python, script, home):
         """Throwaway copy of pigi_oneshot.sh with the pinned literals replaced.
         The isolation guard runs first — a refused call writes nothing."""
+        test_isolation.refuse_unisolated_entry(script)
         support = Path(home) / "Library" / "Application Support"
         assert_isolated(str(home), support / "pigi" / "oneshot.json",
                         support / "pigi" / "agent.sock",
@@ -518,7 +545,8 @@ class OneshotTests(unittest.TestCase):
         return code, out, json.loads(out) if out else None
 
     def audit_rows(self):
-        with sqlite3.connect(self.root / "audit.sqlite3") as db:
+        with contextlib.closing(
+                sqlite3.connect(self.root / "audit.sqlite3")) as db:
             return db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id").fetchall()
 
     def methods_seen(self):
@@ -626,7 +654,8 @@ class OneshotTests(unittest.TestCase):
                 code, out = self.invoke(["get", bad])
                 self.assertEqual(code, 2)
                 self.assertEqual(self.parse(out), USAGE_DOC)
-        for argv in (["get", "-abc"], ["get"], ["get", "ok", "extra"]):
+        for argv in (["get"], ["get", "ok", "extra"], ["get", "-a", "-b"],
+                     ["get", "--"]):
             result = self.cli(argv)
             self.assertEqual(result.returncode, 2)
             self.assertEqual(self.parse(result.stdout), USAGE_DOC)
@@ -679,6 +708,284 @@ class OneshotTests(unittest.TestCase):
         result = self.cli(["get-batch"] + ["m%d" % i for i in range(6)])
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.agent.requests, [])
+
+    # Every one matches MESSAGE_ID, so each is an ID, never an option. A
+    # literal "--" is never an ID: it is the first-position separator or an
+    # invalid argument (see the rejection tests below).
+    DASH_IDS = ("-abc", "--abc", "-", "-a-b=", "-h", "--help", "--limit",
+                "--history", "--cursor", "--query", "--since-days",
+                "--account", "--offset", "--limit=5", "--cursor=abc",
+                "-" * 88, "-" + "x" * 255)
+
+    def dash_runner(self, profile):
+        """(invoke, make_message) for one profile."""
+        if profile == "full":
+            def make(message_id):
+                return make_message(message_id, account=FULL_ACCOUNT)
+            return self.invoke_full, make
+        return self.invoke, make_message
+
+    def test_every_valid_id_accepted_by_get_without_separator(self):
+        for profile in ("billing", "full"):
+            invoke, make = self.dash_runner(profile)
+            self.table["get"] = lambda params: get_result(
+                make(params["messageID"]), "body")
+            # A first `--` is always the separator; every ID works bare and
+            # behind the separator.
+            cases = [([mid], mid) for mid in self.DASH_IDS]
+            cases += [(["--", mid], mid) for mid in self.DASH_IDS]
+            for tokens, message_id in cases:
+                argv = ["get"] + tokens
+                with self.subTest(profile=profile, argv=argv[:4]):
+                    del self.agent.requests[:]
+                    code, out = invoke(argv)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(
+                        self.parse(out)["message"]["messageID"], message_id)
+                    self.assertEqual([r["params"]["messageID"]
+                                      for r in self.agent.requests],
+                                     [message_id])
+
+    def test_every_valid_id_accepted_in_batches(self):
+        batches = [["ok1", "-a", "--b", "-", "m2"], ["-a", "ok1"],
+                   ["m1", "-a-"], ["--limit", "--history"],
+                   ["ok1", "--help", "-h", "--cursor", "--query"],
+                   ["--history", "a"], list(self.DASH_IDS[:5])]
+        # A first `--` is always the separator, never an ID: `get-batch -- a`
+        # is the single ID `a`.
+        cases = [(ids, ids) for ids in batches]
+        cases += [(["--"] + ids, ids) for ids in batches]
+        cases.append((["--", "a"], ["a"]))
+        for profile in ("billing", "full"):
+            invoke, make = self.dash_runner(profile)
+            self.table["get"] = lambda params: get_result(
+                make(params["messageID"]), "body-" + params["messageID"])
+            for tokens, ids in cases:
+                with self.subTest(profile=profile, tokens=tokens):
+                    del self.agent.requests[:]
+                    code, out = invoke(["get-batch"] + tokens)
+                    self.assertEqual(code, 0)
+                    results = self.parse(out)["results"]
+                    self.assertEqual([e["messageID"] for e in results], ids)
+                    self.assertEqual([e["status"] for e in results],
+                                     ["ok"] * len(ids))
+                    self.assertEqual([r["params"]["messageID"]
+                                      for r in self.agent.requests], ids)
+
+    def test_dash_ids_keep_real_invalid_arguments_rejected(self):
+        rejected = [
+            ["get"], ["get-batch"], ["get", "--"], ["get-batch", "--"],
+            ["get", "--", ""], ["get-batch", "--", ""],
+            ["get", ""], ["get-batch", "-a", ""],
+            ["get", "-bad id"], ["get", "-a/b"], ["get", "--a<b"],
+            ["get", "-" + "x" * 256], ["get", "--", "-" + "x" * 256],
+            ["get-batch", "-a", "-bad id"], ["get-batch", "--", "-a", "-bad/id"],
+            ["get", "-abc", "-def"], ["get", "m1", "--history"],
+            ["get", "--limit", "5"], ["get", "--", "-a", "-b"],
+            ["get", "--", "--", "--"], ["get", "--", "--"], ["get", "a", "--"],
+            ["get", "--", "a", "--"], ["get", "--", "--", "a"],
+            ["get-batch", "a", "--"], ["get-batch", "--", "--"],
+            ["get-batch", "--", "--", "a"], ["get-batch", "--", "a", "--"],
+            ["get-batch", "--", "a", "--", "b"], ["get-batch", "a", "--", "b"],
+            ["get-batch", "-a", "--", "--b"],
+            ["get-batch"] + ["-m%d" % i for i in range(6)],
+            ["get-batch", "--"] + ["--m%d" % i for i in range(6)],
+            ["get-batch", "--", "--"] + ["m%d" % i for i in range(5)],
+        ]
+        for profile in ("billing", "full"):
+            invoke, _ = self.dash_runner(profile)
+            for argv in rejected:
+                with self.subTest(profile=profile, argv=argv[:3]):
+                    code, out = invoke(argv)
+                    self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        self.assertEqual(self.agent.requests, [])
+        # Exactly five ids still pass; the cap is unchanged.
+        self.table["get"] = lambda params: get_result(
+            make_message(params["messageID"]), "b")
+        code, _ = self.invoke(["get-batch", "-a", "--b", "-", "--history", "m"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.agent.requests), 5)
+
+    def test_options_of_other_commands_unchanged_by_id_handling(self):
+        del self.agent.requests[:]
+        self.table["list"] = lambda params: search_result([])
+        code, _ = self.invoke_full(["list", "--limit", "20"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.agent.requests[-1]["params"]["limit"], 20)
+        self.assertEqual(self.invoke_full(["list", "--limit", "21"])[0], 2)
+        self.assertEqual(self.invoke_full(["list", "-abc"])[0], 2)
+        self.assertEqual(self.invoke_full(["list", "--history", "--limit", "0"])[0], 2)
+        self.table["search"] = lambda params: search_result([])
+        self.assertEqual(self.invoke(["search", "--limit", "20"])[0], 0)
+        self.assertEqual(self.invoke(["search", "--limit", "21"])[0], 2)
+        self.assertEqual(self.invoke(["search", "-abc"])[0], 2)
+        self.assertEqual(self.invoke(["accounts", "-abc"])[0], 2)
+        self.assertEqual(self.invoke(["accounts", "--history"])[0], 2)
+        self.assertEqual(self.invoke(["--limit", "5", "get", "m1"])[0], 2)
+        self.assertEqual(len(self.agent.requests), 2)
+
+    def test_launcher_passes_dash_ids_end_to_end(self):
+        env, _ = self.make_hooks()
+        for profile, account in (("billing", ACCOUNT), ("full", FULL_ACCOUNT)):
+            home, listener = self.make_home(
+                "ld" + profile, {"account": ACCOUNT, "senders": [ALLOWED]},
+                agent=True)
+            self.write_profile_config(home, "oneshot-full.json",
+                                      {"account": FULL_ACCOUNT})
+            launch_dir = self.root / ("ld-sh-" + profile)
+            launch_dir.mkdir()
+            runtime = self.root / ("ld-runtime-" + profile)
+            runtime.mkdir()
+            for name in ("pigi_oneshot.py", "pigi_oneshot_full.py",
+                         "pigi_mcp.py", "transport.py", "audit.py"):
+                shutil.copyfile(SCRIPT.parent / name, runtime / name)
+            script = runtime / "pigi_oneshot.py"
+            pinned = 'PINNED_HOME = "/Users/tr"'
+            text = script.read_text()
+            self.assertEqual(text.count(pinned), 1)
+            script.write_text(text.replace(
+                pinned, "PINNED_HOME = " + repr(str(home)), 1))
+            launcher = self.render_launcher(launch_dir, synthetic_python(),
+                                            script, home)
+            self.table["get"] = lambda params, account=account: get_result(
+                make_message(params["messageID"], account=account), "body")
+            prefix = ["full"] if profile == "full" else []
+            def run(argv):
+                return subprocess.run([str(launcher), *prefix, *argv],
+                                      capture_output=True, timeout=20, env=env)
+
+            expected = []
+            for message_id in ("-abc", "--limit", "--history", "-h"):
+                result = run(["get", message_id])
+                self.assertEqual((result.returncode, result.stderr), (0, b""))
+                self.assertEqual(
+                    json.loads(result.stdout)["message"]["messageID"],
+                    message_id)
+                expected.append(message_id)
+            for tokens, ids in ((["--x", "-", "y", "--cursor"],) * 2,
+                                (["--", "--x", "-", "y"], ["--x", "-", "y"])):
+                result = run(["get-batch", *tokens])
+                self.assertEqual((result.returncode, result.stderr), (0, b""))
+                self.assertEqual([e["messageID"] for e in
+                                  json.loads(result.stdout)["results"]], ids)
+                expected += ids
+            seen = [r["params"]["messageID"] for r in listener.requests
+                    if r["method"] == "get"]
+            self.assertEqual(seen, expected)
+            before = len(listener.requests)
+            for argv in (["get", "-bad id"], ["get"], ["get", "-a", "-b"],
+                         ["get", "--"], ["get-batch", "--"], ["get", "--", "--"],
+                         ["get-batch", "a", "--"], ["get-batch", "--", "--", "a"],
+                         ["get-batch", "-ok", "a/b"],
+                         ["get-batch"] + ["-m%d" % i for i in range(6)]):
+                result = run(argv)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+            self.assertEqual(len(listener.requests), before)
+
+    def test_module_defaults_resolve_to_sentinel_not_real_home(self):
+        """After module_setup every real default resolves under ISO.root —
+        pinned home, default socket/audit paths and the defaults bound into
+        Context/SocketClient/Audit."""
+        root = os.path.realpath(str(ISO.root)) + os.sep
+
+        def under_root(path):
+            resolved = os.path.realpath(str(path))
+            self.assertTrue(resolved.startswith(root), resolved)
+            for home in test_isolation.real_homes():
+                self.assertNotEqual(resolved, home)
+                self.assertFalse(resolved.startswith(home + os.sep),
+                                 (resolved, home))
+
+        for path in (pigi_oneshot.PINNED_HOME, transport.DEFAULT_SOCKET,
+                     audit.DEFAULT_AUDIT, pigi_oneshot.DEFAULT_SOCKET,
+                     pigi_oneshot.DEFAULT_AUDIT, pigi_mcp.DEFAULT_SOCKET,
+                     pigi_mcp.DEFAULT_AUDIT):
+            with self.subTest(path=str(path)):
+                under_root(path)
+        ctx = pigi_oneshot.Context(ACCOUNT, {ALLOWED})
+        under_root(ctx.socket_path)
+        under_root(ctx.audit_db)
+        under_root(ctx.home)
+        under_root(transport.SocketClient().path)
+        with contextlib.closing(audit.Audit()) as ledger:
+            self.assertIsNotNone(ledger.db)
+        self.assertTrue(ISO.audit.exists())
+        under_root(ISO.audit)
+
+    def test_unisolated_entry_points_are_refused(self):
+        """Spawning the un-isolated repo entry points raises before any
+        process exists, and rendering a launcher at them fails the same way.
+        """
+        env = self.trusted_env()
+        for argv in ([synthetic_python(), "-I", str(SCRIPT), "accounts"],
+                     [str(LAUNCHER), "accounts"],
+                     ["/bin/sh", str(LAUNCHER), "accounts"],
+                     [synthetic_python(), "-I", str(FULL_SCRIPT), "accounts"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(AssertionError):
+                    subprocess.run(argv, capture_output=True, timeout=20,
+                                   env=env)
+        outdir = self.root / "refused-render"
+        outdir.mkdir()
+        home, _ = self.make_home("refused")
+        with self.assertRaises(AssertionError):
+            self.render_launcher(outdir, synthetic_python(), SCRIPT, home)
+        self.assertEqual(list(outdir.iterdir()), [])
+        self.assertEqual(ISO.tripwire.connections, 0)
+        self.assertEqual(ISO.tripwire.requests, [])
+        with patch.object(test_isolation, "_active", None):
+            with self.assertRaises(AssertionError):
+                test_isolation.active()
+
+    def test_default_cli_path_reaches_only_isolated_homes(self):
+        """Parse-clean option-shaped IDs over the default path land on the
+        sentinel socket (cli) or a fake home's FakeAgent (launcher) — never
+        a real path."""
+        for argv in (["get", "-abc"], ["full", "get", "-abc"]):
+            with self.subTest(argv=argv):
+                ISO.tripwire.reset()
+                result = self.cli(argv)
+                self.assertEqual(result.returncode, 5)
+                self.assertEqual(ISO.tripwire.connections, 1)
+                self.assertEqual(ISO.tripwire.requests, ["get"])
+        ISO.tripwire.reset()
+        # The same argv through the rendered .sh launcher for both profiles:
+        # a runtime copy pinned to a throwaway home reaches only that home's
+        # FakeAgent (the pattern test_launcher_passes_dash_ids_end_to_end
+        # exercises further).
+        env, _ = self.make_hooks()
+        home, listener = self.make_home(
+            "iso-sh", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
+        self.write_profile_config(home, "oneshot-full.json",
+                                  {"account": FULL_ACCOUNT})
+        launch_dir = self.root / "iso-sh-launch"
+        launch_dir.mkdir()
+        runtime = self.root / "iso-sh-rt"
+        runtime.mkdir()
+        for name in ("pigi_oneshot.py", "pigi_oneshot_full.py", "pigi_mcp.py",
+                     "transport.py", "audit.py"):
+            shutil.copyfile(SCRIPT.parent / name, runtime / name)
+        script = runtime / "pigi_oneshot.py"
+        pinned = 'PINNED_HOME = "/Users/tr"'
+        text = script.read_text()
+        self.assertEqual(text.count(pinned), 1)
+        script.write_text(text.replace(
+            pinned, "PINNED_HOME = " + repr(str(home)), 1))
+        launcher = self.render_launcher(launch_dir, synthetic_python(),
+                                        script, home)
+        for prefix, account in (([], ACCOUNT), (["full"], FULL_ACCOUNT)):
+            self.table["get"] = lambda params, account=account: get_result(
+                make_message(params["messageID"], account=account), "body")
+            result = subprocess.run([str(launcher), *prefix, "get", "-abc"],
+                                    capture_output=True, timeout=20, env=env)
+            self.assertEqual((result.returncode, result.stderr), (0, b""))
+            self.assertEqual(
+                json.loads(result.stdout)["message"]["messageID"], "-abc")
+        self.assertEqual([r["method"] for r in listener.requests],
+                         ["get", "get"])
+        self.assertEqual(ISO.tripwire.connections, 0)
+        self.assertEqual(ISO.tripwire.requests, [])
 
     def test_unimplemented_and_scope_options_rejected(self):
         rejected = [["list"], ["get_verification_code"], ["unknown"], [],
@@ -810,7 +1117,7 @@ class OneshotTests(unittest.TestCase):
 
     def test_direct_launch_refused_exit_nine(self):
         env, canaries = self.make_hooks()
-        result = self.run_python([synthetic_python(), str(SCRIPT), "list"],
+        result = self.run_python([synthetic_python(), str(RUN_SCRIPT), "list"],
                                 capture_output=True, timeout=20, env=env)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stdout,
@@ -826,19 +1133,19 @@ class OneshotTests(unittest.TestCase):
         # Launcher flag set but interpreter not isolated -> still refused.
         flagged = dict(env)
         flagged[pigi_oneshot.TRUSTED_FLAG_NAME] = pigi_oneshot.TRUSTED_FLAG_VALUE
-        result = self.run_python([synthetic_python(), str(SCRIPT), "list"],
+        result = self.run_python([synthetic_python(), str(RUN_SCRIPT), "list"],
                                 capture_output=True, timeout=20, env=flagged)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stderr, b"")
         # Isolation flags but no launcher flag -> refused.
         result = self.run_python(
-            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(RUN_SCRIPT), "list"],
             capture_output=True, timeout=20, env=env)
         self.assertEqual(result.returncode, 9)
         self.assertEqual(result.stderr, b"")
         # Flag plus all isolation flags -> passes the gate, rejects `list`.
         result = self.run_python(
-            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), "list"],
+            [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(RUN_SCRIPT), "list"],
             capture_output=True, timeout=20, env=flagged)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.parse(result.stdout), USAGE_DOC)
@@ -846,7 +1153,7 @@ class OneshotTests(unittest.TestCase):
 
     def test_launcher_blocks_environment_hooks(self):
         home, _ = self.make_home("hla")
-        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
+        launcher = self.render_launcher(self.root, synthetic_python(), RUN_SCRIPT, home)
         env, canaries = self.make_hooks()
         for argv in (["list"], ["--account", "x"]):
             with self.subTest(argv=argv):
@@ -901,7 +1208,7 @@ class OneshotTests(unittest.TestCase):
         d1.mkdir()
         d2.mkdir()
         launcher = self.render_launcher(d1, self.root / "no-such-python",
-                                        SCRIPT, home)
+                                        RUN_SCRIPT, home)
         merged, split = self.launch(launcher, ["accounts"])
         self.assert_json_contract(merged, split, 6, CONFIG_DOC)
         launcher = self.render_launcher(d2, synthetic_python(),
@@ -912,9 +1219,10 @@ class OneshotTests(unittest.TestCase):
     def test_launcher_normalizes_interpreter_failures(self):
         home, _ = self.make_home("hni")
 
-        def render(python, script=SCRIPT, tag="r"):
+        def render(python, script=None, tag="r"):
             sub = tempfile.mkdtemp(prefix=tag + "-", dir=self.temp.name)
-            return self.render_launcher(sub, python, script, home)
+            return self.render_launcher(
+                sub, python, RUN_SCRIPT if script is None else script, home)
 
         # (a) a corrupted-but-executable binary: native magic prefix with no
         # real program behind it — passes the guard's native-binary rule, then
@@ -968,7 +1276,7 @@ class OneshotTests(unittest.TestCase):
 
     def test_bash_env_never_runs_on_supported_launches(self):
         home, _ = self.make_home("hba")
-        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
+        launcher = self.render_launcher(self.root, synthetic_python(), RUN_SCRIPT, home)
         env, canaries = self.make_hooks()
         for command in ([str(launcher), "list"], ["/bin/sh", str(launcher), "list"]):
             with self.subTest(command=command):
@@ -986,7 +1294,7 @@ class OneshotTests(unittest.TestCase):
         # $BASH_ENV before the script's first line — the canary fires even
         # though the run itself still ends in the fixed refusal.
         home, _ = self.make_home("hbb")
-        launcher = self.render_launcher(self.root, synthetic_python(), SCRIPT, home)
+        launcher = self.render_launcher(self.root, synthetic_python(), RUN_SCRIPT, home)
         env, canaries = self.make_hooks()
         result = subprocess.run(["/bin/bash", str(launcher), "list"],
                                 capture_output=True, timeout=20, env=env)
@@ -1183,7 +1491,7 @@ class OneshotTests(unittest.TestCase):
         for argv in cases:
             with self.subTest(argv=argv):
                 merged = self.run_python(
-                    [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(SCRIPT), *argv],
+                    [synthetic_python(), "-I", "-S", "-B", "-X", "utf8", str(RUN_SCRIPT), *argv],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
                     env=self.trusted_env())
                 self.assertEqual(merged.returncode, 2)
@@ -1231,10 +1539,10 @@ class OneshotTests(unittest.TestCase):
                             str(support / "pigi" / "agent.sock"), str(audit_path))
         with self.assertRaises(AssertionError):
             assert_isolated(str(home), str(config),
-                            str(transport.DEFAULT_SOCKET), str(audit_path))
+                            str(test_isolation.REAL_SOCKET), str(audit_path))
         with self.assertRaises(AssertionError):
             assert_isolated(str(home), str(config), str(sock),
-                            str(audit.DEFAULT_AUDIT))
+                            str(test_isolation.REAL_AUDIT))
         with self.assertRaises(AssertionError):
             assert_isolated(str(home), str(support / "pigi" / "oneshot.json"),
                             str(sock), str(audit_path))
@@ -1263,7 +1571,7 @@ class OneshotTests(unittest.TestCase):
         outdir = self.root / "render-deny"
         outdir.mkdir()
         with self.assertRaises(AssertionError):
-            self.render_launcher(outdir, pinned, SCRIPT, home)
+            self.render_launcher(outdir, pinned, RUN_SCRIPT, home)
         self.assertEqual(list(outdir.iterdir()), [])
         # The spawn helper refuses before Popen is ever invoked.
         with patch.object(subprocess, "run") as mock_run:
@@ -1285,7 +1593,7 @@ class OneshotTests(unittest.TestCase):
         home = self.root / "shim-home"
         home.mkdir()
         with self.assertRaises(AssertionError):
-            self.render_launcher(outdir, shim, SCRIPT, home)
+            self.render_launcher(outdir, shim, RUN_SCRIPT, home)
         self.assertEqual(list(outdir.iterdir()), [])
         with patch.object(subprocess, "run") as mock_run:
             with self.assertRaises(AssertionError):
@@ -2357,8 +2665,6 @@ class OneshotTests(unittest.TestCase):
             ["list", "--offset", "5"],
             ["get", "m1", "--cursor", token],
             ["get", "m1", "--history"],
-            ["get-batch", "m1", "--history"],
-            ["get-batch", "m1", "--cursor", token],
             ["accounts", "--history"],
             ["accounts", "--cursor", token],
         ]
@@ -2470,7 +2776,7 @@ class OneshotTests(unittest.TestCase):
         launch_dir = self.root / "lh-sh"
         launch_dir.mkdir()
         launcher = self.render_launcher(launch_dir, synthetic_python(),
-                                      SCRIPT, home)
+                                      RUN_SCRIPT, home)
         # Argument rejection exits 2 before the pinned home is touched.
         result = subprocess.run(
             [str(launcher), "full", "list", "--history", "--cursor", "x"],
@@ -2587,7 +2893,7 @@ class OneshotTests(unittest.TestCase):
         home, _ = self.make_home("lfull")
         launch_dir = self.root / "lfull-sh"
         launch_dir.mkdir()
-        launcher = self.render_launcher(launch_dir, synthetic_python(), SCRIPT, home)
+        launcher = self.render_launcher(launch_dir, synthetic_python(), RUN_SCRIPT, home)
         env, canaries = self.make_hooks()
         result = subprocess.run(
             [str(launcher), "full", "search", "--since-days", "31"],

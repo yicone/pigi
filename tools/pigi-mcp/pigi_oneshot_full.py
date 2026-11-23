@@ -111,18 +111,15 @@ def build_parser():
     search_paged.add_argument("--history", action="store_true")
     search_paged.add_argument("--cursor", type=cursor)
     search.add_argument("--limit", type=pigi_oneshot.bounded_int(1, 20), default=10)
-    get = commands.add_parser("get", allow_abbrev=False)
-    get.add_argument("message_id", type=pigi_oneshot.message_id)
-    batch = commands.add_parser("get-batch", allow_abbrev=False)
-    batch.add_argument("message_ids", nargs="+", type=pigi_oneshot.message_id)
     return parser
 
 
 def parse_args(argv):
+    args = pigi_oneshot.id_command(argv)
+    if args is not None:
+        return args
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "get-batch" and len(args.message_ids) > 5:
-        parser.error()
     if args.command in (LIST_COMMAND, "search"):
         repeated = sum(a == "--cursor" or a.startswith("--cursor=")
                        for a in argv)

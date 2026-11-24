@@ -2223,22 +2223,88 @@ class OneshotTests(unittest.TestCase):
                 code, out = self.invoke_full(unmatched)
                 self.assertEqual((code, self.parse(out)), (5, failure))
 
-    def test_codes_oversize_page_shrinks_and_resumes(self):
+    def test_codes_oversize_page_is_truncated_not_shortened(self):
+        """An oversized codes envelope is truncated, never shortened: exit 8
+        with no codes key; a limit that fits still pages with nextOffset."""
         rows = [make_code_row("m%02d" % i, CODE_SENDER,
                               fromName="N" * 4000 + "%02d" % i,
                               date=NOW - i * 1000) for i in range(20)]
         self.table["codes"] = self.codes_server(rows)
-        codes, docs, outs = self.codes_walk(
-            ["codes", "--from-email", CODE_SENDER], 20)
-        self.assertEqual(codes, [0] * len(codes))
-        self.assertGreater(len(docs), 1)
-        self.assertTrue(any(len(doc["codes"]) < 20 for doc in docs))
+        expected = pigi_oneshot.envelope(
+            "codes", {"codes": [{key: row[key]
+                                 for key in pigi_oneshot_full.CODES_FIELDS
+                                 if key in row}
+                                for row in rows]})
+        original = len(pigi_oneshot.serialize(expected))
+        self.assertEqual(len(expected["codes"]), 20)
+        self.assertGreater(original, pigi_oneshot.MAX_STDOUT)
+        code, out = self.invoke_full(["codes", "--limit", "20"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["command"], "codes")
+        self.assertNotIn("codes", doc)
+        self.assertNotIn("nextOffset", doc)
+        self.assertEqual(doc["originalBytes"], original)
+        # A limit whose page fits is still a normal paged result.
+        codes, docs, outs = self.codes_walk(["codes"], 5)
+        self.assertEqual(codes, [0] * 4)
+        self.assertEqual([len(doc["codes"]) for doc in docs], [5] * 4)
+        self.assertEqual([doc.get("nextOffset") for doc in docs],
+                         [5, 10, 15, None])
         self.assertEqual([item["messageID"] for doc in docs
                           for item in doc["codes"]],
                          ["m%02d" % i for i in range(20)])
         self.assertTrue(all(len(out) <= pigi_oneshot.MAX_STDOUT
                             for out in outs))
-        self.assertNotIn("nextOffset", docs[-1])
+
+    def test_codes_next_offset_validated_even_when_result_is_complete(self):
+        """Every fetched page's nextOffset is revalidated before the walk may
+        stop: a malformed one fails closed even when the page already holds
+        offset+limit+1 matches."""
+        failure = {"contentTrust": "untrusted", "error": "invalid_response"}
+        page = [make_code_row("m%02d" % i, CODE_SENDER,
+                              date=NOW - i * 1000) for i in range(11)]
+        for bad in ("100", -1, True, 5, 2_000_000, 11.0, 0):
+            with self.subTest(nextOffset=bad):
+                self.table["codes"] = lambda params, bad=bad: codes_result(
+                    page, next_offset=bad)
+                code, out = self.invoke_full(["codes"])
+                self.assertEqual((code, self.parse(out)), (5, failure))
+        # The same page with a correct App nextOffset is fine.
+        rows = page + [make_code_row("x%03d" % i, CODE_SENDER2,
+                                     date=NOW - 20_000 - i * 1000)
+                       for i in range(109)]
+        self.table["codes"] = self.codes_server(rows)
+        code, out = self.invoke_full(
+            ["codes", "--from-email", CODE_SENDER])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 10))
+        self.assertEqual(doc["nextOffset"], 10)
+        # A bad nextOffset on a later page the walk actually needs fails too.
+        filler = [make_code_row("f%03d" % i, CODE_SENDER2,
+                                date=NOW - i * 500) for i in range(100)]
+        second = [make_code_row("s%02d" % i, CODE_SENDER,
+                                date=NOW - 50_000 - i * 1000)
+                  for i in range(11)]
+        for bad in ("100", True, 5):
+            with self.subTest(later=bad):
+                def respond(params, bad=bad):
+                    if params["offset"] == 0:
+                        return codes_result(filler, next_offset=100)
+                    return codes_result(second, next_offset=bad)
+                self.table["codes"] = respond
+                code, out = self.invoke_full(
+                    ["codes", "--from-email", CODE_SENDER])
+                self.assertEqual((code, self.parse(out)), (5, failure))
+        # An unfiltered 11-row page with no App nextOffset emits the
+        # filtered-list nextOffset, not the App's.
+        self.table["codes"] = self.codes_server(page)
+        code, out = self.invoke_full(["codes"])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 10))
+        self.assertEqual(doc["nextOffset"], 10)
 
     def test_codes_single_oversize_row_exit_eight(self):
         self.table["codes"] = lambda params: codes_result(
@@ -3321,7 +3387,7 @@ class OneshotTests(unittest.TestCase):
     def test_docs_describe_codes(self):
         doc = DOCS.read_text()
         for needle in ("codes", "--since-minutes", "--from-email",
-                       "--enable-codes", "page_limit_exceeded"):
+                       "--enable-codes", "page_limit_exceeded", "truncated"):
             self.assertIn(needle, doc)
 
     def test_full_module_has_no_write_path(self):

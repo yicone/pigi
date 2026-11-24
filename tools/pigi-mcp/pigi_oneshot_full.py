@@ -323,28 +323,24 @@ def command_codes(args, ctx):
             floor = rows[-1]["date"]
         matched.extend(row for row in rows
                        if not senders or sender_matches(row, senders))
-        if later is None or len(matched) >= needed:
-            break
-        if (type(later) is not int or not rows
+        # Validate every page's nextOffset before any early exit: a bad one
+        # fails the run even when this page already completed the result.
+        if later is not None and (
+                type(later) is not int or not rows
                 or later != app_offset + len(rows) or later > CODES_OFFSET_MAX):
             return pigi_oneshot.EXIT_UPSTREAM, \
                 pigi_oneshot.upstream_failure("invalid_response")
+        if later is None or len(matched) >= needed:
+            break
         app_offset = later
-    rest = matched[args.offset:]
-    n = min(args.limit, len(rest))
-    while True:
-        more = len(rest) > n
-        body = {"codes": [{key: row[key] for key in CODES_FIELDS if key in row}
-                          for row in rest[:n]]}
-        if more:
-            body["nextOffset"] = args.offset + n
-        payload = pigi_oneshot.envelope(CODES_COMMAND, body)
-        # An oversized page becomes a shorter page whose nextOffset resumes
-        # exactly after it; only a single row that cannot fit alone is cut
-        # (flagged truncated, exit 8) by emit_full.
-        if n <= 1 or len(pigi_oneshot.serialize(payload)) <= pigi_oneshot.MAX_STDOUT:
-            return pigi_oneshot.EXIT_OK, payload
-        n -= 1
+    page = matched[args.offset:args.offset + args.limit]
+    body = {"codes": [{key: row[key] for key in CODES_FIELDS if key in row}
+                      for row in page]}
+    if len(matched) > args.offset + args.limit:
+        body["nextOffset"] = args.offset + len(page)
+    # Oversize output is not shortened here: emit_full applies the standard
+    # truncation (truncated:true, no codes, exit 8), never a complete success.
+    return pigi_oneshot.EXIT_OK, pigi_oneshot.envelope(CODES_COMMAND, body)
 
 
 def command_accounts(args, ctx):

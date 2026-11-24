@@ -219,15 +219,19 @@ field, a non-string `code`/`messageID`, a `messageID` that fails the
 increases across rows or pages, a `messageID` repeated anywhere in the walk,
 or an App `nextOffset` that is not an integer equal to `offset+len(page)` —
 including one on an empty page or above 1,000,000 — fails closed with
-`invalid_response` (exit 5). An App whose `capabilities` do not advertise
+`invalid_response` (exit 5). Every fetched page's `nextOffset` is checked
+even when the filtered result is already complete: it must be a real
+integer (booleans, strings and floats are rejected), equal to
+`offset+len(rows)` on that page, never present on an empty page, and at
+most 1,000,000. An App whose `capabilities` do not advertise
 `codes` (and `filters`, because `since` is always sent) fails with
 `unsupported_server` (exit 5) rather than silently widening the read.
 
-When an emitted page would exceed the 65,536-byte cap it is shortened, not
-shrunk: `nextOffset` resumes exactly after the rows that fit, so following it
-covers every row without duplicates or gaps. A single row that cannot fit
-alone goes through the normal truncation path — exit 8 with
-`"truncated":true` and no `codes` key.
+Output over 65,536 bytes is never delivered as a shortened page: the
+standard truncation rule applies — exit 8 with `"truncated":true`,
+`"truncationNotice"`, `"originalBytes"` (the uncut size), and neither a
+`codes` key nor `nextOffset`. The result is incomplete, never a success:
+retry with a smaller `--limit`.
 
 `codes` takes no other options: `--history`, `--cursor`, `--since-days`,
 `--query`, `--account` and any unknown option exit 2 with zero upstream
@@ -308,7 +312,7 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | 5 | upstream/transport/MCP error; also `cursor_stale` (a paged read whose anchor moved out of reach), `page_item_too_large` (a paged item that cannot be delivered even with all text fields cut — the walk cannot continue past it, by design nothing is skipped) — restart with `--history` — and `page_limit_exceeded` (a `codes` read that could not decide within 5 App fetches — never a partial success) | `{"contentTrust":"untrusted","error":<fixed code>}` |
 | 6 | config or environment failure — missing/unsafe config, missing pinned interpreter, or pinned interpreter fails to execute (exec status 126/127, normalized by the launcher) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
 | 7 | internal error — also an interpreter crash/signal or any unexpected child status, normalized by the launcher | `{"contentTrust":"untrusted","error":"internal_error"}` |
-| 8 | success but output truncated; data incomplete — do not treat as complete. On a paged page it means one item's text fields were cut (`truncatedFields`): message identity delivered, nothing skipped — use `get <messageID>` for the full text | truncated envelope with `"truncated":true` |
+| 8 | success but output truncated; data incomplete — do not treat as complete. On a paged page it means one item's text fields were cut (`truncatedFields`): message identity delivered, nothing skipped — use `get <messageID>` for the full text. On `codes` it means the whole result did not fit — no `codes`/`nextOffset`; retry with a smaller `--limit` | truncated envelope with `"truncated":true` |
 | 9 | untrusted entry — not launched by `pigi_oneshot.sh` | `{"contentTrust":"untrusted","error":"untrusted_entry"}` |
 
 `get-batch` maps per-entry outcomes to the worst exit code by precedence

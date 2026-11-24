@@ -90,7 +90,7 @@ public struct AccountConfiguration {
     }
 
     func removeCredentials(for email: String, credentials: CredentialStore) throws {
-        for key in try Self.credentialKeys(email, store: open()) { try credentials.save(key, "") }
+        for key in try Self.credentialKeys(email, store: open()) { try credentials.remove(key) }
     }
 
     func addGmail(_ email: String, refreshToken: String, credentials: CredentialStore) throws {

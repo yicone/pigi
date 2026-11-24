@@ -156,12 +156,24 @@ extension LocalEngine {
         // Fail before deleting the mailbox if its plaintext translation cache cannot be cleared.
         // Purge also invalidates outstanding request tickets, preventing late writes.
         try await purgeTranslationData(accountID: email, privacy: privacy)
-        let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
-        proton?.deactivate()
-        _ = credentials.write(ProtonSession.key(email), "")
         let s = try db()
-        let gmailKeys = try account(email)?["kind"]?.text == "gmail" ? AccountConfiguration.credentialKeys(email, store: s) : []
-        try s.transaction {
+        try s.transaction(immediate: true) {
+            let kind = try account(email)?["kind"]?.text
+            let keys: [String]
+            switch kind {
+            case "gmail": keys = try AccountConfiguration.credentialKeys(email, store: s)
+            case "imap": keys = ["imap-\(email)"]
+            case "proton":
+                // Stop in-flight Proton work before removing its credential.
+                (protonSessions[email] as? ProtonSession)?.deactivate()
+                keys = [ProtonSession.key(email)]
+            default: keys = []
+            }
+            // Keep all account/alias/cache rows until every credential deletion
+            // succeeds. Partial cleanup is safe to retry with the same persisted
+            // identities after either a failure or a process restart. Never
+            // restore a secret already removed at the user's request.
+            for key in keys { try credentials.remove(key) }
             try s.run("DELETE FROM gmail_credential_aliases WHERE account=?", [.text(email)])
             try s.run("DELETE FROM gmail_legacy_state WHERE account=?", [.text(email)])
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
@@ -174,8 +186,8 @@ extension LocalEngine {
             try s.run("DELETE FROM agent_permissions WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
-        _ = credentials.write("imap-\(email)", "")
-        for key in gmailKeys { _ = credentials.write(key, "") }
+        let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
+        proton?.deactivate()
         sessions[email] = nil
         due[email] = nil
         announce()

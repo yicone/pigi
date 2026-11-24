@@ -153,6 +153,158 @@ final class AccountConfigurationTests: XCTestCase {
         XCTAssertTrue(secrets.isEmpty)
     }
 
+    func testRejectedAliasDeletionThrowsAndPreservesRetryRecords() async throws {
+        let fixture = try makeDeletionFixture()
+        fixture.rejected.insert("gmail-refresh-Legacy@Example.test")
+        let engine = LocalEngine(credentials: fixture.credentials)
+        try await engine.installConfigurationFixture(path: path)
+        let privacy = await deletionPrivacy()
+        do {
+            try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+            XCTFail("Credential rejection must be returned to the caller")
+        } catch {
+            XCTAssertEqual(error as? CredentialPersistenceError, .deleteFailed)
+            XCTAssertFalse(error.localizedDescription.contains("Legacy@"))
+            XCTAssertFalse(error.localizedDescription.contains("synthetic"))
+        }
+        try assertDeletionRetryRecordsRetained()
+        XCTAssertEqual(fixture.secrets.count, 3)
+    }
+
+    func testDeletionRetryCompletesAfterPartialCredentialCleanupRecovers() async throws {
+        let fixture = try makeDeletionFixture()
+        fixture.rejected.insert("gmail-refresh-LEGACY@example.test")
+        let engine = LocalEngine(credentials: fixture.credentials)
+        try await engine.installConfigurationFixture(path: path)
+        let privacy = await deletionPrivacy()
+        do {
+            try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+            XCTFail("Expected partial credential cleanup failure")
+        } catch { XCTAssertEqual(error as? CredentialPersistenceError, .deleteFailed) }
+        XCTAssertNil(fixture.secrets["gmail-refresh-Legacy@Example.test"], "Never restore a secret already removed by the user")
+        XCTAssertEqual(fixture.secrets.count, 2)
+        try assertDeletionRetryRecordsRetained()
+        fixture.rejected.removeAll()
+        try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+        try assertDeletionCompleted(fixture)
+        XCTAssertGreaterThan(fixture.attempts.filter { $0 == "gmail-refresh-Legacy@Example.test" }.count, 1,
+                             "Retry must safely revisit aliases whose secrets were already removed")
+    }
+
+    func testFailedCredentialDeletionCanBeRetriedAfterEngineAndConfigurationRestart() async throws {
+        let fixture = try makeDeletionFixture()
+        fixture.rejected.insert("gmail-refresh-Legacy@Example.test")
+        let first = LocalEngine(credentials: fixture.credentials)
+        try await first.installConfigurationFixture(path: path)
+        let privacy = await deletionPrivacy()
+        do {
+            try await first.deleteAccount("legacy@example.test", privacy: privacy)
+            XCTFail("Expected deletion failure")
+        } catch { XCTAssertEqual(error as? CredentialPersistenceError, .deleteFailed) }
+        // Reopen the on-disk configuration and a new engine connection. No
+        // in-memory pending-deletion list is needed to recover the alias keys.
+        let restarted = AccountConfiguration(path: path)
+        try restarted.migrateLegacy(defaults: defaults)
+        try assertDeletionRetryRecordsRetained()
+        XCTAssertEqual(try restarted.refreshToken(for: "legacy@example.test", credentials: fixture.credentials), "synthetic-original")
+        fixture.rejected.removeAll()
+        let second = LocalEngine(credentials: fixture.credentials)
+        try await second.installConfigurationFixture(path: path)
+        try await second.deleteAccount("legacy@example.test", privacy: privacy)
+        try assertDeletionCompleted(fixture)
+        let finalRestart = AccountConfiguration(path: path)
+        try finalRestart.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try finalRestart.emails(kind: "gmail"), [])
+    }
+
+    func testDatabaseDeleteFailureKeepsAliasRecordsForRetryWithoutRestoringSecrets() async throws {
+        let fixture = try makeDeletionFixture()
+        let db = try Store(path: path)
+        try db.run("CREATE TRIGGER reject_delete BEFORE DELETE ON accounts BEGIN SELECT RAISE(ABORT,'synthetic database failure'); END")
+        let engine = LocalEngine(credentials: fixture.credentials)
+        try await engine.installConfigurationFixture(path: path)
+        let privacy = await deletionPrivacy()
+        do {
+            try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+            XCTFail("Expected database deletion failure")
+        } catch { XCTAssertTrue(error is SQLError) }
+        XCTAssertTrue(fixture.secrets.isEmpty)
+        try assertDeletionRetryRecordsRetained()
+        try db.run("DROP TRIGGER reject_delete")
+        try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+        try assertDeletionCompleted(fixture)
+    }
+
+    func testOtherMailboxKindsAlsoReportCredentialDeletionFailureBeforeRemovingRows() async throws {
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        let privacy = await deletionPrivacy()
+        for kind in ["imap", "proton"] {
+            let email = "\(kind)@example.test"
+            let key = kind == "imap" ? "imap-\(email)" : ProtonSession.key(email)
+            try db.run("INSERT INTO accounts(email,kind) VALUES(?,?)", [.text(email), .text(kind)])
+            var reject = true
+            var secret: String? = "synthetic"
+            var attempted: [String] = []
+            let credentials = CredentialStore(read: { _ in secret }, write: { actual, value in
+                attempted.append(actual)
+                guard !reject else { return false }
+                secret = value.isEmpty ? nil : value
+                return true
+            })
+            let engine = LocalEngine(credentials: credentials)
+            try await engine.installConfigurationFixture(path: path)
+            do {
+                try await engine.deleteAccount(email, privacy: privacy)
+                XCTFail("Expected rejected \(kind) credential cleanup")
+            } catch { XCTAssertEqual(error as? CredentialPersistenceError, .deleteFailed) }
+            XCTAssertEqual(try config.emails(kind: kind), [email])
+            XCTAssertNotNil(secret)
+            reject = false
+            try await engine.deleteAccount(email, privacy: privacy)
+            XCTAssertEqual(try config.emails(kind: kind), [])
+            XCTAssertNil(secret)
+            XCTAssertEqual(attempted, [key, key], "Do not clear credentials belonging to a different account kind")
+        }
+    }
+
+    private func makeDeletionFixture() throws -> DeletionCredentials {
+        defaults.set(["Legacy@Example.test", "LEGACY@example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind,history_id,page_token) VALUES('legacy@example.test','gmail','retained-history','retained-page')")
+        try db.run("INSERT INTO messages(account,id,html) VALUES('legacy@example.test','cached',?)", [.blob(Data("retained-body".utf8))])
+        let rowid = try XCTUnwrap(db.query("SELECT rowid FROM messages").first?["rowid"]?.int)
+        try db.run("INSERT INTO fts(rowid,subject) VALUES(?,'retained')", [.int(rowid)])
+        try config.migrateLegacy(defaults: defaults)
+        return DeletionCredentials()
+    }
+
+    private func deletionPrivacy() async -> TranslationPrivacySettings {
+        let privacySuite = suite!
+        return await MainActor.run { TranslationPrivacySettings(defaults: UserDefaults(suiteName: privacySuite)!) }
+    }
+
+    private func assertDeletionRetryRecordsRetained() throws {
+        let db = try Store(path: path)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
+        XCTAssertEqual(try db.query("SELECT * FROM gmail_credential_aliases").count, 3)
+        XCTAssertEqual(try db.query("SELECT * FROM gmail_legacy_state").count, 1)
+        XCTAssertEqual(try db.query("SELECT html FROM messages").first?["html"]?.blob, Data("retained-body".utf8))
+        XCTAssertEqual(try db.query("SELECT * FROM fts").count, 1)
+        XCTAssertEqual(try db.query("SELECT history_id FROM accounts").first?["history_id"]?.text, "retained-history")
+        XCTAssertEqual(try db.query("SELECT page_token FROM accounts").first?["page_token"]?.text, "retained-page")
+    }
+
+    private func assertDeletionCompleted(_ fixture: DeletionCredentials) throws {
+        let db = try Store(path: path)
+        XCTAssertEqual(try config.emails(kind: "gmail"), [])
+        for table in ["gmail_credential_aliases", "gmail_legacy_state", "messages", "fts"] {
+            XCTAssertTrue(try db.query("SELECT * FROM \(table)").isEmpty)
+        }
+        XCTAssertTrue(fixture.secrets.isEmpty)
+    }
+
     func testDuplicateCaseCachesMergeWithoutLosingRowsFTSOrCursorMetadata() throws {
         defaults.set(["Legacy@Example.test", "LEGACY@example.test"], forKey: "gmailAccounts")
         _ = try config.emails(kind: "gmail")
@@ -264,5 +416,21 @@ private extension LocalEngine {
     func installConfigurationFixture(path: String) throws {
         store = try Store(path: path)
         translationCache = SQLiteTranslationCache(path: ":memory:")
+    }
+}
+
+private final class DeletionCredentials {
+    var secrets = ["gmail-refresh-Legacy@Example.test": "synthetic-original",
+                   "gmail-refresh-LEGACY@example.test": "synthetic-second",
+                   "gmail-refresh-legacy@example.test": "synthetic-canonical"]
+    var rejected: Set<String> = []
+    var attempts: [String] = []
+    var credentials: CredentialStore {
+        CredentialStore(read: { self.secrets[$0] }, write: { key, value in
+            self.attempts.append(key)
+            if value.isEmpty && self.rejected.contains(key) { return false }
+            self.secrets[key] = value.isEmpty ? nil : value
+            return true
+        })
     }
 }

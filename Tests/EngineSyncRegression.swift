@@ -161,7 +161,7 @@ actor GmailFixture {
         // Gmail re-authorization writes only for the mailbox that is already signed in.
         let signedIn = "signed-in@example.test"
         try GmailStore.add(signedIn, refreshToken: "old-refresh")
-        defer { GmailStore.remove(signedIn) }
+        defer { try! GmailStore.remove(signedIn) }
         let gmailKey = GmailStore.keychainKey(signedIn)
         let writesBeforeReauth = Keychain.writes.withLock { $0 }
         precondition(GmailStore.applyReauthorization(authorizedEmail: "other@example.test", refreshToken: "intruder", for: signedIn) == .differentMailbox)

@@ -116,7 +116,7 @@ final class CredentialPersistenceTests: XCTestCase {
     }
 
     func testCredentialErrorsAreExplicitAndRedacted() {
-        for error in [CredentialPersistenceError.writeFailed, .recoveryFailed] {
+        for error in [CredentialPersistenceError.writeFailed, .recoveryFailed, .deleteFailed] {
             XCTAssertTrue(error.localizedDescription.contains("失败"))
             XCTAssertTrue(error.localizedDescription.contains("钥匙串"))
             XCTAssertFalse(error.localizedDescription.contains(email))

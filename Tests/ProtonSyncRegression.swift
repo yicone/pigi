@@ -652,6 +652,12 @@ extension LocalEngine {
         } catch CredentialPersistenceError.recoveryFailed {}
         precondition(state.displayedCredentialError == CredentialPersistenceError.recoveryFailed.localizedDescription)
         precondition(state.sidebarError == state.displayedCredentialError)
+        do {
+            try await state.reportCredentialFailure { throw CredentialPersistenceError.deleteFailed }
+            fatalError("credential deletion failure was not rethrown to the settings sheet")
+        } catch CredentialPersistenceError.deleteFailed {}
+        precondition(state.displayedCredentialError == CredentialPersistenceError.deleteFailed.localizedDescription)
+        precondition(state.sidebarError == state.displayedCredentialError)
         try await state.reportCredentialFailure {}
         precondition(state.displayedCredentialError == nil && state.sidebarError == nil, "successful recovery kept a stale error")
         let account = ArchiveAccount(email: "credential-fixture@example.test", backfillDone: 1, total: 0,

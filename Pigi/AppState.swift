@@ -332,7 +332,8 @@ final class AppState {
         // credential-store texts still identify them.
         let keychainMessages = [CredentialPersistenceError.writeFailed.localizedDescription,
                                 CredentialPersistenceError.recoveryFailed.localizedDescription,
-                                CredentialPersistenceError.readFailed.localizedDescription]
+                                CredentialPersistenceError.readFailed.localizedDescription,
+                                CredentialPersistenceError.deleteFailed.localizedDescription]
         serverCredentialError = accounts.first {
             $0.lastErrorKind == AccountErrorKind.keychain.rawValue
                 || ($0.lastErrorKind == nil && keychainMessages.contains($0.lastError ?? ""))
@@ -367,8 +368,8 @@ final class AppState {
     /// Deletes a mailbox from the engine and from this Mac.
     func removeAccount(_ id: String) async throws {
         guard let account = allAccounts.first(where: { $0.id == id }) else { return }
+        try await reportCredentialFailure { try await ArchiveClient().deleteAccount(id) }
         inlineImagesByMailID = inlineImagesByMailID.filter { !$0.key.hasPrefix(id + "#") }
-        try await ArchiveClient().deleteAccount(id)
         if account.kind == .gmail {
             removeGmailAccount(id)
         } else {
@@ -460,7 +461,7 @@ final class AppState {
     }
 
     func removeGmailAccount(_ email: String) {
-        GmailStore.remove(email)
+        // The engine has already checked credential cleanup before committing deletion.
         gmailClients[email] = nil
         gmailAccounts.removeAll { $0.id == email }
         avatarURLs[email] = nil

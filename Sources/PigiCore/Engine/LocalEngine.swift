@@ -107,7 +107,8 @@ public actor LocalEngine {
     static func legacyErrorKind(_ message: String) -> AccountErrorKind {
         let keychain = [CredentialPersistenceError.writeFailed.localizedDescription,
                         CredentialPersistenceError.recoveryFailed.localizedDescription,
-                        CredentialPersistenceError.readFailed.localizedDescription]
+                        CredentialPersistenceError.readFailed.localizedDescription,
+                        CredentialPersistenceError.deleteFailed.localizedDescription]
         if keychain.contains(message) { return .keychain }
         if ["无法连接 Proton", "请求超时", "请求过于频繁", "代理需要认证", "将重试"].contains(where: message.contains) { return .network }
         if ["会话失效", "账号、密码或验证码", "请重新登录"].contains(where: message.contains) { return .auth }

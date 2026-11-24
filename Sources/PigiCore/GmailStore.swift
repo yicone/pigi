@@ -41,8 +41,8 @@ public enum GmailStore {
         return replaceRefreshToken(refreshToken, for: email) ? .replaced : .keychainFailed
     }
 
-    public static func remove(_ email: String) {
-        try? AccountConfiguration.shared.removeCredentials(for: email, credentials: CredentialStore())
+    public static func remove(_ email: String) throws {
+        try AccountConfiguration.shared.removeCredentials(for: email, credentials: CredentialStore())
         // The engine deletes the authoritative account row and cached mail.
     }
 }

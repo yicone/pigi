@@ -66,6 +66,8 @@ public protocol TranslationCache: Sendable {
     func get(_ key: TranslationCacheKey) async throws -> CachedTranslation?
     func begin(_ key: TranslationCacheKey) async throws -> SQLiteTranslationCache.Ticket
     func put(_ value: CachedTranslation, for ticket: SQLiteTranslationCache.Ticket, validated: Bool) async throws
+    /// Commit every entry or none. A later failure or cancellation must not leave earlier entries from this call.
+    func putAll(_ entries: [(value: CachedTranslation, ticket: SQLiteTranslationCache.Ticket)], validated: Bool) async throws
     func clear() async throws
     func purge(accountID: String) async throws
 }

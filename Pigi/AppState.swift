@@ -49,8 +49,15 @@ final class AppState {
         (UserDefaults.standard.dictionary(forKey: "gmailAvatars") as? [String: String] ?? [:])
             .compactMapValues { URL(string: $0) }
 
-    var scope: Scope = .all
-    var readFilter: ReadFilter = .all { didSet { stayVisible = [] } }
+    var scope: Scope = .all {
+        didSet { if oldValue != scope { cancelListTranslation() } }
+    }
+    var readFilter: ReadFilter = .all {
+        didSet {
+            stayVisible = []
+            if oldValue != readFilter { cancelListTranslation() }
+        }
+    }
     /// Mails read while the list shows only unread stay put until the list context changes.
     private(set) var stayVisible: Set<String> = []
     var selectedMailID: String?
@@ -69,7 +76,12 @@ final class AppState {
     }
 
     var isSearching = false
-    var searchText = "" { didSet { stayVisible = [] } }
+    var searchText = "" {
+        didSet {
+            stayVisible = []
+            if oldValue != searchText { cancelListTranslation() }
+        }
+    }
     /// Ids returned by the server's full-text search for the current query.
     private var searchHits: Set<String> = []
     private var searchTask: Task<Void, Never>?
@@ -726,6 +738,12 @@ final class AppState {
     var listTranslationBusy = false
     /// Follows the translation master switch. Off hides the list action.
     var listTranslationAvailable = false
+    #if PIGI_REGRESSION
+    /// Installed before launch by the synthetic window harness. Nil uses the real keychain and translator.
+    var listTranslationSession: ListTranslationSession?
+    var listViewportObserver: (([ListRowFrame], CGFloat) -> Void)?
+    var listScrollTarget: String?
+    #endif
     @ObservationIgnored private var listTranslationTask: Task<Void, Never>?
     @ObservationIgnored private var listTranslationGeneration = UUID()
     @ObservationIgnored private var listTranslationContinuation: CheckedContinuation<Bool, Never>?
@@ -762,7 +780,12 @@ final class AppState {
                 if self.listTranslationGeneration == generation { self.listTranslationBusy = false }
             }
             let configuration = TranslationConfigStore().load()
-            let hasKey = ((try? KeychainKeyStore().apiKey()) ?? nil)?.isEmpty == false
+            #if PIGI_REGRESSION
+            let session = self.listTranslationSession ?? ListTranslationSession.production()
+            #else
+            let session = ListTranslationSession.production()
+            #endif
+            let hasKey = session.credentialConfigured()
             let policy = StoredTranslationPolicy(
                 accounts: self.allAccounts.map { ($0.id, $0.kind == .proton) },
                 globalEnabled: configuration.enabled,
@@ -772,8 +795,8 @@ final class AppState {
                 rows: snapshot,
                 policy: policy,
                 configuration: configuration,
-                cache: SQLiteTranslationCache.shared,
-                translator: OpenAICompatibleTranslator(config: configuration, keyStore: KeychainKeyStore()),
+                cache: session.cache,
+                translator: session.makeTranslator(configuration),
                 confirm: { sending, skipped in
                     await self.askListTranslation(sending: sending, skipped: skipped)
                 })

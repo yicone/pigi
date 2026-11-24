@@ -53,6 +53,11 @@ struct MailListView: View {
                 .onChange(of: state.selectedMailID) {
                     if let id = state.selectedMailID { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id) } }
                 }
+                #if PIGI_REGRESSION
+                .onChange(of: state.listScrollTarget) {
+                    if let id = state.listScrollTarget { proxy.scrollTo(id, anchor: .center) }
+                }
+                #endif
                 }
             }
         }
@@ -60,8 +65,18 @@ struct MailListView: View {
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             state.refreshListTranslationAvailability()
         }
-        .onPreferenceChange(ListRowFramesKey.self) { rowFrames = $0 }
-        .onPreferenceChange(ListViewportHeightKey.self) { viewportHeight = $0 }
+        .onPreferenceChange(ListRowFramesKey.self) { frames in
+            rowFrames = frames
+            #if PIGI_REGRESSION
+            state.listViewportObserver?(frames, viewportHeight)
+            #endif
+        }
+        .onPreferenceChange(ListViewportHeightKey.self) { height in
+            viewportHeight = height
+            #if PIGI_REGRESSION
+            state.listViewportObserver?(rowFrames, height)
+            #endif
+        }
         .background {
             Group {
                 Button("") { state.moveSelection(1) }.shortcut(.nextMail)

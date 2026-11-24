@@ -207,6 +207,61 @@ final class ListBatchTranslationTests: XCTestCase {
         XCTAssertEqual(outcome.translations[sample.id]?.snippet, "世界")
     }
 
+    func testBatchWriteFailureAndCancellationLeaveNoPartialCache() async throws {
+        let kept = row("kept", subject: "Keep me", snippet: "Existing")
+        let first = row("first", subject: "Hello first", snippet: "World first")
+        let second = row("second", subject: "Hello second", snippet: "World second")
+        let config = configuration()
+        let keptValue = CachedTranslation(subject: "已有主题", body: "已有摘要")
+        let oldFirst = CachedTranslation(subject: "旧主题", body: "旧摘要")
+        for fault in [SQLiteTranslationCache.BatchFault.errorAfterInserts(1), .cancelAfterInserts(1)] {
+            let cache = SQLiteTranslationCache(path: ":memory:")
+            let keptKey = ListTranslationCache.key(row: kept, configuration: config)
+            let firstKey = ListTranslationCache.key(row: first, configuration: config)
+            try await cache.put(keptValue, for: try await cache.begin(keptKey), validated: true)
+            try await cache.put(oldFirst, for: try await cache.begin(firstKey), validated: true)
+            await cache.testingInjectBatchFault(fault)
+            let outcome = await ListBatchTranslator().run(
+                rows: [first, second], policy: FixedPolicy(decisions: [first.accountID: .allowed]), configuration: config,
+                cache: cache, translator: RecordingTranslator(), confirm: { _, _ in true })
+            let failed = if case .errorAfterInserts = fault { true } else { false }
+            XCTAssertEqual(outcome.status, failed ? .failed : .cancelled)
+            XCTAssertEqual(outcome.requestCount, 1)
+            XCTAssertTrue(outcome.translations.isEmpty)
+            let keptHit = try await cache.get(keptKey)
+            let firstHit = try await cache.get(firstKey)
+            let secondHit = try await cache.get(ListTranslationCache.key(row: second, configuration: config))
+            XCTAssertEqual(keptHit, keptValue)
+            XCTAssertEqual(firstHit, oldFirst)
+            XCTAssertNil(secondHit)
+        }
+    }
+
+    func testPutAllRejectionWritesNothingAndSkipsRowPuts() async throws {
+        let rows = [row("first", subject: "Hello first", snippet: "World first"), row("second", subject: "Hello second", snippet: "World second")]
+        let config = configuration()
+        for cancel in [false, true] {
+            let cache = RejectingBatchCache(cancel: cancel)
+            let prior = CachedTranslation(subject: "原缓存", body: "不能丢")
+            let priorKey = ListTranslationCache.key(row: rows[0], configuration: config)
+            try await cache.seed(prior, for: priorKey)
+            let outcome = await ListBatchTranslator().run(
+                rows: rows, policy: FixedPolicy(decisions: [rows[0].accountID: .allowed]), configuration: config,
+                cache: cache, translator: RecordingTranslator(), confirm: { _, _ in true })
+            XCTAssertEqual(outcome.status, cancel ? .cancelled : .failed)
+            XCTAssertEqual(outcome.requestCount, 1)
+            XCTAssertTrue(outcome.translations.isEmpty)
+            let rowPuts = await cache.rowPuts
+            let batchPuts = await cache.batchPuts
+            XCTAssertEqual(rowPuts, 0)
+            XCTAssertEqual(batchPuts, 1)
+            let stored = try await cache.get(priorKey)
+            XCTAssertEqual(stored, prior)
+            let second = try await cache.get(ListTranslationCache.key(row: rows[1], configuration: config))
+            XCTAssertNil(second)
+        }
+    }
+
     func testDefaultOffAndMissingConsentSkipWithoutGranting() async throws {
         let suite = "list-translation-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -271,6 +326,32 @@ private final class RecordingTranslator: SegmentTranslator, @unchecked Sendable 
         if let replacement { return replacement }
         return segments.map { TranslationSegment(id: $0.id, text: "译:" + $0.text) }
     }
+}
+
+private actor RejectingBatchCache: TranslationCache {
+    let inner = SQLiteTranslationCache(path: ":memory:")
+    let cancel: Bool
+    var rowPuts = 0
+    var batchPuts = 0
+    init(cancel: Bool) { self.cancel = cancel }
+
+    func seed(_ value: CachedTranslation, for key: TranslationCacheKey) async throws {
+        try await inner.put(value, for: try await inner.begin(key), validated: true)
+    }
+
+    func get(_ key: TranslationCacheKey) async throws -> CachedTranslation? { try await inner.get(key) }
+    func begin(_ key: TranslationCacheKey) async throws -> SQLiteTranslationCache.Ticket { try await inner.begin(key) }
+    func put(_ value: CachedTranslation, for ticket: SQLiteTranslationCache.Ticket, validated: Bool) async throws {
+        rowPuts += 1
+        throw TranslationError.network("row put is not a batch commit")
+    }
+    func putAll(_ entries: [(value: CachedTranslation, ticket: SQLiteTranslationCache.Ticket)], validated: Bool) async throws {
+        batchPuts += 1
+        if cancel { throw CancellationError() }
+        throw TranslationError.network("synthetic second cache write failure")
+    }
+    func clear() async throws { try await inner.clear() }
+    func purge(accountID: String) async throws { try await inner.purge(accountID: accountID) }
 }
 
 private final class CancelAfterStartTranslator: SegmentTranslator, @unchecked Sendable {

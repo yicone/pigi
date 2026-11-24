@@ -122,6 +122,28 @@ public enum ListTranslationCache {
     }
 }
 
+/// Production uses the keychain and shared cache. A regression process can install a stand-in first.
+public struct ListTranslationSession: Sendable {
+    public var credentialConfigured: @Sendable () -> Bool
+    public var makeTranslator: @Sendable (TranslationConfig) -> any SegmentTranslator
+    public var cache: any TranslationCache
+
+    public init(credentialConfigured: @escaping @Sendable () -> Bool,
+                makeTranslator: @escaping @Sendable (TranslationConfig) -> any SegmentTranslator,
+                cache: any TranslationCache) {
+        self.credentialConfigured = credentialConfigured
+        self.makeTranslator = makeTranslator
+        self.cache = cache
+    }
+
+    public static func production() -> ListTranslationSession {
+        ListTranslationSession(
+            credentialConfigured: { ((try? KeychainKeyStore().apiKey()) ?? nil)?.isEmpty == false },
+            makeTranslator: { OpenAICompatibleTranslator(config: $0, keyStore: KeychainKeyStore()) },
+            cache: SQLiteTranslationCache.shared)
+    }
+}
+
 public enum ListTranslationDisplay {
     /// Stale cache (the subject or snippet changed) stays off the row. The stored mail is unchanged.
     public static func text(subject: String, snippet: String, translation: ListRowTranslation?) -> (subject: String, snippet: String, translated: Bool) {
@@ -247,12 +269,15 @@ public struct ListBatchTranslator {
             fresh[item.row.id] = ListRowTranslation(subject: subject, snippet: snippet, sourceHash: item.key.bodyHash)
         }
 
+        let entries: [(value: CachedTranslation, ticket: SQLiteTranslationCache.Ticket)]
         do {
-            for item in misses {
-                try Task.checkCancellation()
+            entries = try misses.map { item in
                 guard let value = fresh[item.row.id], let ticket = tickets[item.row.id] else { throw TranslationError.misaligned }
-                try await cache.put(CachedTranslation(subject: value.subject, body: value.snippet), for: ticket, validated: true)
+                return (CachedTranslation(subject: value.subject, body: value.snippet), ticket)
             }
+            try Task.checkCancellation()
+            // One commit. A later row failing or a cancellation rolls the whole batch back.
+            try await cache.putAll(entries, validated: true)
         } catch is CancellationError {
             return ListBatchOutcome(status: .cancelled, skipped: skipped, requestCount: 1)
         } catch let error as TranslationError {

@@ -364,6 +364,17 @@ claimed by these tests.
 
 ## ACM-960: account-scoped Linux → mini stdio path
 
+**Frozen (ACM-1018, 2026-11-24).** This remote MCP path is historical and is
+not the current recommended entry. Bots read through `pigi_oneshot.sh` executed
+locally on `tr-mini-m4`; see [pigi-oneshot](pigi-oneshot.md). Local MCP is reserved
+for supervised interactive use. The remote wrapper receives no new features;
+its code and tests (`remote_pigi_mcp.py`, `pigi_forced_command.sh` and their
+tests) are retained. Do not provision, issue, or install SSH keys for any bot,
+or repoint an existing key's `command=` to `pigi_forced_command`.
+The provisioning and invocation instructions below are paused until separate
+user approval by issue number unfreezes the path; see the
+[frozen rollout plan](billing-ssh-transition.md).
+
 The repository provides `tools/pigi-mcp/remote_pigi_mcp.py` (Python 3.10+, stdlib),
 which replaces itself with OpenSSH and carries MCP stdio over the encrypted SSH
 channel. The remote command starts `pigi_mcp.py --account <exact account>` on the
@@ -405,6 +416,9 @@ process isolation must be approved and provided by the platform owner. Merely
 adding the launcher to a Bot's tools does not establish that isolation.
 
 ### Billing invocation after separately approved provisioning
+
+**PAUSED:** the following prerequisites and Linux invocation are retained as
+historical reference, not instructions to provision or hand off remote access.
 
 Prerequisites (not performed by this change):
 

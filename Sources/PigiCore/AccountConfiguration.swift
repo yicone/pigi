@@ -39,17 +39,17 @@ public struct AccountConfiguration {
         let store = try open()
         try store.run("BEGIN IMMEDIATE")
         do {
-            if try store.query("SELECT 1 FROM account_config WHERE key='legacy-v1'").isEmpty {
-                for email in defaults.stringArray(forKey: "gmailAccounts") ?? [] {
-                    try Self.insertGmail(email, store: store)
-                }
+            if try store.query("SELECT 1 FROM account_config WHERE key='legacy-v2'").isEmpty {
+                let firstImport = try store.query("SELECT 1 FROM account_config WHERE key='legacy-v1'").isEmpty
+                try GmailAccountMigration.run(store, legacy: defaults.stringArray(forKey: "gmailAccounts") ?? [], importLegacy: firstImport)
                 if let client = defaults.string(forKey: "gmailClientID") {
                     try store.run("INSERT OR IGNORE INTO account_config VALUES('gmailClientID',?)",
                                   [.text(client.trimmingCharacters(in: .whitespacesAndNewlines))])
                 }
                 // imapAccounts was only a display cache: the authoritative rows,
                 // including host/port, already live in this database.
-                try store.run("INSERT INTO account_config VALUES('legacy-v1','1')")
+                try store.run("INSERT OR IGNORE INTO account_config VALUES('legacy-v1','1')")
+                try store.run("INSERT INTO account_config VALUES('legacy-v2','1')")
             }
             try store.run("COMMIT")
         } catch {
@@ -58,12 +58,39 @@ public struct AccountConfiguration {
         }
     }
 
-    private static func insertGmail(_ email: String, store: Store) throws {
-        // Legacy identifiers are also credential lookup keys. Preserve them
-        // verbatim; new registrations are normalized before reaching this helper.
-        guard !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        try store.run("INSERT OR IGNORE INTO accounts(email,added_at,kind) VALUES(?,?,'gmail')",
-                      [.text(email), .int(Int(Date().timeIntervalSince1970))])
+    static func credentialKeys(_ email: String, store: Store) throws -> [String] {
+        let canonical = GmailAccountMigration.identity(email)
+        let ids = try store.query("SELECT identifier FROM gmail_credential_aliases WHERE account=? ORDER BY priority,identifier", [.text(canonical)])
+            .compactMap { $0["identifier"]?.text }
+        var keys: [String] = []
+        for id in ids + [email, canonical] {
+            let key = GmailStore.keychainKey(id)
+            if !keys.contains(key) { keys.append(key) }
+        }
+        return keys
+    }
+
+    func refreshToken(for email: String, credentials: CredentialStore) throws -> String {
+        for key in try Self.credentialKeys(email, store: open()) {
+            do { if let token = try credentials.read(key), !token.isEmpty { return token } }
+            catch { throw CredentialPersistenceError.readFailed }
+        }
+        throw CredentialPersistenceError.readFailed
+    }
+
+    func replaceRefreshToken(_ token: String, for email: String, credentials: CredentialStore) throws {
+        let keys = try Self.credentialKeys(email, store: open())
+        for key in keys {
+            let old: String?
+            do { old = try credentials.read(key) }
+            catch { throw CredentialPersistenceError.readFailed }
+            if let old, !old.isEmpty { try credentials.save(key, token); return }
+        }
+        try credentials.save(keys[0], token)
+    }
+
+    func removeCredentials(for email: String, credentials: CredentialStore) throws {
+        for key in try Self.credentialKeys(email, store: open()) { try credentials.save(key, "") }
     }
 
     func addGmail(_ email: String, refreshToken: String, credentials: CredentialStore) throws {
@@ -72,26 +99,32 @@ public struct AccountConfiguration {
         let store = try open()
         // Hold the write transaction across the credential operation. On SQLite
         // failure restore the previous credential, just as Proton installation does.
+        let keys = try Self.credentialKeys(email, store: store)
         try store.run("BEGIN IMMEDIATE")
+        var selected = keys[0]
         var previous: String?
         var saved = false
         do {
             if let row = try store.query("SELECT kind FROM accounts WHERE email=?", [.text(email)]).first,
                row["kind"]?.text != "gmail" { throw SQLError(message: "这个邮箱已使用其他连接方式") }
-            do { previous = try credentials.read(GmailStore.keychainKey(email)) }
+            do {
+                for key in keys {
+                    if let old = try credentials.read(key), !old.isEmpty { selected = key; previous = old; break }
+                }
+            }
             catch { throw CredentialPersistenceError.readFailed }
-            try credentials.save(GmailStore.keychainKey(email), refreshToken)
+            try credentials.save(selected, refreshToken)
             saved = true
-            try Self.insertGmail(email, store: store)
+            try store.run("INSERT OR IGNORE INTO accounts(email,added_at,kind) VALUES(?,?,'gmail')",
+                          [.text(email), .int(Int(Date().timeIntervalSince1970))])
             try store.run("COMMIT")
         } catch {
             _ = try? store.run("ROLLBACK")
             if saved {
-                do { try credentials.save(GmailStore.keychainKey(email), previous ?? "") }
+                do { try credentials.save(selected, previous ?? "") }
                 catch { throw CredentialPersistenceError.recoveryFailed }
             }
             throw error
         }
     }
 }
-

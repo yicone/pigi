@@ -28,7 +28,7 @@ final class AccountConfigurationTests: XCTestCase {
         let db = try Store(path: path)
         try db.run("INSERT INTO accounts(email,kind,imap_host,imap_port) VALUES('imap@example.test','imap','imap.invalid',993)")
         try config.migrateLegacy(defaults: defaults)
-        XCTAssertEqual(try config.emails(kind: "gmail"), ["Legacy@Example.test"])
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
         XCTAssertEqual(try config.emails(kind: "imap"), ["imap@example.test"])
         XCTAssertEqual(try config.gmailClientID(), "new.apps.googleusercontent.com")
         XCTAssertEqual(try db.query("SELECT imap_host FROM accounts WHERE kind='imap'").first?["imap_host"]?.text, "imap.invalid")
@@ -116,6 +116,139 @@ final class AccountConfigurationTests: XCTestCase {
         XCTAssertEqual(next["gmailClientID"] as? String, "updated.apps.googleusercontent.com")
     }
 
+    func testMixedCaseLegacyAndSyncedRowKeepCacheAndCredentialAliasThenDeleteAndRestart() async throws {
+        defaults.set(["Legacy@Example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind,history_id,page_token,total) VALUES('legacy@example.test','gmail','history-123','page-456',42)")
+        try db.run("INSERT INTO messages(account,id,html) VALUES('legacy@example.test','cached',?)", [.blob(Data("cached-body".utf8))])
+        let rowid = try XCTUnwrap(db.query("SELECT rowid FROM messages").first?["rowid"]?.int)
+        try db.run("INSERT INTO fts(rowid,subject) VALUES(?,'retained')", [.int(rowid)])
+        var secrets = ["gmail-refresh-Legacy@Example.test": "synthetic-original"]
+        let credentials = CredentialStore(read: { secrets[$0] }, write: { key, value in
+            secrets[key] = value.isEmpty ? nil : value; return true
+        })
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
+        XCTAssertEqual(try config.refreshToken(for: "legacy@example.test", credentials: credentials), "synthetic-original")
+        XCTAssertEqual(try db.query("SELECT history_id FROM accounts").first?["history_id"]?.text, "history-123")
+        XCTAssertEqual(try db.query("SELECT page_token FROM accounts").first?["page_token"]?.text, "page-456")
+        XCTAssertEqual(try db.query("SELECT rowid FROM messages").first?["rowid"]?.int, rowid)
+        XCTAssertEqual(try db.query("SELECT subject FROM fts WHERE rowid=?", [.int(rowid)]).first?["subject"]?.text, "retained")
+        try config.replaceRefreshToken("synthetic-rotated", for: "legacy@example.test", credentials: credentials)
+        XCTAssertEqual(secrets["gmail-refresh-Legacy@Example.test"], "synthetic-rotated")
+        XCTAssertNil(secrets["gmail-refresh-legacy@example.test"])
+        let engine = LocalEngine(credentials: credentials)
+        try await engine.installConfigurationFixture(path: path)
+        let privacySuite = suite!
+        let privacy = await MainActor.run { TranslationPrivacySettings(defaults: UserDefaults(suiteName: privacySuite)!) }
+        try await engine.deleteAccount("legacy@example.test", privacy: privacy)
+        let restarted = AccountConfiguration(path: path)
+        try restarted.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try restarted.emails(kind: "gmail"), [])
+        XCTAssertTrue(try db.query("SELECT * FROM messages").isEmpty)
+        XCTAssertTrue(try db.query("SELECT * FROM fts").isEmpty)
+        XCTAssertTrue(try db.query("SELECT * FROM gmail_credential_aliases").isEmpty)
+        XCTAssertTrue(try db.query("SELECT * FROM gmail_legacy_state").isEmpty)
+        XCTAssertTrue(secrets.isEmpty)
+    }
+
+    func testDuplicateCaseCachesMergeWithoutLosingRowsFTSOrCursorMetadata() throws {
+        defaults.set(["Legacy@Example.test", "LEGACY@example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        for (id, history) in [("legacy@example.test", "canonical-history"), ("Legacy@Example.test", "other-history")] {
+            try db.run("INSERT INTO accounts(email,kind,history_id) VALUES(?,'gmail',?)", [.text(id), .text(history)])
+        }
+        try db.run("INSERT INTO messages(account,id,subject) VALUES('legacy@example.test','shared','canonical')")
+        try db.run("INSERT INTO messages(account,id,html) VALUES('Legacy@Example.test','shared',?)", [.blob(Data("body".utf8))])
+        try db.run("INSERT INTO messages(account,id,subject) VALUES('Legacy@Example.test','unique','unique')")
+        for row in try db.query("SELECT rowid FROM messages") {
+            try db.run("INSERT INTO fts(rowid,subject) VALUES(?,'searchable')", [.int(row["rowid"]!.int!)])
+        }
+        try db.run("DELETE FROM fts WHERE rowid=(SELECT rowid FROM messages WHERE account='legacy@example.test' AND id='shared')")
+        try db.run("UPDATE fts SET body='needle' WHERE rowid=(SELECT rowid FROM messages WHERE account='Legacy@Example.test' AND id='shared')")
+        try db.run("INSERT INTO agent_permissions VALUES('legacy@example.test',1,1,1)")
+        try db.run("INSERT INTO agent_permissions VALUES('Legacy@Example.test',0,1,0)")
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
+        XCTAssertEqual(try db.query("SELECT history_id FROM accounts").first?["history_id"]?.text, "canonical-history")
+        XCTAssertEqual(try db.query("SELECT * FROM messages WHERE account='legacy@example.test'").count, 2)
+        XCTAssertEqual(try db.query("SELECT html FROM messages WHERE id='shared'").first?["html"]?.blob, Data("body".utf8))
+        XCTAssertEqual(try db.query("SELECT * FROM fts").count, 2)
+        XCTAssertEqual(try db.query("SELECT * FROM fts WHERE fts MATCH 'needle'").count, 1)
+        let saved = try XCTUnwrap(db.query("SELECT metadata FROM gmail_legacy_state WHERE identifier='Legacy@Example.test'").first?["metadata"]?.blob)
+        XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: saved)["history_id"], "other-history")
+        XCTAssertEqual(try db.query("SELECT read FROM agent_permissions").first?["read"]?.int, 0)
+        let credentials = CredentialStore(read: { $0 == "gmail-refresh-LEGACY@example.test" ? "synthetic-fallback" : nil }, write: { _, _ in XCTFail("Migration must never rewrite secrets"); return false })
+        XCTAssertEqual(try config.refreshToken(for: "legacy@example.test", credentials: credentials), "synthetic-fallback")
+    }
+
+    func testCollisionMergeFailureRollsBackAndCanRetry() throws {
+        defaults.set(["Legacy@Example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind,history_id) VALUES('legacy@example.test','gmail','keep'),('Legacy@Example.test','gmail','also-keep')")
+        try db.run("INSERT INTO messages(account,id) VALUES('Legacy@Example.test','cached')")
+        try db.run("CREATE TRIGGER reject_merge BEFORE INSERT ON account_config WHEN NEW.key='legacy-v2' BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
+        XCTAssertThrowsError(try config.migrateLegacy(defaults: defaults))
+        XCTAssertEqual(try config.emails(kind: "gmail").count, 2)
+        XCTAssertEqual(try db.query("SELECT account FROM messages").first?["account"]?.text, "Legacy@Example.test")
+        XCTAssertTrue(try db.query("SELECT * FROM gmail_credential_aliases").isEmpty)
+        XCTAssertTrue(try db.query("SELECT * FROM gmail_legacy_state").isEmpty)
+        XCTAssertTrue(try db.query("SELECT * FROM account_config WHERE key LIKE 'legacy-%'").isEmpty)
+        try db.run("DROP TRIGGER reject_merge")
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
+        XCTAssertEqual(try db.query("SELECT account FROM messages").first?["account"]?.text, "legacy@example.test")
+    }
+
+    func testVersionOneRepairMergesButDoesNotReimportDeletedMailboxes() throws {
+        defaults.set(["Legacy@Example.test", "deleted@example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO account_config VALUES('legacy-v1','1')")
+        try db.run("INSERT INTO accounts(email,kind) VALUES('legacy@example.test','gmail'),('Legacy@Example.test','gmail')")
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["legacy@example.test"])
+        try db.run("DELETE FROM accounts")
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(try config.emails(kind: "gmail"), [])
+    }
+
+    func testPreferenceOnlyAndDatabaseOnlyVariantsUseOneLogicalMailbox() throws {
+        defaults.set(["Upper@Example.test", "upper@example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind,history_id) VALUES('Other@Example.test','gmail','preserved')")
+        try config.migrateLegacy(defaults: defaults)
+        XCTAssertEqual(Set(try config.emails(kind: "gmail")), ["upper@example.test", "other@example.test"])
+        XCTAssertEqual(try db.query("SELECT history_id FROM accounts WHERE email='other@example.test'").first?["history_id"]?.text, "preserved")
+    }
+
+    func testPopulatedVariantSuppliesCursorToEmptyCanonicalShell() throws {
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind) VALUES('legacy@example.test','gmail')")
+        try db.run("INSERT INTO accounts(email,kind,history_id,page_token,backfill_done) VALUES('Legacy@Example.test','gmail','kept-history','kept-page',1)")
+        try config.migrateLegacy(defaults: defaults)
+        let row = try XCTUnwrap(db.query("SELECT * FROM accounts").first)
+        XCTAssertEqual(row["history_id"]?.text, "kept-history")
+        XCTAssertEqual(row["page_token"]?.text, "kept-page")
+        XCTAssertEqual(row["backfill_done"]?.int, 1)
+    }
+
+    func testCrossKindCollisionFailsWithoutChangingIMAPOrCredentials() throws {
+        defaults.set(["Imap@Example.test"], forKey: "gmailAccounts")
+        _ = try config.emails(kind: "gmail")
+        let db = try Store(path: path)
+        try db.run("INSERT INTO accounts(email,kind,imap_host,imap_port) VALUES('imap@example.test','imap','keep.invalid',993)")
+        XCTAssertThrowsError(try config.migrateLegacy(defaults: defaults))
+        XCTAssertEqual(try config.emails(kind: "imap"), ["imap@example.test"])
+        XCTAssertEqual(try db.query("SELECT imap_host FROM accounts").first?["imap_host"]?.text, "keep.invalid")
+        XCTAssertTrue(try db.query("SELECT * FROM account_config WHERE key LIKE 'legacy-%'").isEmpty)
+    }
+
     func testUnreadableConfigurationThrowsWithoutTouchingCredentials() throws {
         let invalid = AccountConfiguration(path: directory.appendingPathComponent("missing/mail.db").path)
         var reads = 0
@@ -124,5 +257,12 @@ final class AccountConfigurationTests: XCTestCase {
         XCTAssertThrowsError(try invalid.addGmail("a@example.test", refreshToken: "synthetic", credentials: credentials))
         XCTAssertEqual(reads, 0)
         XCTAssertEqual(writes, 0)
+    }
+}
+
+private extension LocalEngine {
+    func installConfigurationFixture(path: String) throws {
+        store = try Store(path: path)
+        translationCache = SQLiteTranslationCache(path: ":memory:")
     }
 }

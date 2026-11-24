@@ -152,15 +152,18 @@ extension LocalEngine {
         trigger(email)
     }
 
-    func deleteAccount(_ email: String) async throws {
+    func deleteAccount(_ email: String, privacy: TranslationPrivacySettings? = nil) async throws {
         // Fail before deleting the mailbox if its plaintext translation cache cannot be cleared.
         // Purge also invalidates outstanding request tickets, preventing late writes.
-        try await purgeTranslationData(accountID: email)
+        try await purgeTranslationData(accountID: email, privacy: privacy)
         let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
         proton?.deactivate()
-        _ = Keychain.set(ProtonSession.key(email), "")
+        _ = credentials.write(ProtonSession.key(email), "")
         let s = try db()
+        let gmailKeys = try account(email)?["kind"]?.text == "gmail" ? AccountConfiguration.credentialKeys(email, store: s) : []
         try s.transaction {
+            try s.run("DELETE FROM gmail_credential_aliases WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM gmail_legacy_state WHERE account=?", [.text(email)])
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
             try s.run("DELETE FROM attachments WHERE account=?", [.text(email)])
             try s.run("DELETE FROM inline_images WHERE account=?", [.text(email)])
@@ -171,7 +174,8 @@ extension LocalEngine {
             try s.run("DELETE FROM agent_permissions WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
-        _ = Keychain.set("imap-\(email)", "")
+        _ = credentials.write("imap-\(email)", "")
+        for key in gmailKeys { _ = credentials.write(key, "") }
         sessions[email] = nil
         due[email] = nil
         announce()

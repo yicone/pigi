@@ -34,8 +34,8 @@ actor GmailClient {
 
     private func accessToken() async throws -> String? {
         if let token, token.expiresAt > Date() { return token.accessToken }
-        guard let refresh = try Keychain.get(GmailStore.keychainKey(email)),
-              let fresh = try? await GmailAuth.refresh(refresh) else { return nil }
+        let refresh = try GmailStore.refreshToken(for: email)
+        guard let fresh = try? await GmailAuth.refresh(refresh) else { return nil }
         token = fresh
         return fresh.accessToken
     }

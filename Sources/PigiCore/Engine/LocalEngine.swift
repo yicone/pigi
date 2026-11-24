@@ -39,6 +39,8 @@ public actor LocalEngine {
     // MARK: database
 
     static let schema = [
+        "CREATE TABLE IF NOT EXISTS gmail_credential_aliases(account TEXT NOT NULL,identifier TEXT NOT NULL,priority INTEGER NOT NULL,PRIMARY KEY(account,identifier))",
+        "CREATE TABLE IF NOT EXISTS gmail_legacy_state(account TEXT NOT NULL,identifier TEXT NOT NULL,metadata BLOB NOT NULL,PRIMARY KEY(account,identifier))",
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER)",
         "CREATE TABLE IF NOT EXISTS agent_permissions(account TEXT PRIMARY KEY, read INTEGER NOT NULL, draft INTEGER NOT NULL, organize INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_audit_key(id INTEGER PRIMARY KEY CHECK(id=1), key BLOB NOT NULL)",

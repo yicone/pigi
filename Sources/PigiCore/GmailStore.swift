@@ -5,6 +5,10 @@ import Foundation
 public enum GmailStore {
     public static func keychainKey(_ email: String) -> String { "gmail-refresh-\(email)" }
 
+    public static func refreshToken(for email: String) throws -> String {
+        try AccountConfiguration.shared.refreshToken(for: email, credentials: CredentialStore())
+    }
+
     public static var emails: [String] {
         (try? AccountConfiguration.shared.emails(kind: "gmail")) ?? []
     }
@@ -17,7 +21,8 @@ public enum GmailStore {
     /// Returns false when the mailbox is unknown so it can never create an account.
     public static func replaceRefreshToken(_ token: String, for email: String) -> Bool {
         guard emails.contains(email) else { return false }
-        return Keychain.set(keychainKey(email), token)
+        do { try AccountConfiguration.shared.replaceRefreshToken(token, for: email, credentials: CredentialStore()); return true }
+        catch { return false }
     }
 
     /// Two addresses name the same mailbox when they match ignoring case and whitespace.
@@ -37,7 +42,7 @@ public enum GmailStore {
     }
 
     public static func remove(_ email: String) {
-        _ = Keychain.set(keychainKey(email), "")
+        try? AccountConfiguration.shared.removeCredentials(for: email, credentials: CredentialStore())
         // The engine deletes the authoritative account row and cached mail.
     }
 }

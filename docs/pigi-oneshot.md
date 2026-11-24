@@ -27,6 +27,15 @@ is unchanged.
 
 ## Invocation
 
+Bots currently invoke `tools/pigi-mcp/pigi_oneshot.sh` by executing locally on
+`tr-mini-m4`. The SSH remote MCP wrapper is frozen (ACM-1018, 2026-11-24): no
+new features, no provisioning, issuance, or installation of SSH keys for any
+bot, and no repointing an existing key's `command=` to `pigi_forced_command`.
+Its code and tests (`remote_pigi_mcp.py`, `pigi_forced_command.sh` and their
+tests) remain intact. Local MCP is reserved for supervised interactive use.
+The [SSH rollout plan](billing-ssh-transition.md) is paused; unfreezing or
+resuming it requires separate user approval by issue number.
+
 The **only** supported launch is the launcher script (this is the command text
 the approver sees):
 

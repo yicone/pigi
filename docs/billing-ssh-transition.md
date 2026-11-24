@@ -1,5 +1,24 @@
 # Billing transitional read access over restricted SSH (ACM-963)
 
+## Frozen — rollout paused (ACM-1018, 2026-11-24)
+
+The remote MCP wrapper is frozen: no new features, including verification-code
+access. Do not provision, issue, or install SSH keys for any bot, or repoint an
+existing key's `command=` to `pigi_forced_command`. Keep
+`remote_pigi_mcp.py`, `pigi_forced_command.sh`, and their existing tests intact.
+Unfreezing or resuming rollout requires separate user approval by issue number.
+
+Bots can now execute directly on `tr-mini-m4`; their current read entry is
+`tools/pigi-mcp/pigi_oneshot.sh` run locally on the mini (see
+[pigi-oneshot](pigi-oneshot.md)). Local MCP is reserved for supervised interactive
+use. The remote chain has no current caller and would add an SSH credential and
+an external entry point to maintain.
+
+Everything below is a **historical plan, paused until separately unfrozen**.
+Do not execute its provisioning, `authorized_keys` writes,
+`~/.ssh/pigi_forced_command.sh` installation, or bot/connector handoff steps.
+This documentation change authorizes no SSH or deployment writes.
+
 Temporary bridge until the long-term token-auth design (ACM-962) lands. It gives
 the Grok Bot **Billing** read-only access to the approved target mailbox
 `<target-mailbox>` through the running pigi App's `agent.sock`. Nothing here
@@ -222,6 +241,12 @@ field in the mini's oneshot config (the placeholder `<target-mailbox>` above),
 not a value stored in the repo. Otherwise the request is logged and refused.
 
 ## Gates and rollout order (each needs its own numbered approval)
+
+**PAUSED (ACM-1018): none of steps 0–5 below is an active rollout instruction.**
+Separate user approval by issue number to unfreeze is required before these
+historical gates can be reconsidered; prior rollout planning is not approval
+to configure keys, write `authorized_keys`, install the forced command, or
+give this remote path to any bot.
 
 0. **Code gate**: this change set passes independent offline re-review, then
    the author is separately approved to push/PR and DevOps is separately

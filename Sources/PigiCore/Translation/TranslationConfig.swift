@@ -81,7 +81,7 @@ public struct TranslationConfigStore: @unchecked Sendable {
     private let defaults: UserDefaults
     private let key = "translation.config"
 
-    public init(defaults: UserDefaults = .standard) {
+    public init(defaults: UserDefaults = CorePreferences.defaults) {
         self.defaults = defaults
     }
 

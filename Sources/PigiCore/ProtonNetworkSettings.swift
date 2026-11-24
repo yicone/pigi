@@ -80,7 +80,7 @@ public enum ProtonNetworkSettings {
     /// Exceptions and proxy choice are evaluated for the Proton API host.
     public static let protonAPIURL = URL(string: "https://mail.proton.me/api")!
 
-    public static func current(defaults: UserDefaults = .standard) -> ProtonNetworkSelection {
+    public static func current(defaults: UserDefaults = CorePreferences.defaults) -> ProtonNetworkSelection {
         selection(
             mode: ProtonProxyMode.resolved(defaults.string(forKey: modeKey)),
             manualScheme: defaults.string(forKey: schemeKey) ?? "http",

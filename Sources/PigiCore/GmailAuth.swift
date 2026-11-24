@@ -2,12 +2,12 @@ import Foundation
 
 /// Google OAuth for an installed app (PKCE, iOS client type, no client secret).
 /// Token refresh and authorization-code redemption live here. The system-browser
-/// sign-in stays in the app, because it needs AppKit.
+/// sign-in stays in the app, because it needs UI frameworks.
 public enum GmailAuth {
     /// The OAuth client ID the user created in their own Google Cloud project (see docs/gmail-api.md).
-    public static var clientID: String {
-        get { UserDefaults.standard.string(forKey: "gmailClientID") ?? "" }
-        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "gmailClientID") }
+    public static var clientID: String { (try? AccountConfiguration.shared.gmailClientID()) ?? "" }
+    public static func setClientID(_ value: String) throws {
+        try AccountConfiguration.shared.setGmailClientID(value)
     }
     public static var isConfigured: Bool { clientID.hasSuffix(".apps.googleusercontent.com") }
     public static let scopes = [
@@ -52,7 +52,7 @@ public enum GmailAuth {
 
     public static func refresh(_ refreshToken: String) async throws -> Token {
         try await tokenRequest([
-            "client_id": clientID,
+            "client_id": try AccountConfiguration.shared.gmailClientID(),
             "refresh_token": refreshToken,
             "grant_type": "refresh_token",
         ])

@@ -106,6 +106,8 @@ extension LocalEngine {
     // MARK: accounts
 
     func addGmail(_ email: String) throws {
+        // Existing legacy IDs must keep their exact credential lookup key.
+        if try account(email) != nil { trigger(email); return }
         try db().run("INSERT OR IGNORE INTO accounts(email, added_at, kind) VALUES(?,?,'gmail')", [.text(email.lowercased()), .int(now())])
         trigger(email.lowercased())
     }

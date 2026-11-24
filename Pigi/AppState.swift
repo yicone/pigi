@@ -11,7 +11,7 @@ final class AppState {
 
     private(set) var gmailAccounts: [Account] = GmailStore.emails.map(AppState.gmailAccount)
     /// Mailboxes the engine pulls over IMAP; the engine is the source of truth, this is the last list it gave.
-    private(set) var imapAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "imapAccounts") ?? []).map(AppState.imapAccount)
+    private(set) var imapAccounts: [Account] = ((try? AccountConfiguration.shared.emails(kind: "imap")) ?? []).map(AppState.imapAccount)
     private(set) var protonAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "protonAccounts") ?? []).map(AppState.protonAccount)
     private(set) var protonLabels: [String: [ProtonLabel]] = [:]
     var selectedProtonLabel: String? = nil
@@ -320,7 +320,6 @@ final class AppState {
         let emails = list.filter { $0.kind == "imap" }.map(\.email)
         if emails != imapAccounts.map(\.id) {
             imapAccounts = emails.map(Self.imapAccount)
-            UserDefaults.standard.set(emails, forKey: "imapAccounts")
         }
         let protonEmails = list.filter { $0.kind == "proton" }.map(\.email)
         protonAccounts = protonEmails.map(Self.protonAccount)
@@ -377,7 +376,6 @@ final class AppState {
             protonLabels[id] = nil
             UserDefaults.standard.set(protonAccounts.map(\.id), forKey: "protonAccounts")
             imapAccounts.removeAll { $0.id == id }
-            UserDefaults.standard.set(imapAccounts.map(\.id), forKey: "imapAccounts")
             mails.removeAll { $0.accountID == id }
             if scope == .account(id) { select(.all) }
         }

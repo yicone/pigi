@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .library(name: "PigiCore", targets: ["PigiCore"]),
+        .executable(name: "pigi-config", targets: ["PigiConfigCLI"]),
     ],
     targets: [
         .target(
@@ -18,6 +19,7 @@ let package = Package(
                 .linkedLibrary("z"),
             ]
         ),
+        .executableTarget(name: "PigiConfigCLI", dependencies: ["PigiCore"]),
         .testTarget(name: "AgentServiceTests", dependencies: ["PigiCore"], path: "Tests/AgentServiceTests"),
     ]
 )

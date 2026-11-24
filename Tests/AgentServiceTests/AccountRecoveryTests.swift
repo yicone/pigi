@@ -22,11 +22,6 @@ final class AccountRecoveryTests: XCTestCase {
 
     /// An unknown mailbox must be refused before the keychain is touched.
     func testReplaceRefreshTokenRefusesUnknownMailbox() {
-        let key = "gmailAccounts"
-        let defaults = UserDefaults.standard
-        let saved = defaults.stringArray(forKey: key)
-        defer { defaults.set(saved, forKey: key) }
-        defaults.set(["a@example.test"], forKey: key)
         XCTAssertFalse(GmailStore.replaceRefreshToken("token", for: "b@example.test"))
         XCTAssertFalse(GmailStore.replaceRefreshToken("token", for: "a@example.test "))
     }

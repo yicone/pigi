@@ -33,6 +33,7 @@ struct WorkflowRegression {
         AppAppearance.system.apply()
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain([
             "gmailAccounts": [String](), "imapAccounts": [String](),
             "archiveURL": "http://pigi-workflow.invalid", "archiveCursor": 42,

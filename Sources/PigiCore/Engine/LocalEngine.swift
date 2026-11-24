@@ -150,15 +150,9 @@ public actor LocalEngine {
         guard loop == nil else { return }
         // One keychain read before per-account sync, so startup does not prompt once per mailbox.
         try Keychain.warm()
-        try? ensureGmailAccounts()
+        // Registrations already live in accounts, including the app migration.
+        _ = try db()
         loop = Task { await runLoop() }
-    }
-
-    func ensureGmailAccounts() throws {
-        let s = try db()
-        for email in GmailStore.emails {
-            try s.run("INSERT OR IGNORE INTO accounts(email, added_at, kind) VALUES(?,?,'gmail')", [.text(email.lowercased()), .int(now())])
-        }
     }
 
     func now() -> Int { Int(Date().timeIntervalSince1970) }

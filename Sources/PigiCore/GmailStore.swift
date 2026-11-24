@@ -1,25 +1,16 @@
 import Foundation
 
-/// Which Gmail accounts are signed in. Emails live in UserDefaults.
-/// Refresh tokens live in the shared `vault-v1` keychain item.
+/// Gmail registrations share the engine's SQLite accounts table.
+/// Refresh tokens remain exclusively in the keychain vault.
 public enum GmailStore {
-    private static let defaultsKey = "gmailAccounts"
-
     public static func keychainKey(_ email: String) -> String { "gmail-refresh-\(email)" }
 
     public static var emails: [String] {
-        UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+        (try? AccountConfiguration.shared.emails(kind: "gmail")) ?? []
     }
 
     public static func add(_ email: String, refreshToken: String) throws {
-        try add(email, refreshToken: refreshToken, defaults: .standard, credentials: CredentialStore())
-    }
-
-    static func add(_ email: String, refreshToken: String, defaults: UserDefaults, credentials: CredentialStore) throws {
-        try credentials.save(keychainKey(email), refreshToken)
-        var list = defaults.stringArray(forKey: defaultsKey) ?? []
-        if !list.contains(email) { list.append(email) }
-        defaults.set(list, forKey: defaultsKey)
+        try AccountConfiguration.shared.addGmail(email, refreshToken: refreshToken, credentials: CredentialStore())
     }
 
     /// Replaces the refresh token of a mailbox that is already signed in.
@@ -47,6 +38,6 @@ public enum GmailStore {
 
     public static func remove(_ email: String) {
         _ = Keychain.set(keychainKey(email), "")
-        UserDefaults.standard.set(emails.filter { $0 != email }, forKey: defaultsKey)
+        // The engine deletes the authoritative account row and cached mail.
     }
 }

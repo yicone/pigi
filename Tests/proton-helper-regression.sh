@@ -7,6 +7,6 @@ TEST_BUILD="$(mktemp -d "${TMPDIR:-/tmp}/pigi-proton-regression.XXXXXX")"
 trap isolate_support_finish EXIT
 bash "$ROOT/tools/build-proton-helper.sh" "$TEST_BUILD"
 isolate_support_swiftc -swift-version 5 -parse-as-library \
-    "$ROOT/Sources/PigiCore/ProtonHelper.swift" "$ROOT/Sources/PigiCore/ProtonNetworkSettings.swift" "$ROOT/Sources/PigiCore/ProtonVerificationPolicy.swift" "$ROOT/Pigi/ProtonLoginPrompt.swift" "$ROOT/Tests/ProtonLoginRegression.swift" "$ROOT/Tests/ProtonHelperRegression.swift" \
+    "$ROOT/Sources/PigiCore/CorePreferences.swift" "$ROOT/Sources/PigiCore/ProtonHelper.swift" "$ROOT/Sources/PigiCore/ProtonNetworkSettings.swift" "$ROOT/Sources/PigiCore/ProtonVerificationPolicy.swift" "$ROOT/Pigi/ProtonLoginPrompt.swift" "$ROOT/Tests/ProtonLoginRegression.swift" "$ROOT/Tests/ProtonHelperRegression.swift" \
     -o "$TEST_BUILD/proton-helper-regression"
 "$TEST_BUILD/proton-helper-regression" "$TEST_BUILD"

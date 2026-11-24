@@ -197,6 +197,7 @@ struct MailAppearanceRegression {
             fputs("FAIL: detail appearance regression timed out\n", stderr)
             _exit(124)
         }
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain([
             "gmailAccounts": [String](), "imapAccounts": [String](), "loadRemoteImages": false,
         ], forName: UserDefaults.argumentDomain)

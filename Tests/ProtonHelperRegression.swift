@@ -13,6 +13,7 @@ struct ProtonHelperRegression {
     }
 
     static func main() async throws {
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain(["protonProxyMode": "direct"], forName: UserDefaults.argumentDomain)
         let root = URL(fileURLWithPath: CommandLine.arguments[1])
         let actual = ProtonHelperClient(executable: root.appendingPathComponent("pigi-proton-helper"))

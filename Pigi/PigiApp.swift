@@ -46,6 +46,15 @@ struct PigiApp: App {
             }
             dispatchMain()
         }
+        CorePreferences.defaults = UserDefaults.standard
+        do { try AccountConfiguration.shared.migrateLegacy(defaults: UserDefaults.standard) }
+        catch {
+            // Do not start sync or touch credentials after a failed migration.
+            _state = State(initialValue: AppState())
+            _layout = State(initialValue: LayoutState())
+            state.syncError = "账号配置迁移失败，请检查本地存储权限后重启"
+            return
+        }
         (AppAppearance(rawValue: UserDefaults.standard.string(forKey: "appearanceMode") ?? "") ?? .system).apply()
         let appState = AppState()
         _state = State(initialValue: appState)

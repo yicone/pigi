@@ -27,6 +27,6 @@ isolate_support_swiftc -swift-version 5 -O -D PIGI_REGRESSION -parse-as-library 
 
 for scope in all account; do
     for unread in 0 1 12 120; do
-        "$TEST_BUILD/pigi-panel-regression" "$unread" "$scope"
+        isolate_support_env "$TEST_BUILD/home-$scope-$unread" -- "$TEST_BUILD/pigi-panel-regression" "$unread" "$scope"
     done
 done

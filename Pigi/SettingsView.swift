@@ -662,6 +662,7 @@ private struct AccountIconButton: View {
 /// Gmail needs the user's own Google OAuth client; IMAP mailboxes do not.
 private struct GmailClientField: View {
     @State private var clientID = GmailAuth.clientID
+    @State private var configError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -669,11 +670,15 @@ private struct GmailClientField: View {
                 Text("Gmail 客户端 ID").font(.system(size: 12.5)).foregroundStyle(.secondary)
                 TextField("", text: $clientID, prompt: Text("xxxxxxxx.apps.googleusercontent.com"))
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: clientID) { _, value in GmailAuth.clientID = value }
+                    .onChange(of: clientID) { _, value in
+                        do { try GmailAuth.setClientID(value); configError = nil }
+                        catch { configError = "客户端 ID 保存失败，请检查本地存储权限" }
+                    }
                 if GmailAuth.isConfigured {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 }
             }
+            if let configError { Text(configError).font(.caption).foregroundStyle(.red) }
             Text("添加 Gmail 前需要填入你自己在 Google Cloud 创建的 OAuth 客户端 ID。")
                 .font(.system(size: 11.5)).foregroundStyle(.tertiary)
             + Text(" 查看图文教程")

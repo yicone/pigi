@@ -163,7 +163,7 @@ class UpstreamError(Exception):
         super().__init__(code)
 
 
-def mcp_session(ctx, calls):
+def mcp_session(ctx, calls, enable_codes=False):
     """One pigi_mcp child: handshake, then each (tool, arguments) pair in order.
 
     Returns one ("ok", result) or ("error", fixed_code) per call; raises
@@ -174,6 +174,8 @@ def mcp_session(ctx, calls):
                "--account", ctx.account,
                "--socket", str(ctx.socket_path),
                "--audit-db", str(ctx.audit_db)]
+    if enable_codes:
+        command.append("--enable-codes")
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
                           "clientInfo": {"name": "pigi-oneshot", "version": "0.1.0"}}},
@@ -243,8 +245,8 @@ def mcp_session(ctx, calls):
     return outcomes
 
 
-def single_call(ctx, tool, arguments):
-    outcome, = mcp_session(ctx, [(tool, arguments)])
+def single_call(ctx, tool, arguments, enable_codes=False):
+    outcome, = mcp_session(ctx, [(tool, arguments)], enable_codes)
     return outcome
 
 

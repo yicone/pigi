@@ -26,6 +26,16 @@ CURSOR_TTL_MS = 6 * 3_600_000
 CLOCK_SKEW_MS = 60_000
 IDENTITY_FIELDS = {"account", "messageID", "date"}
 META_BUDGET = 512
+CODES_COMMAND = "codes"
+CODES_TOOL = "get_verification_code"
+CODES_STATUSES = ("inbox", "archived", "spam", "trash")
+CODES_FIELDS = ("code", "fromName", "fromEmail", "date", "account", "messageID")
+CODES_SINCE_DEFAULT_MINUTES = 10
+CODES_SINCE_MAX_MINUTES = 60
+CODES_OFFSET_MAX = 1_000_000
+CODES_FETCH = 100
+CODES_MAX_FETCHES = 5
+CODES_MAX_SENDERS = 64
 
 
 def config_path(home):
@@ -63,6 +73,14 @@ def query_text(value):
 
 def query_digest(query):
     return hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+
+
+def sender_filter(value):
+    """--from-email: non-blank, at most 1024 UTF-8 bytes; stored lowercased."""
+    if (not isinstance(value, str) or not value.strip()
+            or len(value.encode("utf-8")) > 1024):
+        raise argparse.ArgumentTypeError("invalid sender")
+    return value.strip().lower()
 
 
 def cursor(value):
@@ -111,6 +129,15 @@ def build_parser():
     search_paged.add_argument("--history", action="store_true")
     search_paged.add_argument("--cursor", type=cursor)
     search.add_argument("--limit", type=pigi_oneshot.bounded_int(1, 20), default=10)
+    codes = commands.add_parser(CODES_COMMAND, allow_abbrev=False)
+    codes.add_argument("--since-minutes", type=pigi_oneshot.bounded_int(
+        1, CODES_SINCE_MAX_MINUTES), default=CODES_SINCE_DEFAULT_MINUTES)
+    codes.add_argument("--limit", type=pigi_oneshot.bounded_int(1, 20), default=10)
+    codes.add_argument("--offset", type=pigi_oneshot.bounded_int(
+        0, CODES_OFFSET_MAX), default=0)
+    codes.add_argument("--status", choices=CODES_STATUSES)
+    codes.add_argument("--from-email", dest="from_email", action="append",
+                       type=sender_filter)
     return parser
 
 
@@ -131,6 +158,9 @@ def parse_args(argv):
             if (args.cursor["c"] != args.command
                     or args.cursor["q"] != expected):
                 parser.error()
+    if (args.command == CODES_COMMAND
+            and len(args.from_email or ()) > CODES_MAX_SENDERS):
+        parser.error()
     return args
 
 
@@ -231,6 +261,90 @@ def cut_single_item(payload, item):
         return pigi_oneshot.EXIT_UPSTREAM, \
             pigi_oneshot.upstream_failure("page_item_too_large")
     return pigi_oneshot.EXIT_TRUNCATED, cut_payload
+
+
+def code_rows_valid(rows, ctx, since, floor, seen):
+    """App code rows safe to filter and page over: own account, typed fields,
+    fetchable messageID, inside the window, dates never increasing and no
+    messageID repeated across the whole walk (a shifted page would repeat)."""
+    previous = floor
+    for row in rows:
+        if (not own_record(row, ctx) or set(row) - set(CODES_FIELDS)
+                or not isinstance(row.get("code"), str)
+                or not isinstance(row.get("messageID"), str)
+                or not pigi_oneshot.MESSAGE_ID.fullmatch(row["messageID"])
+                or row["messageID"] in seen
+                or type(row.get("date")) is not int or row["date"] < since
+                or (previous is not None and row["date"] > previous)
+                or any(key in row and not isinstance(row[key], str)
+                       for key in ("fromName", "fromEmail"))):
+            return False
+        seen.add(row["messageID"])
+        previous = row["date"]
+    return True
+
+
+def sender_matches(row, senders):
+    sender = row.get("fromEmail")
+    return isinstance(sender, str) and sender.strip().lower() in senders
+
+
+def command_codes(args, ctx):
+    """Cached verification codes: App time window, oneshot sender filter.
+
+    The App cannot filter by sender, so this walks the App's pages (at most
+    CODES_MAX_FETCHES) until offset + limit + 1 rows match or the App has no
+    further page. limit/offset/nextOffset all refer to the filtered list. If
+    the walk cannot reach a decision within the fetch cap it fails: it never
+    reports a possibly incomplete result as complete.
+    """
+    since = ctx.now_ms() - args.since_minutes * 60_000
+    senders = frozenset(args.from_email or ())
+    needed = args.offset + args.limit + 1
+    matched, seen, app_offset, floor, fetches = [], set(), 0, None, 0
+    while True:
+        if fetches >= CODES_MAX_FETCHES:
+            return pigi_oneshot.EXIT_UPSTREAM, \
+                pigi_oneshot.upstream_failure("page_limit_exceeded")
+        fetches += 1
+        params = {"account": ctx.account, "since": since,
+                  "limit": CODES_FETCH, "offset": app_offset}
+        if args.status is not None:
+            params["status"] = args.status
+        status, value = pigi_oneshot.single_call(
+            ctx, CODES_TOOL, params, enable_codes=True)
+        if status == "error":
+            return pigi_oneshot.EXIT_UPSTREAM, pigi_oneshot.upstream_failure(value)
+        rows, later = value.get("codes"), value.get("nextOffset")
+        if not isinstance(rows, list) or not code_rows_valid(rows, ctx, since, floor, seen):
+            return pigi_oneshot.EXIT_UPSTREAM, \
+                pigi_oneshot.upstream_failure("invalid_response")
+        if rows:
+            floor = rows[-1]["date"]
+        matched.extend(row for row in rows
+                       if not senders or sender_matches(row, senders))
+        if later is None or len(matched) >= needed:
+            break
+        if (type(later) is not int or not rows
+                or later != app_offset + len(rows) or later > CODES_OFFSET_MAX):
+            return pigi_oneshot.EXIT_UPSTREAM, \
+                pigi_oneshot.upstream_failure("invalid_response")
+        app_offset = later
+    rest = matched[args.offset:]
+    n = min(args.limit, len(rest))
+    while True:
+        more = len(rest) > n
+        body = {"codes": [{key: row[key] for key in CODES_FIELDS if key in row}
+                          for row in rest[:n]]}
+        if more:
+            body["nextOffset"] = args.offset + n
+        payload = pigi_oneshot.envelope(CODES_COMMAND, body)
+        # An oversized page becomes a shorter page whose nextOffset resumes
+        # exactly after it; only a single row that cannot fit alone is cut
+        # (flagged truncated, exit 8) by emit_full.
+        if n <= 1 or len(pigi_oneshot.serialize(payload)) <= pigi_oneshot.MAX_STDOUT:
+            return pigi_oneshot.EXIT_OK, payload
+        n -= 1
 
 
 def command_accounts(args, ctx):
@@ -423,6 +537,8 @@ def run_command(args, ctx):
             code, payload = command_list(args, ctx)
         elif args.command == "search":
             code, payload = command_search(args, ctx)
+        elif args.command == CODES_COMMAND:
+            code, payload = command_codes(args, ctx)
         elif args.command == "get":
             code, payload = command_get(args, ctx)
         else:

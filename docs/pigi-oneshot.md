@@ -77,18 +77,37 @@ macOS).
 | `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. | Same batch cap and handshake. No `"status":"filtered"`; a foreign account is `error` / `invalid_response` and its body is not copied. |
 
 Not implemented on either profile — now or by accident: `get_verification_code`,
-`--account`, `--offset`, `--help`/`-h` (unsupported, exits 2), send/mark-read/draft
+`--account`, `--offset`, `--help`/`-h` (unsupported, exit 2; only `get`/`get-batch` read them as IDs), send/mark-read/draft
 or any mutation. The billing profile also rejects `list` and a caller-chosen
 query. Unknown subcommands, unknown options, and an unknown profile exit 2
 before config or socket use. The full profile's `list` is a code path, not a
 config switch.
 
+### IDs that start with `-`
+
+`get` and `get-batch` take IDs only and no options, so every token must match
+the `messageID` rule and nothing else is interpreted (both profiles, and
+through `pigi_oneshot.sh`). Any valid ID is passed as is, with no `--`:
+`get -abc`, `get -`, `get --limit`, `get-batch ok -a --b --history`.
+A first `--` token is always the separator and is dropped (`get -- -abc`,
+`get-batch -- -a b`). A literal `--` is never an ID, in any position: a lone
+`--` (`get --`, `get-batch --`) leaves no ID, and any `--` after the
+separator or anywhere else in the batch (`get -- --`, `get-batch a --`,
+`get-batch -- -- a`) is rejected. All of these exit 2 with zero upstream
+requests.
+
+Because those tokens are IDs, not options, `get`/`get-batch` no longer reject
+them as paging options: `get-batch m1 --history` is a batch of two IDs. `get`
+with more than one token still exits 2. Invalid IDs, a missing ID, any `--`
+token (see above), more than one ID for `get` and more than 5 for `get-batch`
+exit 2 with zero upstream requests.
+
 ### History paging (full only)
 
 On full `list` and `search`, exactly one of `--since-days`, `--history`,
 `--cursor <token>` may be given. Any combination, a repeated flag, or either
-paging option on `get`/`get-batch`/`accounts` or on the billing profile exits
-2 before config or socket use:
+paging option on `accounts` or on the billing profile exits 2 before config or
+socket use (on `get`/`get-batch` those tokens are IDs, see above):
 
 ```sh
 <checkout>/tools/pigi-mcp/pigi_oneshot.sh full list --history --limit 20

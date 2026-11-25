@@ -448,6 +448,35 @@ def message_id(value):
     return value
 
 
+ID_COMMANDS = {"get": 1, "get-batch": 5}
+
+
+def id_command(argv):
+    """Namespace for `get`/`get-batch`, or None for any other command.
+
+    These commands take only IDs and no options, so argparse never sees them:
+    it would read an ID that starts with `-` as an option. A first `--` token
+    is always the separator and is dropped. A literal `--` is never an ID: any
+    further `--` token is rejected, as is a lone `--` (no ID left). Every other
+    token must match MESSAGE_ID and is an ID, so `-x`, `--x`, `-` and
+    option-shaped IDs such as `--limit` are all plain IDs.
+    """
+    if not argv or argv[0] not in ID_COMMANDS:
+        return None
+    command, tokens = argv[0], argv[1:]
+    if tokens[:1] == ["--"]:
+        tokens = tokens[1:]
+    if "--" in tokens or not 1 <= len(tokens) <= ID_COMMANDS[command]:
+        raise SystemExit(EXIT_USAGE)
+    try:
+        ids = [message_id(token) for token in tokens]
+    except argparse.ArgumentTypeError:
+        raise SystemExit(EXIT_USAGE) from None
+    if command == "get":
+        return argparse.Namespace(command=command, message_id=ids[0])
+    return argparse.Namespace(command=command, message_ids=ids)
+
+
 def build_parser():
     parser = Parser(prog="pigi-oneshot", allow_abbrev=False, description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -455,19 +484,14 @@ def build_parser():
     search = commands.add_parser("search", allow_abbrev=False)
     search.add_argument("--since-days", type=bounded_int(1, 30), default=7)
     search.add_argument("--limit", type=bounded_int(1, 20), default=10)
-    get = commands.add_parser("get", allow_abbrev=False)
-    get.add_argument("message_id", type=message_id)
-    batch = commands.add_parser("get-batch", allow_abbrev=False)
-    batch.add_argument("message_ids", nargs="+", type=message_id)
     return parser
 
 
 def parse_args(argv):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "get-batch" and len(args.message_ids) > 5:
-        parser.error()
-    return args
+    args = id_command(argv)
+    if args is not None:
+        return args
+    return build_parser().parse_args(argv)
 
 
 def run_command(args, ctx):

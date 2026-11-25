@@ -1,4 +1,5 @@
 """Synthetic fixtures only. Swift XCTest also invokes --integration over its real socket."""
+import contextlib
 import io
 import json
 import os
@@ -15,9 +16,16 @@ from unittest.mock import Mock
 
 from audit import Audit
 from pigi_mcp import MCPServer, TOOLS, TRUST_NOTICE, serve
+import test_isolation
 from transport import MAX_REQUEST, MAX_RESPONSE, SocketClient, ToolError
 
 SCRIPT = Path(__file__).with_name("pigi_mcp.py")
+
+
+def setUpModule():
+    # Every default that used to resolve to the real HOME is a sentinel here;
+    # the un-isolated repo entry points are refused before a process exists.
+    test_isolation.module_setup()
 
 
 def request(id, method, params=None):
@@ -34,11 +42,30 @@ def call(id, name, arguments=None):
     return request(id, "tools/call", {"name": name, "arguments": arguments or {}})
 
 
+def subprocess_env():
+    """HOME bound to the sentinel. There is no fallback to the inherited
+    environment: without the default isolation this raises before any
+    subprocess is created."""
+    return {**os.environ, "HOME": str(test_isolation.active().home)}
+
+
+def run_entry(function, *args):
+    """Run a Swift-invoked --*integration entry point under the same default
+    isolation as the unittest run, then undo it and fail if any default path
+    was used."""
+    test_isolation.module_setup()
+    try:
+        return function(*args)
+    finally:
+        unittest.doModuleCleanups()
+
+
 def subprocess_calls(socket_path, audit_path, messages, extra_args=()):
     result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--socket", str(socket_path),
                              "--audit-db", str(audit_path), *extra_args],
                             input="\n".join(json.dumps(m) for m in messages) + "\n",
-                            text=True, capture_output=True, timeout=20)
+                            text=True, capture_output=True, timeout=20,
+                            env=subprocess_env())
     assert result.returncode == 0, result.stderr
     assert result.stderr == "", result.stderr
     return {r["id"]: r for r in map(json.loads, result.stdout.splitlines())}
@@ -84,7 +111,7 @@ def integration(socket_path, audit_path):
     assert value(14)["items"][0]["messageID"] == "old"
     assert value(15)["items"] == []
     assert "PRIVATE_SENTINEL" not in json.dumps(responses)
-    with sqlite3.connect(audit_path) as db:
+    with contextlib.closing(sqlite3.connect(audit_path)) as db:
         rows = db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id").fetchall()
     assert len(rows) == 13, rows
     assert rows[6:] == [("get_message", "not_found"), ("list_messages", "invalid_arguments"),
@@ -98,7 +125,7 @@ def integration(socket_path, audit_path):
     assert "BODY_SENTINEL" not in json.dumps(codes)
     assert json.loads(codes[21]["result"]["content"][0]["text"])["codes"][0]["messageID"] == "old"
     assert codes[22]["error"]["code"] == -32602
-    with sqlite3.connect(audit_path) as db:
+    with contextlib.closing(sqlite3.connect(audit_path)) as db:
         assert db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id DESC LIMIT 3").fetchall() == [
             ("get_verification_code", "invalid_arguments"), ("get_verification_code", "ok"), ("get_verification_code", "ok")]
     print("MCP stdio -> real Swift socket -> synthetic LocalEngine: passed")
@@ -131,7 +158,7 @@ def permissions_integration(socket_path, audit_path):
     assert value(10)["message"]["account"] == "b@example.invalid"
     for id in range(11, 17):
         assert responses[id]["error"]["code"] == -32602
-    with sqlite3.connect(audit_path) as db:
+    with contextlib.closing(sqlite3.connect(audit_path)) as db:
         rows = db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id").fetchall()
     assert len(rows) == 15, rows
     assert [outcome for _, outcome in rows].count("permission_denied") == 4
@@ -170,7 +197,7 @@ def scoped_integration(socket_path, audit_path, denied):
     assert json.loads(responses[6]["result"]["content"][0]["text"]) == {"error": "permission_denied"}
     for id in (8, 9, 11):
         assert responses[id]["error"]["code"] == -32602
-    with sqlite3.connect(audit_path) as db:
+    with contextlib.closing(sqlite3.connect(audit_path)) as db:
         rows = db.execute("SELECT tool,outcome FROM tool_calls ORDER BY id").fetchall()
     assert len(rows) == 9
     assert rows[3:] == [("list_messages", "permission_denied"),
@@ -448,12 +475,87 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(self.rows()[0][:2], ("list_messages", "unavailable"))
 
 
+class EntryIsolationTests(unittest.TestCase):
+    """The --*integration entry points bypass setUpModule, so they get the
+    isolation from run_entry; without it they refuse before any process."""
+
+    def child(self, code, extra_env=None):
+        env = {**os.environ, "HOME": str(test_isolation.active().home),
+               **(extra_env or {})}
+        return subprocess.run([sys.executable, "-B", "-c", code], cwd=SCRIPT.parent,
+                              env=env, text=True, capture_output=True, timeout=30)
+
+    def test_entry_points_refuse_without_isolation_before_any_process(self):
+        result = self.child(
+            "import subprocess, test_pigi_mcp as t\n"
+            "def never(*a, **k): raise SystemExit('PROCESS-CREATED')\n"
+            "subprocess.run = never\n"
+            "subprocess.Popen = never\n"
+            "for call in (t.subprocess_env,\n"
+            "             lambda: t.subprocess_calls('/nonexistent/s', '/nonexistent/a', []),\n"
+            "             lambda: t.integration('/nonexistent/s', '/nonexistent/a'),\n"
+            "             lambda: t.permissions_integration('/nonexistent/s', '/nonexistent/a'),\n"
+            "             lambda: t.scoped_integration('/nonexistent/s', '/nonexistent/a', 'x')):\n"
+            "    try:\n"
+            "        call()\n"
+            "    except AssertionError as error:\n"
+            "        assert 'refusing to run without the default isolation' in str(error), error\n"
+            "    else:\n"
+            "        raise SystemExit('NOT-REFUSED')\n"
+            "print('refused-all')\n")
+        self.assertEqual((result.returncode, result.stdout.strip(), result.stderr),
+                         (0, "refused-all", ""))
+
+    def test_run_entry_installs_sentinel_home_and_tripwire(self):
+        result = self.child(
+            "import os, socket, json, test_pigi_mcp as t, test_isolation as i\n"
+            "def probe():\n"
+            "    s = i.active()\n"
+            "    assert t.subprocess_env()['HOME'] == str(s.home)\n"
+            "    assert os.path.realpath(str(s.home)) not in i.real_homes()\n"
+            "    assert i.REAL_SOCKET != s.socket\n"
+            "    import transport, pigi_oneshot\n"
+            "    assert transport.DEFAULT_SOCKET == s.socket\n"
+            "    assert pigi_oneshot.PINNED_HOME == str(s.home)\n"
+            "    c = socket.socket(socket.AF_UNIX); c.connect(str(s.socket)); c.close()\n"
+            "    import time; end = time.time() + 3\n"
+            "    while not s.tripwire.connections and time.time() < end: time.sleep(0.02)\n"
+            "    return 'probed'\n"
+            "try:\n"
+            "    t.run_entry(probe)\n"
+            "except AssertionError as error:\n"
+            "    assert 'a default socket path was used' in str(error), error\n"
+            "    print('tripwire-fired')\n"
+            "else:\n"
+            "    raise SystemExit('TRIPWIRE-SILENT')\n"
+            "try:\n"
+            "    i.active()\n"
+            "except AssertionError:\n"
+            "    print('cleaned-up')\n")
+        self.assertEqual((result.returncode, result.stdout.split(), result.stderr),
+                         (0, ["tripwire-fired", "cleaned-up"], ""))
+
+    def test_main_routes_every_integration_entry_through_run_entry(self):
+        import ast
+        tree = ast.parse(Path(__file__).read_text())
+        gate = next(node for node in tree.body if isinstance(node, ast.If)
+                    and "__main__" in ast.dump(node.test))
+        called = {}
+        for node in ast.walk(gate):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                called.setdefault(node.func.id, []).append(node)
+        self.assertEqual(len(called["run_entry"]), 3)
+        self.assertEqual(
+            sorted(call.args[0].id for call in called["run_entry"]),
+            ["integration", "permissions_integration", "scoped_integration"])
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--integration":
-        integration(*sys.argv[2:])
+        run_entry(integration, *sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--permissions-integration":
-        permissions_integration(*sys.argv[2:])
+        run_entry(permissions_integration, *sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--scoped-integration":
-        scoped_integration(*sys.argv[2:])
+        run_entry(scoped_integration, *sys.argv[2:])
     else:
         unittest.main()

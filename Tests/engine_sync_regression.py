@@ -8,6 +8,11 @@ import sys
 import threading
 
 build = Path(sys.argv[1])
+# Catch launcher regressions before starting the TLS fixture or Swift process.
+# Inheriting a caller's temporary HOME previously hid the missing CI setup.
+for key in ('HOME', 'CFFIXED_USER_HOME'):
+    assert Path(os.environ[key]).resolve() == (build / 'home').resolve(), key
+assert os.environ.get('PIGI_REGRESSION') == '1'
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(build / 'cert.pem', build / 'key.pem')
 listener = socket.socket()

@@ -61,6 +61,7 @@ actor GmailFixture {
 
 @main struct EngineSyncRegression {
     static func main() async throws {
+        try AppSupport.assertProcessSupportIsIsolated()
         let port = Int(CommandLine.arguments[1])!
         let root = URL(fileURLWithPath: CommandLine.arguments[2])
         let email = "fixture@example.test"

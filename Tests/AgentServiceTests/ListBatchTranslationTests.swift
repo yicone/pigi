@@ -185,6 +185,46 @@ final class ListBatchTranslationTests: XCTestCase {
         XCTAssertNil(stored)
     }
 
+    func testStaleGenerationAfterConfirmationSendsNothing() async throws {
+        let sample = row("mail", subject: "Hello", snippet: "World")
+        let cache = SQLiteTranslationCache(path: ":memory:")
+        let translator = RecordingTranslator()
+        var current = true
+        let outcome = await ListBatchTranslator().run(
+            rows: [sample], policy: FixedPolicy(decisions: [sample.accountID: .allowed]), configuration: configuration(),
+            cache: cache, translator: translator,
+            confirm: { _, _ in
+                current = false
+                return true
+            },
+            isCurrent: { current })
+        XCTAssertEqual(outcome.status, .cancelled)
+        XCTAssertEqual(outcome.requestCount, 0)
+        XCTAssertTrue(outcome.translations.isEmpty)
+        XCTAssertTrue(translator.calls.isEmpty)
+        let stored = try await cache.get(ListTranslationCache.key(row: sample, configuration: configuration()))
+        XCTAssertNil(stored)
+    }
+
+    func testStaleGenerationAfterResponseWritesNothingAndReturnsNothing() async throws {
+        let sample = row("mail", subject: "Hello", snippet: "World")
+        let cache = SQLiteTranslationCache(path: ":memory:")
+        let current = CurrentFlag()
+        let translator = InvalidateOnTranslate { current.value = false }
+        let outcome = await ListBatchTranslator().run(
+            rows: [sample], policy: FixedPolicy(decisions: [sample.accountID: .allowed]), configuration: configuration(),
+            cache: cache, translator: translator, confirm: { _, _ in true },
+            isCurrent: { current.value })
+        XCTAssertEqual(outcome.status, .cancelled)
+        XCTAssertEqual(outcome.requestCount, 1)
+        XCTAssertTrue(outcome.translations.isEmpty)
+        XCTAssertEqual(translator.calls.count, 1)
+        let stored = try await cache.get(ListTranslationCache.key(row: sample, configuration: configuration()))
+        XCTAssertNil(stored)
+        XCTAssertEqual(sample.subject, "Hello")
+        XCTAssertEqual(sample.snippet, "World")
+    }
+
     func testCacheHitSkipsTheRequest() async throws {
         let sample = row("mail", subject: "Hello", snippet: "World")
         let config = configuration()
@@ -352,6 +392,23 @@ private actor RejectingBatchCache: TranslationCache {
     }
     func clear() async throws { try await inner.clear() }
     func purge(accountID: String) async throws { try await inner.purge(accountID: accountID) }
+}
+
+private final class CurrentFlag: @unchecked Sendable {
+    var value = true
+}
+
+private final class InvalidateOnTranslate: SegmentTranslator, @unchecked Sendable {
+    private var stored: [[TranslationSegment]] = []
+    var calls: [[TranslationSegment]] { stored }
+    let invalidate: () -> Void
+    init(invalidate: @escaping () -> Void) { self.invalidate = invalidate }
+
+    func translate(_ segments: [TranslationSegment]) async throws -> [TranslationSegment] {
+        stored.append(segments)
+        invalidate()
+        return segments.map { TranslationSegment(id: $0.id, text: "译:" + $0.text) }
+    }
 }
 
 private final class CancelAfterStartTranslator: SegmentTranslator, @unchecked Sendable {

@@ -142,6 +142,7 @@ struct ListTranslationWindowRegression {
         ], forName: UserDefaults.argumentDomain)
         TranslationConfigStore().save(config)
         let privacy = TranslationPrivacySettings.shared
+        privacy.removeAccount(proton)
         privacy.grantServiceConsent(endpoint: config.baseURL)
         privacy.setEnabled(true, accountID: allowed, isProton: false)
 
@@ -279,6 +280,50 @@ struct ListTranslationWindowRegression {
         state.searchText = ""
         print("PASS: search cancelled the in-flight request and kept stored subjects")
 
+        TranslationPrivacySettings.shared.setEnabled(true, accountID: proton, isProton: true, confirmingProtonConsent: true)
+        state.select(.account(proton))
+        try await wait("proton inbox did not appear") { state.visibleMails.contains { $0.id == "mail-2" } }
+        let protonRow = ListTranslationRow(id: "mail-2", accountID: proton, subject: "Proton 02", snippet: "Snippet 02")
+        let protonFrames = [ListRowFrame(id: "mail-2", minY: 10, maxY: 50)]
+        translator.setHold(false)
+        let callsBeforeConfirm = translator.calls.count
+        state.translateVisibleList(frames: protonFrames, viewportHeight: 200)
+        try await wait("proton confirmation did not appear") { state.listTranslationPrompt != nil }
+        guard translator.calls.count == callsBeforeConfirm else { fail("proton confirmation sent a request") }
+        state.selectedProtonLabel = "TRASH"
+        try await wait("proton folder change during confirmation did not cancel") {
+            !state.listTranslationBusy && state.listTranslationPrompt == nil
+        }
+        guard translator.calls.count == callsBeforeConfirm else { fail("switching Proton folder during confirmation sent a request") }
+        guard state.listTranslations["mail-2"] == nil else { fail("confirmation cancel applied a proton translation") }
+        let confirmCache = try await cache.get(ListTranslationCache.key(row: protonRow, configuration: config))
+        guard confirmCache == nil else { fail("confirmation cancel wrote a proton cache row") }
+        guard state.visibleMails.isEmpty else { fail("TRASH still showed the inbox row") }
+        print("PASS: Proton folder change during confirmation performed zero requests")
+
+        state.selectedProtonLabel = nil
+        try await wait("proton inbox did not return") { state.visibleMails.contains { $0.id == "mail-2" } }
+        translator.setHold(true)
+        let callsBeforeFlight = translator.calls.count
+        let translationsBeforeFlight = state.listTranslations
+        state.translateVisibleList(frames: protonFrames, viewportHeight: 200)
+        try await wait("in-flight proton confirmation did not appear") { state.listTranslationPrompt != nil }
+        state.acceptListTranslation()
+        state.finishListTranslationPrompt()
+        try await wait("proton request did not start") { translator.calls.count > callsBeforeFlight }
+        state.selectedProtonLabel = "TRASH"
+        try await wait("proton folder change did not cancel the request") { !state.listTranslationBusy }
+        guard state.listTranslations == translationsBeforeFlight else { fail("stale proton translation was displayed") }
+        guard state.listTranslations["mail-2"] == nil else { fail("old proton translation was applied") }
+        let flightCache = try await cache.get(ListTranslationCache.key(row: protonRow, configuration: config))
+        guard flightCache == nil else { fail("stale proton translation wrote cache") }
+        try await Task.sleep(for: .milliseconds(400))
+        guard state.listTranslations == translationsBeforeFlight else { fail("late proton result was displayed") }
+        let lateCache = try await cache.get(ListTranslationCache.key(row: protonRow, configuration: config))
+        guard lateCache == nil else { fail("late proton result wrote cache") }
+        guard state.mails.first(where: { $0.id == "mail-2" })?.subject == "Proton 02" else { fail("proton folder change replaced the stored subject") }
+        print("PASS: Proton folder change dropped the in-flight result without cache or display")
+
         guard Keychain.translationAPIKeyReads == 0, Keychain.getCount == 0 else {
             fail("keychain reads=\(Keychain.getCount) translationReads=\(Keychain.translationAPIKeyReads)")
         }
@@ -293,6 +338,7 @@ struct ListTranslationWindowRegression {
             outsideIDs: viewport.outside,
             edgeTouchIDs: viewport.touching,
             notes: [
+                "Proton folder changes during confirmation and during a request are asserted above.",
                 "Exact boundary touch without overlap is asserted in ListBatchTranslationTests.",
                 viewport.touching.isEmpty ? "This layout produced no exact edge-touch frame." : "Edge-touch frames were excluded from the request.",
                 "No real keychain, mailbox, or translation service was contacted.",

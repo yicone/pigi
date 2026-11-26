@@ -156,6 +156,7 @@ public enum ListTranslationDisplay {
 
 /// Translates the subject and snippet of rows the caller already decided are visible.
 /// Nothing is sent until `confirm` returns true. A cancelled confirmation performs no request.
+/// `isCurrent` is the caller's generation check. Once it is false, a finished response is not stored or returned.
 @MainActor
 public struct ListBatchTranslator {
     public init() {}
@@ -166,7 +167,8 @@ public struct ListBatchTranslator {
         configuration: TranslationConfig,
         cache: any TranslationCache,
         translator: any SegmentTranslator,
-        confirm: @escaping @MainActor (_ sending: Int, _ skipped: Int) async -> Bool
+        confirm: @escaping @MainActor (_ sending: Int, _ skipped: Int) async -> Bool,
+        isCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ListBatchOutcome {
         var skipped: [ListTranslationSkip] = []
         var pending: [Pending] = []
@@ -208,7 +210,7 @@ public struct ListBatchTranslator {
         }
 
         let allowed = await confirm(misses.count, skipped.count)
-        if !allowed || Task.isCancelled {
+        if !allowed || Task.isCancelled || isCurrent?() == false {
             return ListBatchOutcome(status: .cancelled, skipped: skipped)
         }
 
@@ -238,11 +240,14 @@ public struct ListBatchTranslator {
         do {
             for item in misses {
                 try Task.checkCancellation()
+                if isCurrent?() == false { throw CancellationError() }
                 tickets[item.row.id] = try await cache.begin(item.key)
             }
+            if isCurrent?() == false { throw CancellationError() }
             requested = true
             translated = try await translator.translate(segments)
             try Task.checkCancellation()
+            if isCurrent?() == false { throw CancellationError() }
         } catch is CancellationError {
             return ListBatchOutcome(status: .cancelled, skipped: skipped, requestCount: requested ? 1 : 0)
         } catch let error as TranslationError {
@@ -276,7 +281,9 @@ public struct ListBatchTranslator {
                 return (CachedTranslation(subject: value.subject, body: value.snippet), ticket)
             }
             try Task.checkCancellation()
+            if isCurrent?() == false { throw CancellationError() }
             // One commit. A later row failing or a cancellation rolls the whole batch back.
+            // A stale generation is rejected above and never reaches this commit.
             try await cache.putAll(entries, validated: true)
         } catch is CancellationError {
             return ListBatchOutcome(status: .cancelled, skipped: skipped, requestCount: 1)

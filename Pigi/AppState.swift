@@ -25,7 +25,10 @@ final class AppState {
     private(set) var imapAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "imapAccounts") ?? []).map(AppState.imapAccount)
     private(set) var protonAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "protonAccounts") ?? []).map(AppState.protonAccount)
     private(set) var protonLabels: [String: [ProtonLabel]] = [:]
-    var selectedProtonLabel: String? = nil
+    /// Changing the Proton folder or label cancels the in-flight list translation.
+    var selectedProtonLabel: String? = nil {
+        didSet { if oldValue != selectedProtonLabel { cancelListTranslation() } }
+    }
     /// Mailboxes switched off in 邮箱管理: still pulled and kept by the engine, just not shown in the window or the panel.
     var hiddenAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenAccounts") ?? []) {
         didSet { UserDefaults.standard.set(Array(hiddenAccounts).sorted(), forKey: "hiddenAccounts") }
@@ -799,7 +802,8 @@ final class AppState {
                 translator: session.makeTranslator(configuration),
                 confirm: { sending, skipped in
                     await self.askListTranslation(sending: sending, skipped: skipped)
-                })
+                },
+                isCurrent: { self.listTranslationGeneration == generation })
             guard !Task.isCancelled, self.listTranslationGeneration == generation else { return }
             self.applyListTranslation(outcome)
         }

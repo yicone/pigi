@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 // Stand-ins compiled instead of the app's mail cache and the real keychain.
@@ -109,7 +110,7 @@ private let fixtureMails: [Mail] = (0..<24).map { index in
 struct ListTranslationWindowRegression {
     static func main() {
         let evidence = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 50) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 90) {
             fputs("FAIL: list translation window harness timed out\n", stderr)
             _exit(124)
         }
@@ -153,6 +154,7 @@ struct ListTranslationWindowRegression {
         try await cache.put(CachedTranslation(subject: "已缓存主题", body: "已缓存摘要"),
                             for: try await cache.begin(seededKey), validated: true)
 
+        let indexEngine = try await seedOriginalMailIndex()
         let state = AppState()
         state.listTranslationSession = ListTranslationSession(
             credentialConfigured: { true },
@@ -192,6 +194,38 @@ struct ListTranslationWindowRegression {
         save(window, evidence.appendingPathComponent("03-after-cancel.png"))
         print("PASS: confirmation cancel performed zero requests")
 
+        try await pinExactEdge(window: window, host: host, frames: frames, id: "mail-4")
+        let edge = sampleViewport(frames)
+        guard edge.touching.contains("mail-4"), !edge.visible.contains("mail-4") else {
+            fail("mail-4 was not a stable edge; height=\(edge.height) frames=\(edge.frames)")
+        }
+        let callsBeforeEdge = translator.calls.count
+        try await press(window, identifier: "mail.list.translation")
+        try await Task.sleep(for: .milliseconds(300))
+        guard translator.calls.count == callsBeforeEdge, state.listTranslationPrompt == nil, !state.listTranslationBusy else {
+            fail("exact edge mail-4 caused confirmation or request")
+        }
+        NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: UserDefaults.standard)
+        try await Task.sleep(for: .milliseconds(250))
+        host.layoutSubtreeIfNeeded()
+        let edgeAfterPreference = sampleViewport(frames)
+        if !edgeAfterPreference.touching.contains("mail-4") || edgeAfterPreference.visible.contains("mail-4") {
+            try await pinExactEdge(window: window, host: host, frames: frames, id: "mail-4")
+        }
+        try await press(window, identifier: "mail.list.translation")
+        try await Task.sleep(for: .milliseconds(300))
+        guard translator.calls.count == callsBeforeEdge, state.listTranslationPrompt == nil, !state.listTranslationBusy else {
+            fail("exact edge mail-4 caused confirmation or request after preference refresh")
+        }
+        let settled = sampleViewport(frames)
+        guard settled.touching.contains("mail-4"), !settled.visible.contains("mail-4") else {
+            fail("mail-4 did not stay on the edge after the second click; height=\(settled.height)")
+        }
+        let edgeRow = edge.frames.first(where: { $0.id == "mail-4" })
+        save(window, evidence.appendingPathComponent("09-exact-edge.png"))
+        print("PASS: exact edge stayed excluded across two clicks; mail-4 minY=\(edgeRow?.minY ?? -1) viewport=\(edge.height)")
+
+        try await fitViewport(window: window, host: host, frames: frames)
         let viewport = try requireViewport(frames)
         try await press(window, identifier: "mail.list.translation")
         try await wait("second confirmation did not appear") { buttonExists(window, title: "发送并翻译") }
@@ -324,6 +358,12 @@ struct ListTranslationWindowRegression {
         guard state.mails.first(where: { $0.id == "mail-2" })?.subject == "Proton 02" else { fail("proton folder change replaced the stored subject") }
         print("PASS: Proton folder change dropped the in-flight result without cache or display")
 
+        guard state.listTranslations.values.contains(where: { $0.subject.hasPrefix("译:") || $0.snippet.hasPrefix("译:") }) else {
+            fail("list translation never produced a display translation to compare")
+        }
+        let readback = try await proveOriginalReadback(engine: indexEngine, evidence: evidence)
+        print("PASS: persistent index and agent.sock returned originals; searchHits=\(readback.searchHits) socketSubject=\(readback.socketSubject)")
+
         guard Keychain.translationAPIKeyReads == 0, Keychain.getCount == 0 else {
             fail("keychain reads=\(Keychain.getCount) translationReads=\(Keychain.translationAPIKeyReads)")
         }
@@ -338,6 +378,8 @@ struct ListTranslationWindowRegression {
             outsideIDs: viewport.outside,
             edgeTouchIDs: viewport.touching,
             notes: [
+                "Exact edge exclusion was clicked twice, including after a preference refresh.",
+                "Persistent FTS and agent.sock readback is in original-readback.json.",
                 "Proton folder changes during confirmation and during a request are asserted above.",
                 "Exact boundary touch without overlap is asserted in ListBatchTranslationTests.",
                 viewport.touching.isEmpty ? "This layout produced no exact edge-touch frame." : "Edge-touch frames were excluded from the request.",
@@ -366,6 +408,158 @@ private struct ViewportSample {
     var touching: [String]
 }
 
+private struct OriginalReadback {
+    var searchHits: Int
+    var socketSubject: String
+}
+
+private let indexSubject = "Index Subject Original"
+private let indexSnippet = "Index snippet original"
+private let indexBody = "Index body original stays unread"
+private let indexID = "index-original"
+
+@MainActor
+private func seedOriginalMailIndex() async throws -> LocalEngine {
+    let engine = LocalEngine()
+    let store = try await engine.db()
+    try store.run("INSERT INTO accounts(email,kind) VALUES(?,'imap')", [.text(allowed)])
+    try await engine.save(LocalEngine.Draft(
+        account: allowed, id: indexID, threadID: nil, date: 1_700_000_000_000,
+        subject: indexSubject, name: "Index Sender", address: "sender@example.invalid",
+        to: allowed, snippet: indexSnippet, labels: ["INBOX"], attachments: [],
+        size: indexBody.utf8.count, html: "", text: indexBody, headers: [:]))
+    let found = try await engine.search("Index", account: allowed)
+    guard found.contains(where: { $0.id == indexID && $0.subject == indexSubject && $0.snippet == indexSnippet }) else {
+        fail("persistent index did not store the original subject")
+    }
+    return engine
+}
+
+@MainActor
+private func proveOriginalReadback(engine: LocalEngine, evidence: URL) async throws -> OriginalReadback {
+    let found = try await engine.search("Index", account: allowed)
+    guard found.contains(where: { $0.id == indexID && $0.subject == indexSubject && $0.snippet == indexSnippet }) else {
+        fail("persistent index lost the original after list translation")
+    }
+    guard !found.contains(where: { ($0.subject ?? "").contains("译:") || ($0.snippet ?? "").contains("译:") }) else {
+        fail("persistent index returned a list translation")
+    }
+    let translated = try await engine.search("译:Allowed", account: allowed)
+    guard translated.isEmpty else { fail("persistent index matched a displayed translation") }
+    let stored = try await engine.body(account: allowed, id: indexID)
+    guard stored.text == indexBody else { fail("FTS body changed to \(stored.text)") }
+
+    let directory = try AppSupport.pigiDirectory()
+    let socket = directory.appendingPathComponent("agent.sock")
+    let server = AgentSocketServer(engine: engine, url: socket)
+    try server.start()
+    defer { server.stop() }
+    let listed = try agentExchange(socket.path, method: "list", params: ["account": allowed])
+    guard listed.result?.items?.contains(where: { $0.messageID == indexID && $0.subject == indexSubject && $0.snippet == indexSnippet }) == true else {
+        fail("agent.sock list did not return the original subject and snippet")
+    }
+    guard listed.result?.items?.contains(where: { ($0.subject ?? "").contains("译:") || ($0.snippet ?? "").contains("译:") }) != true else {
+        fail("agent.sock list returned a translation")
+    }
+    let searched = try agentExchange(socket.path, method: "search", params: ["account": allowed, "query": "Index"])
+    guard searched.result?.items?.contains(where: { $0.messageID == indexID && $0.subject == indexSubject }) == true else {
+        fail("agent.sock search missed the original subject")
+    }
+    let missed = try agentExchange(socket.path, method: "search", params: ["account": allowed, "query": "译:Allowed"])
+    guard missed.result?.items?.isEmpty == true else { fail("agent.sock search returned a displayed translation") }
+    let got = try agentExchange(socket.path, method: "get", params: ["account": allowed, "messageID": indexID])
+    guard got.result?.message?.subject == indexSubject, got.result?.message?.snippet == indexSnippet, got.result?.text == indexBody else {
+        fail("agent.sock get did not return the original")
+    }
+    guard got.result?.contentTrust == "untrusted" else { fail("agent.sock get dropped the untrusted marker") }
+    let record = OriginalReadbackFile(
+        subject: indexSubject, snippet: indexSnippet, body: indexBody,
+        searchCount: found.count, socketSubject: got.result?.message?.subject ?? "",
+        socketText: got.result?.text ?? "")
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(record).write(to: evidence.appendingPathComponent("original-readback.json"))
+    return OriginalReadback(searchHits: found.count, socketSubject: got.result?.message?.subject ?? "")
+}
+
+private struct OriginalReadbackFile: Codable {
+    var subject: String
+    var snippet: String
+    var body: String
+    var searchCount: Int
+    var socketSubject: String
+    var socketText: String
+}
+
+private func agentExchange(_ path: String, method: String, params: [String: String]) throws -> AgentProtocol.Response {
+    var payload = try JSONSerialization.data(withJSONObject: ["version": 1, "id": "readback", "method": method, "params": params])
+    payload.append(10)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw POSIXError(.EIO) }
+    defer { close(fd) }
+    var timeout = timeval(tv_sec: 8, tv_usec: 0)
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout.size(ofValue: timeout)))
+    var noPipe: Int32 = 1
+    _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noPipe, socklen_t(MemoryLayout.size(ofValue: noPipe)))
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+        buffer.copyBytes(from: Array(path.utf8) + [0])
+    }
+    let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    guard connected == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ECONNREFUSED) }
+    try payload.withUnsafeBytes { raw in
+        var sent = 0
+        while sent < payload.count {
+            let n = write(fd, raw.baseAddress!.advanced(by: sent), payload.count - sent)
+            guard n > 0 else { throw POSIXError(.EIO) }
+            sent += n
+        }
+    }
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 8192)
+    while true {
+        let n = read(fd, &buffer, buffer.count)
+        guard n > 0 else { throw POSIXError(.EIO) }
+        result.append(contentsOf: buffer[..<n])
+        if result.last == 10 { break }
+    }
+    return try JSONDecoder().decode(AgentProtocol.Response.self, from: result)
+}
+
+@MainActor
+private func pinExactEdge(window: NSWindow, host: NSView, frames: FrameBox, id: String) async throws {
+    var contentHeight = window.contentRect(forFrameRect: window.frame).height
+    for _ in 0..<24 {
+        window.setContentSize(NSSize(width: 1080, height: contentHeight))
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(60))
+        let sample = sampleViewport(frames)
+        guard let row = sample.frames.first(where: { $0.id == id }) else {
+            fail("\(id) was not laid out; frames=\(sample.frames.map(\.id))")
+        }
+        let delta = row.minY - sample.height
+        if sample.touching.contains(id), !sample.visible.contains(id) {
+            var held = 0
+            for _ in 0..<4 {
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(50))
+                let next = sampleViewport(frames)
+                if next.touching.contains(id), !next.visible.contains(id) { held += 1 } else { held = 0 }
+            }
+            if held == 4 { return }
+        }
+        contentHeight += abs(delta) < 0.5 ? (delta >= 0 ? 1 : -1) : delta
+        if contentHeight < 220 || contentHeight > 900 {
+            fail("could not place \(id) on the viewport edge; height=\(contentHeight) delta=\(delta) viewport=\(sample.height) minY=\(row.minY)")
+        }
+    }
+    fail("exact edge did not stay put")
+}
+
 @MainActor
 private func fitViewport(window: NSWindow, host: NSView, frames: FrameBox) async throws {
     var height = 460.0
@@ -389,7 +583,9 @@ private func sampleViewport(_ frames: FrameBox) -> ViewportSample {
     let visible = ListViewport.visibleIDs(frames.frames, viewportMinY: 0, viewportMaxY: height)
     let partial = frames.frames.filter { ($0.minY < 0 && $0.maxY > 0) || ($0.minY < height && $0.maxY > height) }.map(\.id)
     let outside = frames.frames.filter { $0.maxY <= 0 || $0.minY >= height }.map(\.id)
-    let touching = frames.frames.filter { $0.maxY == 0 || $0.minY == height }.map(\.id)
+    let touching = frames.frames.filter {
+        ListViewport.touchesViewportBoundary($0, viewportMinY: 0, viewportMaxY: height)
+    }.map(\.id)
     return ViewportSample(frames: frames.frames, height: height, visible: visible, partial: partial, outside: outside, touching: touching)
 }
 

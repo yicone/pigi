@@ -24,6 +24,22 @@ final class ListBatchTranslationTests: XCTestCase {
         XCTAssertFalse(selected.contains { $0.id == "below" || $0.id == "filtered-out" || $0.id == "partial-bottom" })
     }
 
+    func testViewportEdgeStaysExcludedAcrossSubpixelJitter() {
+        let viewportMax = 329.0
+        for minY in [328.6, 328.8, 329.0, 329.2, 329.4] {
+            let frame = ListRowFrame(id: "edge", minY: minY, maxY: minY + 48)
+            XCTAssertFalse(ListViewport.overlapsViewport(frame, viewportMinY: 0, viewportMaxY: viewportMax), "\(minY) overlapped")
+            XCTAssertTrue(ListViewport.touchesViewportBoundary(frame, viewportMinY: 0, viewportMaxY: viewportMax), "\(minY) was not an edge")
+            XCTAssertFalse(ListViewport.visibleIDs([frame], viewportMinY: 0, viewportMaxY: viewportMax).contains("edge"))
+        }
+        let overlap = ListRowFrame(id: "partial", minY: 328.4, maxY: 376)
+        XCTAssertTrue(ListViewport.overlapsViewport(overlap, viewportMinY: 0, viewportMaxY: viewportMax))
+        XCTAssertEqual(ListViewport.visibleIDs([overlap], viewportMinY: 0, viewportMaxY: viewportMax), ["partial"])
+        let above = ListRowFrame(id: "above", minY: -40.2, maxY: 0.4)
+        XCTAssertFalse(ListViewport.visibleIDs([above], viewportMinY: 0, viewportMaxY: viewportMax).contains("above"))
+        XCTAssertTrue(ListViewport.touchesViewportBoundary(above, viewportMinY: 0, viewportMaxY: viewportMax))
+    }
+
     func testMixedAccountsSkipDisabledRows() async {
         let allowed = row("visible", account: "allowed@example.invalid", subject: "Quarterly report", snippet: "Please review the attached document.")
         let disabled = row("hidden", account: "disabled@example.invalid", subject: "Hidden roadmap", snippet: "Do not send this row.")

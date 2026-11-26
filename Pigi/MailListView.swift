@@ -5,8 +5,8 @@ import PigiCore
 
 struct MailListView: View {
     @Environment(AppState.self) private var state
-    @State private var rowFrames: [ListRowFrame] = []
-    @State private var viewportHeight: CGFloat = 0
+    /// One layout pass reports row frames and the viewport height together.
+    @State private var layout = ListLayoutSample()
     private static let listSpace = "mailList"
 
     var body: some View {
@@ -65,16 +65,10 @@ struct MailListView: View {
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             state.refreshListTranslationAvailability()
         }
-        .onPreferenceChange(ListRowFramesKey.self) { frames in
-            rowFrames = frames
+        .onPreferenceChange(ListLayoutKey.self) { sample in
+            layout = sample
             #if PIGI_REGRESSION
-            state.listViewportObserver?(frames, viewportHeight)
-            #endif
-        }
-        .onPreferenceChange(ListViewportHeightKey.self) { height in
-            viewportHeight = height
-            #if PIGI_REGRESSION
-            state.listViewportObserver?(rowFrames, height)
+            state.listViewportObserver?(sample.frames, sample.height)
             #endif
         }
         .background {
@@ -137,7 +131,7 @@ struct MailListView: View {
                     if state.listTranslationBusy {
                         state.cancelListTranslation()
                     } else {
-                        state.translateVisibleList(frames: rowFrames, viewportHeight: viewportHeight)
+                        state.translateVisibleList(frames: layout.frames, viewportHeight: layout.height)
                     }
                 }
                 .font(.system(size: 12))
@@ -157,30 +151,29 @@ struct MailListView: View {
     private func listRowFrame(_ id: String) -> some View {
         GeometryReader { proxy in
             let frame = proxy.frame(in: .named(Self.listSpace))
-            Color.clear.preference(key: ListRowFramesKey.self, value: [
-                ListRowFrame(id: id, minY: frame.minY, maxY: frame.maxY)
-            ])
+            Color.clear.preference(key: ListLayoutKey.self, value: ListLayoutSample(
+                frames: [ListRowFrame(id: id, minY: frame.minY, maxY: frame.maxY)], height: 0))
         }
     }
 
     private var listViewportHeight: some View {
         GeometryReader { proxy in
-            Color.clear.preference(key: ListViewportHeightKey.self, value: proxy.size.height)
+            Color.clear.preference(key: ListLayoutKey.self, value: ListLayoutSample(frames: [], height: proxy.size.height))
         }
     }
 }
 
-private struct ListRowFramesKey: PreferenceKey {
-    static var defaultValue: [ListRowFrame] = []
-    static func reduce(value: inout [ListRowFrame], nextValue: () -> [ListRowFrame]) {
-        value.append(contentsOf: nextValue())
-    }
+struct ListLayoutSample: Equatable {
+    var frames: [ListRowFrame] = []
+    var height: CGFloat = 0
 }
 
-private struct ListViewportHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+private struct ListLayoutKey: PreferenceKey {
+    static var defaultValue = ListLayoutSample()
+    static func reduce(value: inout ListLayoutSample, nextValue: () -> ListLayoutSample) {
+        let next = nextValue()
+        value.frames.append(contentsOf: next.frames)
+        if next.height > 0 { value.height = next.height }
     }
 }
 

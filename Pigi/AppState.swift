@@ -758,7 +758,8 @@ final class AppState {
     }
 
     func refreshListTranslationAvailability() {
-        listTranslationAvailable = TranslationConfigStore().load().enabled
+        let enabled = TranslationConfigStore().load().enabled
+        if listTranslationAvailable != enabled { listTranslationAvailable = enabled }
     }
 
     /// Starts from the list button only. Opening the list or scrolling does not call this.

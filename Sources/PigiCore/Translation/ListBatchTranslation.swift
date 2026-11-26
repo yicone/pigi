@@ -29,13 +29,35 @@ public struct ListRowFrame: Sendable, Equatable, Identifiable {
 }
 
 public enum ListViewport {
+    /// Whole points. Layout reports fractions of a point that change between passes
+    /// without the row visually crossing the edge.
+    public static func layoutPoint(_ value: Double) -> Double { value.rounded() }
+
     /// A row is visible when its span overlaps the viewport, including a partial edge.
     /// A row that only touches the boundary, or sits fully outside, is not visible.
+    public static func overlapsViewport(_ frame: ListRowFrame, viewportMinY: Double, viewportMaxY: Double) -> Bool {
+        let minY = layoutPoint(frame.minY)
+        let maxY = layoutPoint(frame.maxY)
+        let top = layoutPoint(viewportMinY)
+        let bottom = layoutPoint(viewportMaxY)
+        return maxY > minY && minY < bottom && maxY > top
+    }
+
+    /// True when a rounded edge lies on the viewport boundary and the row does not overlap it.
+    public static func touchesViewportBoundary(_ frame: ListRowFrame, viewportMinY: Double, viewportMaxY: Double) -> Bool {
+        let minY = layoutPoint(frame.minY)
+        let maxY = layoutPoint(frame.maxY)
+        let top = layoutPoint(viewportMinY)
+        let bottom = layoutPoint(viewportMaxY)
+        guard maxY > minY else { return false }
+        return minY == bottom || maxY == top
+    }
+
     public static func visibleIDs(_ frames: [ListRowFrame], viewportMinY: Double, viewportMaxY: Double) -> [String] {
-        guard viewportMaxY > viewportMinY else { return [] }
+        guard layoutPoint(viewportMaxY) > layoutPoint(viewportMinY) else { return [] }
         var seen = Set<String>()
         return frames
-            .filter { $0.maxY > $0.minY && $0.minY < viewportMaxY && $0.maxY > viewportMinY }
+            .filter { overlapsViewport($0, viewportMinY: viewportMinY, viewportMaxY: viewportMaxY) }
             .sorted { lhs, rhs in
                 if lhs.minY != rhs.minY { return lhs.minY < rhs.minY }
                 return lhs.id < rhs.id

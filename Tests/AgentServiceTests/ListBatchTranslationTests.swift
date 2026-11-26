@@ -24,20 +24,41 @@ final class ListBatchTranslationTests: XCTestCase {
         XCTAssertFalse(selected.contains { $0.id == "below" || $0.id == "filtered-out" || $0.id == "partial-bottom" })
     }
 
-    func testViewportEdgeStaysExcludedAcrossSubpixelJitter() {
-        let viewportMax = 329.0
-        for minY in [328.6, 328.8, 329.0, 329.2, 329.4] {
-            let frame = ListRowFrame(id: "edge", minY: minY, maxY: minY + 48)
-            XCTAssertFalse(ListViewport.overlapsViewport(frame, viewportMinY: 0, viewportMaxY: viewportMax), "\(minY) overlapped")
-            XCTAssertTrue(ListViewport.touchesViewportBoundary(frame, viewportMinY: 0, viewportMaxY: viewportMax), "\(minY) was not an edge")
-            XCTAssertFalse(ListViewport.visibleIDs([frame], viewportMinY: 0, viewportMaxY: viewportMax).contains("edge"))
+    func testStrictIntersectionIncludesPartialRowsAndDropsExactEdges() {
+        let top = 0.0
+        let bottom = 329.0
+        let rowHeight = 71.0
+        for minY in [328.6, 328.9] {
+            let frame = ListRowFrame(id: "partial", minY: minY, maxY: minY + rowHeight)
+            XCTAssertTrue(ListViewport.overlapsViewport(frame, viewportMinY: top, viewportMaxY: bottom), "\(minY) was excluded")
+            XCTAssertFalse(ListViewport.touchesViewportBoundary(frame, viewportMinY: top, viewportMaxY: bottom), "\(minY) was treated as a mere edge")
+            XCTAssertEqual(ListViewport.visibleIDs([frame], viewportMinY: top, viewportMaxY: bottom), ["partial"])
         }
-        let overlap = ListRowFrame(id: "partial", minY: 328.4, maxY: 376)
-        XCTAssertTrue(ListViewport.overlapsViewport(overlap, viewportMinY: 0, viewportMaxY: viewportMax))
-        XCTAssertEqual(ListViewport.visibleIDs([overlap], viewportMinY: 0, viewportMaxY: viewportMax), ["partial"])
-        let above = ListRowFrame(id: "above", minY: -40.2, maxY: 0.4)
-        XCTAssertFalse(ListViewport.visibleIDs([above], viewportMinY: 0, viewportMaxY: viewportMax).contains("above"))
-        XCTAssertTrue(ListViewport.touchesViewportBoundary(above, viewportMinY: 0, viewportMaxY: viewportMax))
+        let edge = ListRowFrame(id: "edge", minY: bottom, maxY: bottom + rowHeight)
+        for _ in 0..<2 {
+            XCTAssertFalse(ListViewport.overlapsViewport(edge, viewportMinY: top, viewportMaxY: bottom))
+            XCTAssertTrue(ListViewport.touchesViewportBoundary(edge, viewportMinY: top, viewportMaxY: bottom))
+            XCTAssertFalse(ListViewport.visibleIDs([edge], viewportMinY: top, viewportMaxY: bottom).contains("edge"))
+        }
+        let below = ListRowFrame(id: "below", minY: 329.1, maxY: 329.1 + rowHeight)
+        XCTAssertFalse(ListViewport.overlapsViewport(below, viewportMinY: top, viewportMaxY: bottom))
+        XCTAssertFalse(ListViewport.touchesViewportBoundary(below, viewportMinY: top, viewportMaxY: bottom))
+
+        for overlap in [0.4, 0.1] {
+            let frame = ListRowFrame(id: "top-partial", minY: overlap - rowHeight, maxY: overlap)
+            XCTAssertTrue(ListViewport.overlapsViewport(frame, viewportMinY: top, viewportMaxY: bottom), "top overlap \(overlap) was excluded")
+            XCTAssertFalse(ListViewport.touchesViewportBoundary(frame, viewportMinY: top, viewportMaxY: bottom))
+            XCTAssertEqual(ListViewport.visibleIDs([frame], viewportMinY: top, viewportMaxY: bottom), ["top-partial"])
+        }
+        let topEdge = ListRowFrame(id: "top-edge", minY: -rowHeight, maxY: top)
+        for _ in 0..<2 {
+            XCTAssertFalse(ListViewport.overlapsViewport(topEdge, viewportMinY: top, viewportMaxY: bottom))
+            XCTAssertTrue(ListViewport.touchesViewportBoundary(topEdge, viewportMinY: top, viewportMaxY: bottom))
+            XCTAssertFalse(ListViewport.visibleIDs([topEdge], viewportMinY: top, viewportMaxY: bottom).contains("top-edge"))
+        }
+        let above = ListRowFrame(id: "above", minY: -rowHeight - 0.1, maxY: -0.1)
+        XCTAssertFalse(ListViewport.visibleIDs([above], viewportMinY: top, viewportMaxY: bottom).contains("above"))
+        XCTAssertFalse(ListViewport.touchesViewportBoundary(above, viewportMinY: top, viewportMaxY: bottom))
     }
 
     func testMixedAccountsSkipDisabledRows() async {

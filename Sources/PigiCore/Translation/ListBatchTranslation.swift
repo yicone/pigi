@@ -29,32 +29,21 @@ public struct ListRowFrame: Sendable, Equatable, Identifiable {
 }
 
 public enum ListViewport {
-    /// Whole points. Layout reports fractions of a point that change between passes
-    /// without the row visually crossing the edge.
-    public static func layoutPoint(_ value: Double) -> Double { value.rounded() }
-
-    /// A row is visible when its span overlaps the viewport, including a partial edge.
+    /// A row is visible when its original point span overlaps the viewport, including a partial edge.
     /// A row that only touches the boundary, or sits fully outside, is not visible.
     public static func overlapsViewport(_ frame: ListRowFrame, viewportMinY: Double, viewportMaxY: Double) -> Bool {
-        let minY = layoutPoint(frame.minY)
-        let maxY = layoutPoint(frame.maxY)
-        let top = layoutPoint(viewportMinY)
-        let bottom = layoutPoint(viewportMaxY)
-        return maxY > minY && minY < bottom && maxY > top
+        frame.maxY > frame.minY && frame.minY < viewportMaxY && frame.maxY > viewportMinY
     }
 
-    /// True when a rounded edge lies on the viewport boundary and the row does not overlap it.
+    /// True when an edge lies on the viewport boundary and the row does not overlap it.
     public static func touchesViewportBoundary(_ frame: ListRowFrame, viewportMinY: Double, viewportMaxY: Double) -> Bool {
-        let minY = layoutPoint(frame.minY)
-        let maxY = layoutPoint(frame.maxY)
-        let top = layoutPoint(viewportMinY)
-        let bottom = layoutPoint(viewportMaxY)
-        guard maxY > minY else { return false }
-        return minY == bottom || maxY == top
+        guard frame.maxY > frame.minY, viewportMaxY > viewportMinY else { return false }
+        let touches = frame.minY == viewportMaxY || frame.maxY == viewportMinY
+        return touches && !overlapsViewport(frame, viewportMinY: viewportMinY, viewportMaxY: viewportMaxY)
     }
 
     public static func visibleIDs(_ frames: [ListRowFrame], viewportMinY: Double, viewportMaxY: Double) -> [String] {
-        guard layoutPoint(viewportMaxY) > layoutPoint(viewportMinY) else { return [] }
+        guard viewportMaxY > viewportMinY else { return [] }
         var seen = Set<String>()
         return frames
             .filter { overlapsViewport($0, viewportMinY: viewportMinY, viewportMaxY: viewportMaxY) }

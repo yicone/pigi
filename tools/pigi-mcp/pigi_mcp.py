@@ -66,11 +66,15 @@ def tool_result(value, error=False):
 
 
 class MCPServer:
-    def __init__(self, client, audit, account=None):
+    def __init__(self, client, audit, account=None, enable_codes=False):
         self.client, self.audit = client, audit
         self.account = account
         # Remote account discovery is scoped by the App, never an unscoped enumeration.
-        self.tools = [s for s in TOOLS if s["name"] in {"list_accounts", "search", "list_messages", "get_message"}] if account else TOOLS
+        # A pinned account keeps verification codes hidden unless the caller opts in.
+        pinned = {"list_accounts", "search", "list_messages", "get_message"}
+        if enable_codes:
+            pinned.add("get_verification_code")
+        self.tools = [s for s in TOOLS if s["name"] in pinned] if account else TOOLS
         self.state = "new"
 
     def call_tool(self, params):
@@ -190,6 +194,8 @@ def main():
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--audit-db", default=DEFAULT_AUDIT)
     parser.add_argument("--account", help="Restrict discovery and list/search/get to this exact account.")
+    parser.add_argument("--enable-codes", action="store_true",
+                        help="With --account, also expose get_verification_code for that account.")
     args = parser.parse_args()
     if args.account is not None and (not args.account.strip() or len(args.account.encode("utf-8")) > 1024):
         parser.error("Invalid account scope.")
@@ -199,7 +205,7 @@ def main():
     audit = None
     try:
         audit = Audit(args.audit_db)
-        serve(MCPServer(SocketClient(args.socket), audit, args.account), sys.stdin.buffer, sys.stdout.buffer)
+        serve(MCPServer(SocketClient(args.socket), audit, args.account, args.enable_codes), sys.stdin.buffer, sys.stdout.buffer)
         return 0
     except (OSError, sqlite3.Error):
         print("pigi-mcp: transport or audit unavailable.", file=sys.stderr)

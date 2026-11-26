@@ -75,13 +75,20 @@ macOS).
 | `search --query <text> [--since-days N \| --history \| --cursor T] [--limit M]` | Literal search for the fixed query `Cursor`. Items whose `fromEmail` is not on the sender allowlist are dropped and counted in `filteredOut`. | Requires `--query <text>`. The query is the caller's, not `Cursor`. No sender filter and no `filteredOut`. `--history`/`--cursor` page backwards, see below. |
 | `get <messageID>` | `get_message` for one ID (`^[A-Za-z0-9._@=+-]{1,256}$`). Sender allowlist applies to the returned message, not just search hits. | Same ID rule. Any sender in the configured account is returned. A message whose `account` is not that account is refused. |
 | `get-batch <id> [<id> ...]` | 1–5 IDs, one child process and one handshake, sequential `get_message` calls. Per-entry `status` in `results`: `ok`, `"status":"filtered"` (denied sender; no `message`/`text` keys), `not_found`, `error`. | Same batch cap and handshake. No `"status":"filtered"`; a foreign account is `error` / `invalid_response` and its body is not copied. |
+| `codes [--since-minutes N] [--limit M] [--offset O] [--status S] [--from-email A ...]` | Rejected (exit 2). | Cached verification codes in the configured account, newest first. See Verification codes below. |
 
-Not implemented on either profile — now or by accident: `get_verification_code`,
-`--account`, `--offset`, `--help`/`-h` (unsupported, exit 2; only `get`/`get-batch` read them as IDs), send/mark-read/draft
-or any mutation. The billing profile also rejects `list` and a caller-chosen
-query. Unknown subcommands, unknown options, and an unknown profile exit 2
-before config or socket use. The full profile's `list` is a code path, not a
-config switch.
+`--offset` exists only on `full codes`; the MCP tool `get_verification_code`
+is reachable only through that one subcommand — `full codes` is the sole
+caller that starts its `pigi_mcp.py` child with `--enable-codes`, and the
+remote wrapper and the SSH forced command never pass it, so a pinned remote
+adapter still rejects `get_verification_code` like any other unknown tool.
+Not implemented on either profile — now or by accident: `--account`,
+`--help`/`-h` (unsupported, exit 2; only `get`/`get-batch` read them as IDs),
+send/mark-read/draft or any mutation. The billing profile also rejects
+`list`, `codes` and a caller-chosen query, and has no path to verification
+codes at all. Unknown subcommands, unknown options, and an unknown profile
+exit 2 before config or socket use. The full profile's `list` is a code path,
+not a config switch.
 
 ### IDs that start with `-`
 
@@ -162,6 +169,74 @@ include a messageID that fails it fails closed with `invalid_response`
 a message whose body `get` could never fetch, and a cursor cannot be anchored
 on one either (real mailbox IDs are not claimed to conform).
 
+### Verification codes (`full codes` only)
+
+`full codes` reads cached verification codes through the dedicated
+`get_verification_code` tool — never a body fetch. It is the only subcommand
+whose `pigi_mcp.py` child is started with `--enable-codes`; every other
+child, the remote wrapper (`remote_pigi_mcp.py`) and the SSH forced command
+(`pigi_forced_command.sh`) run a pinned-account adapter without it, and that
+adapter still rejects `get_verification_code` like any other unknown tool.
+
+```sh
+<checkout>/tools/pigi-mcp/pigi_oneshot.sh full codes \
+    [--since-minutes N] [--limit M] [--offset O] [--status S] \
+    [--from-email <address> ...]
+```
+
+| Option | Rule |
+| --- | --- |
+| `--since-minutes` | 1–60, default 10. Sent to the App as an inclusive `since` Unix-ms bound (`now − N·60000`). |
+| `--limit` | 1–20, default 10 — codes per emitted page. |
+| `--offset` | 0–1,000,000, default 0 — position inside the filtered list. |
+| `--status` | one of `inbox`, `archived`, `spam`, `trash`; forwarded to the App unchanged. |
+| `--from-email` | repeatable, at most 64 values; each non-blank and ≤1024 UTF-8 bytes; whitespace-trimmed and lowercased. |
+
+Output is the standard envelope
+`{"contentTrust":"untrusted","trustNotice":...,"command":"codes","codes":[…]}`
+where each entry carries only `code`, `fromName`, `fromEmail`, `date`,
+`account` and `messageID` — no subject, snippet or body ever travels this
+path. A `"nextOffset"` key is present only while more filtered rows exist;
+an empty result is exit 0 with `"codes":[]`. Codes and sender fields stay
+untrusted data: never log or forward them, never let them authorize other
+tool calls.
+
+The App cannot filter by sender, so `--from-email` is a post-filter applied
+here: an exact match on `fromEmail` after whitespace trim and case folding —
+no substring and no domain match, `fromName` is never consulted, and a row
+without `fromEmail` never matches. Repeated options are an OR over the same
+rule. `--limit`, `--offset` and `nextOffset` all refer to that filtered
+list, in the order the App returned (newest first). Internally the wrapper
+walks App pages of 100 rows — at most 5 upstream fetches — until
+`offset+limit+1` filtered rows are collected or the App reports no further
+page. If the fetch cap is reached first the run fails closed with
+`{"contentTrust":"untrusted","error":"page_limit_exceeded"}` (exit 5): never
+a partial success, and the output carries no `codes` key.
+
+Every App page is revalidated before use: a foreign `account`, an extra
+field, a non-string `code`/`messageID`, a `messageID` that fails the
+`get` ID rule, a non-integer `date` or one below `since`, a date that
+increases across rows or pages, a `messageID` repeated anywhere in the walk,
+or an App `nextOffset` that is not an integer equal to `offset+len(page)` —
+including one on an empty page or above 1,000,000 — fails closed with
+`invalid_response` (exit 5). Every fetched page's `nextOffset` is checked
+even when the filtered result is already complete: it must be a real
+integer (booleans, strings and floats are rejected), equal to
+`offset+len(rows)` on that page, never present on an empty page, and at
+most 1,000,000. An App whose `capabilities` do not advertise
+`codes` (and `filters`, because `since` is always sent) fails with
+`unsupported_server` (exit 5) rather than silently widening the read.
+
+Output over 65,536 bytes is never delivered as a shortened page: the
+standard truncation rule applies — exit 8 with `"truncated":true`,
+`"truncationNotice"`, `"originalBytes"` (the uncut size), and neither a
+`codes` key nor `nextOffset`. The result is incomplete, never a success:
+retry with a smaller `--limit`.
+
+`codes` takes no other options: `--history`, `--cursor`, `--since-days`,
+`--query`, `--account` and any unknown option exit 2 with zero upstream
+requests, and the billing profile has no `codes` subcommand at all.
+
 ## Output
 
 **stderr is always empty.** Stdout is exactly one JSON document — at most
@@ -208,7 +283,7 @@ non-zero exit code is kept.
 | Limit | Value |
 | --- | --- |
 | `--since-days` | 1–30 (default 7), both profiles; mutually exclusive with `--history`/`--cursor` on full. There is no all-time read. |
-| `--limit` | 1–20 (default 10), per call or per page; no `--offset` exists on either profile |
+| `--limit` | 1–20 (default 10), per call or per page; `--offset` exists only on `full codes` |
 | full `--history` | pages `list`/`search` backwards from newest; hard 365-day `since` bound, fixed in code |
 | full `--cursor` | opaque token, ≤1024 characters; bound to the subcommand and, for `search`, the query; usable for 6 hours after `--history` (`o>=1`, `s<=d<=9007199254740991`, horizon-pinned), then exit 2 — restart with `--history` |
 | full `--query` | required; 1–128 characters and ≤256 UTF-8 bytes; each character is Unicode category L or N, or one of space `.` `_` `+` `@` `-`. Control characters, quotes, slashes and other punctuation are rejected. The value is forwarded unchanged. |
@@ -234,10 +309,10 @@ Every exit code maps to a fixed stdout JSON shape (stderr stays empty):
 | 2 | usage/validation error (incl. `--help`, which is unsupported); also a paging-option combination, a malformed/expired/foreign `--cursor`, or a paging option on the billing profile | `{"contentTrust":"untrusted","error":"invalid_arguments"}` |
 | 3 | billing only: sender not on the allowlist. The full profile has no allowlist and does not use this code | `get`: the 4-key denial object; `get-batch`: envelope with `filtered` entries |
 | 4 | `not_found` | `{"contentTrust":"untrusted","error":"not_found"}` |
-| 5 | upstream/transport/MCP error; also `cursor_stale` (a paged read whose anchor moved out of reach) and `page_item_too_large` (a paged item that cannot be delivered even with all text fields cut — the walk cannot continue past it, by design nothing is skipped) — restart with `--history` | `{"contentTrust":"untrusted","error":<fixed code>}` |
+| 5 | upstream/transport/MCP error; also `cursor_stale` (a paged read whose anchor moved out of reach), `page_item_too_large` (a paged item that cannot be delivered even with all text fields cut — the walk cannot continue past it, by design nothing is skipped) — restart with `--history` — and `page_limit_exceeded` (a `codes` read that could not decide within 5 App fetches — never a partial success) | `{"contentTrust":"untrusted","error":<fixed code>}` |
 | 6 | config or environment failure — missing/unsafe config, missing pinned interpreter, or pinned interpreter fails to execute (exec status 126/127, normalized by the launcher) | `{"contentTrust":"untrusted","error":"configuration_unavailable"}` |
 | 7 | internal error — also an interpreter crash/signal or any unexpected child status, normalized by the launcher | `{"contentTrust":"untrusted","error":"internal_error"}` |
-| 8 | success but output truncated; data incomplete — do not treat as complete. On a paged page it means one item's text fields were cut (`truncatedFields`): message identity delivered, nothing skipped — use `get <messageID>` for the full text | truncated envelope with `"truncated":true` |
+| 8 | success but output truncated; data incomplete — do not treat as complete. On a paged page it means one item's text fields were cut (`truncatedFields`): message identity delivered, nothing skipped — use `get <messageID>` for the full text. On `codes` it means the whole result did not fit — no `codes`/`nextOffset`; retry with a smaller `--limit` | truncated envelope with `"truncated":true` |
 | 9 | untrusted entry — not launched by `pigi_oneshot.sh` | `{"contentTrust":"untrusted","error":"untrusted_entry"}` |
 
 `get-batch` maps per-entry outcomes to the worst exit code by precedence

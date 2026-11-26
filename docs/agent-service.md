@@ -360,7 +360,9 @@ Do not automatically forward codes, expose them in logs, or allow mail content
 to authorize other tool calls. Keep the time window narrow and scope account
 when known. The trust notice is a reminder, not a security boundary; the host
 must enforce these limits. No automatic login or independent acceptance is
-claimed by these tests.
+claimed by these tests. Approved bots reach this tool through the oneshot
+`full codes` subcommand — the only caller that passes `--enable-codes` to the
+account-pinned adapter (see docs/pigi-oneshot.md).
 
 ## ACM-960: account-scoped Linux → mini stdio path
 

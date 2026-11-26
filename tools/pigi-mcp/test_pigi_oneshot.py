@@ -289,6 +289,29 @@ def get_result(message, text):
             "contentTrust": "untrusted", "capabilities": CAPS}
 
 
+CODES_CAPS = CAPS + ["codes"]
+CODE_SENDER = "code-sender@example.org"
+CODE_SENDER2 = "code-other@example.org"
+
+
+def make_code_row(message_id, sender=CODE_SENDER, **fields):
+    """Synthetic App codes row carrying only the six contract fields."""
+    row = {"account": FULL_ACCOUNT, "messageID": message_id, "date": NOW,
+           "code": "000000", "fromName": "Synthetic Sender"}
+    if sender is not None:
+        row["fromEmail"] = sender
+    row.update(fields)
+    return row
+
+
+def codes_result(rows, next_offset=None):
+    result = {"codes": rows, "contentTrust": "untrusted",
+              "capabilities": CODES_CAPS}
+    if next_offset is not None:
+        result["nextOffset"] = next_offset
+    return result
+
+
 class AgentError(Exception):
     def __init__(self, code):
         self.code = code
@@ -1880,6 +1903,453 @@ class OneshotTests(unittest.TestCase):
         self.assertNotIn("get_verification_code",
                          [row[0] for row in self.audit_rows()])
 
+    def test_codes_default_window_envelope_and_fields(self):
+        rows = [make_code_row("c1", CODE_SENDER, code="000001"),
+                make_code_row("c2", CODE_SENDER2, code="000002",
+                              date=NOW - 60_000)]
+        self.table["codes"] = lambda params: codes_result(rows)
+        code, out = self.invoke_full(["codes"])
+        self.assertEqual(code, 0)
+        doc = self.parse(out)
+        self.assertEqual(doc["command"], "codes")
+        self.assertEqual(doc["contentTrust"], "untrusted")
+        self.assertEqual(doc["trustNotice"], TRUST_NOTICE)
+        self.assertEqual(doc["codes"], rows)
+        for item in doc["codes"]:
+            self.assertEqual(set(item), set(pigi_oneshot_full.CODES_FIELDS))
+        self.assertNotIn("nextOffset", doc)
+        # One injected-account upstream call inside the default 10-min window.
+        self.assertEqual(self.agent.requests[-1]["params"],
+                         {"account": FULL_ACCOUNT, "since": NOW - 600_000,
+                          "limit": 100, "offset": 0})
+        self.assertNotIn("status", self.agent.requests[-1]["params"])
+        self.assertEqual(self.audit_rows(),
+                         [("get_verification_code", "ok")])
+        # Keys beyond the six-field contract fail closed, never emitted.
+        for key in ("subject", "snippet", "text", "body"):
+            with self.subTest(key=key):
+                poisoned = dict(rows[0], **{key: "POISON_SENTINEL"})
+                self.table["codes"] = \
+                    lambda params: codes_result([poisoned])
+                code, out = self.invoke_full(["codes"])
+                self.assertEqual(code, 5)
+                self.assertEqual(self.parse(out),
+                                 {"contentTrust": "untrusted",
+                                  "error": "invalid_response"})
+                self.assertNotIn("POISON_SENTINEL", out.decode("utf-8"))
+
+    def test_codes_argument_bounds(self):
+        self.table["codes"] = lambda params: codes_result([])
+        for minutes in (1, 60):
+            code, _ = self.invoke_full(
+                ["codes", "--since-minutes", str(minutes)])
+            self.assertEqual(code, 0)
+            self.assertEqual(self.agent.requests[-1]["params"]["since"],
+                             NOW - minutes * 60_000)
+        for limit in (1, 20):
+            code, _ = self.invoke_full(["codes", "--limit", str(limit)])
+            self.assertEqual(code, 0)
+            # The CLI page size never widens the fixed 100-row App fetch.
+            self.assertEqual(self.agent.requests[-1]["params"]["limit"], 100)
+        for offset in (0, 1_000_000):
+            code, _ = self.invoke_full(["codes", "--offset", str(offset)])
+            self.assertEqual(code, 0)
+            # The filtered-list offset never moves the App window.
+            self.assertEqual(self.agent.requests[-1]["params"]["offset"], 0)
+        for status in pigi_oneshot_full.CODES_STATUSES:
+            code, _ = self.invoke_full(["codes", "--status", status])
+            self.assertEqual(code, 0)
+            self.assertEqual(self.agent.requests[-1]["params"]["status"],
+                             status)
+        requests = len(self.agent.requests)
+        rejected = [
+            ["codes", "--since-minutes", "0"], ["codes", "--since-minutes", "61"],
+            ["codes", "--since-minutes", "1.5"], ["codes", "--since-minutes", "x"],
+            ["codes", "--limit", "0"], ["codes", "--limit", "21"],
+            ["codes", "--limit", "1.5"], ["codes", "--limit", "x"],
+            ["codes", "--offset", "-1"], ["codes", "--offset", "1000001"],
+            ["codes", "--offset", "1.5"], ["codes", "--offset", "x"],
+            ["codes", "--status", "deleted"], ["codes", "--status", "INBOX"],
+            ["codes", "--status", ""], ["codes", "--since", "3"],
+        ]
+        for argv in rejected:
+            with self.subTest(argv=argv):
+                code, out = self.invoke_full(argv)
+                self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        self.assertEqual(len(self.agent.requests), requests)
+
+    def test_codes_empty_result(self):
+        self.table["codes"] = lambda params: codes_result([])
+        code, out = self.invoke_full(["codes"])
+        self.assertEqual(code, 0)
+        doc = self.parse(out)
+        self.assertEqual(doc["codes"], [])
+        self.assertNotIn("nextOffset", doc)
+
+    def test_codes_account_injection_and_foreign_row(self):
+        self.table["codes"] = lambda params: codes_result(
+            [make_code_row("m1")])
+        code, _ = self.invoke_full(["codes"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.agent.requests[-1]["params"]["account"],
+                         FULL_ACCOUNT)
+        self.table["codes"] = lambda params: codes_result(
+            [make_code_row("m1", account=ACCOUNT)])
+        code, out = self.invoke_full(["codes"])
+        self.assertEqual((code, self.parse(out)),
+                         (5, {"contentTrust": "untrusted",
+                              "error": "invalid_response"}))
+        for argv in (["codes", "--account", ACCOUNT],
+                     ["codes", "--account", FULL_ACCOUNT],
+                     ["codes", "--account=" + FULL_ACCOUNT]):
+            with self.subTest(argv=argv):
+                code, out = self.invoke_full(argv)
+                self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        self.assertEqual(len(self.agent.requests), 2)
+
+    def test_codes_rejected_options_and_billing_profile(self):
+        rejected = [
+            ["codes", "--history"], ["codes", "--cursor", "x"],
+            ["codes", "--cursor=x"], ["codes", "--since-days", "3"],
+            ["codes", "--query", "x"], ["codes", "--message-id", "m1"],
+            ["codes", "--no-such-option"], ["codes", "--from-email"],
+            ["codes", "--from-email", ""], ["codes", "--from-email", "   "],
+            ["codes", "--from-email", "x" * 1025],
+            ["codes"] + ["--from-email", "s@example.org"] * 65,
+        ]
+        for argv in rejected:
+            with self.subTest(argv=argv[:4]):
+                code, out = self.invoke_full(argv)
+                self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        self.assertEqual(self.agent.requests, [])
+        # Exactly 64 senders and a non-address token are both inside the rule.
+        self.table["codes"] = lambda params: codes_result([])
+        code, _ = self.invoke_full(
+            ["codes"] + ["--from-email", "s@example.org"] * 64)
+        self.assertEqual(code, 0)
+        code, _ = self.invoke_full(["codes", "--from-email", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.agent.requests), 2)
+        # The billing profile has no codes subcommand at all.
+        code, out = self.invoke(["codes"])
+        self.assertEqual((code, self.parse(out)), (2, USAGE_DOC))
+        for argv in (["codes"], ["billing", "codes"],
+                     ["codes", "--since-minutes", "5"],
+                     ["billing", "codes", "--from-email", CODE_SENDER]):
+            with self.subTest(argv=argv):
+                result = self.cli(argv)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertEqual(len(self.agent.requests), 2)
+
+    def test_codes_capability_missing_fails_closed(self):
+        for caps in (["filters"], ["codes"], [], "codes", None):
+            with self.subTest(caps=caps):
+                result = {"codes": [], "contentTrust": "untrusted"}
+                if caps is not None:
+                    result["capabilities"] = caps
+                self.table["codes"] = lambda params, r=result: r
+                code, out = self.invoke_full(["codes"])
+                self.assertEqual(code, 5)
+                self.assertEqual(self.parse(out),
+                                 {"contentTrust": "untrusted",
+                                  "error": "unsupported_server"})
+                self.assertNotIn("codes", self.parse(out))
+
+    def test_codes_from_email_filter(self):
+        rows = [
+            make_code_row("m1", "alpha@example.org", date=NOW),
+            make_code_row("m2", "beta@example.org", date=NOW - 1000),
+            make_code_row("m3", "ALPHA@EXAMPLE.ORG", date=NOW - 2000),
+            make_code_row("m4", "delta@example.org",
+                          fromName="gamma@example.org",
+                          date=NOW - 3000),
+            make_code_row("m5", None, date=NOW - 4000),
+            make_code_row("m6", "xalpha@example.org", date=NOW - 5000),
+        ]
+        self.table["codes"] = lambda params: codes_result(rows)
+
+        def emitted(out):
+            return [item["messageID"] for item in self.parse(out)["codes"]]
+
+        # Exact match, case-insensitive on both sides, order preserved.
+        for arg in ("alpha@example.org", "ALPHA@EXAMPLE.ORG",
+                    "  alpha@example.org "):
+            code, out = self.invoke_full(["codes", "--from-email", arg])
+            self.assertEqual((code, emitted(out)), (0, ["m1", "m3"]))
+        # Repeated --from-email is an OR over the same rule.
+        code, out = self.invoke_full(
+            ["codes", "--from-email", "alpha@example.org",
+             "--from-email", "beta@example.org"])
+        self.assertEqual((code, emitted(out)), (0, ["m1", "m2", "m3"]))
+        # No substring or domain match anywhere.
+        for arg in ("nobody@example.org", "example.org",
+                    "lpha@example.org", "alpha@example.com",
+                    "alpha2@example.org", "@example.org"):
+            code, out = self.invoke_full(["codes", "--from-email", arg])
+            self.assertEqual((code, emitted(out)), (0, []))
+        # fromName is never a match key, and a row without fromEmail never
+        # matches a filter — but both come back unfiltered.
+        code, out = self.invoke_full(["codes", "--from-email",
+                                      "gamma@example.org"])
+        self.assertEqual((code, emitted(out)), (0, []))
+        code, out = self.invoke_full(["codes"])
+        self.assertEqual((code, emitted(out)),
+                         (0, ["m1", "m2", "m3", "m4", "m5", "m6"]))
+
+    def test_codes_filtered_paging_walks_filtered_list(self):
+        rows, hits = [], []
+        for i in range(250):
+            target = i % 5 == 0
+            rows.append(make_code_row(
+                "m%03d" % i,
+                "target@example.org" if target
+                else "other%d@example.org" % i,
+                date=NOW - i * 2000))
+            if target:
+                hits.append("m%03d" % i)
+        seen = []
+        self.table["codes"] = self.codes_server(rows, seen)
+        argv = ["codes", "--from-email", "target@example.org"]
+        codes, docs, outs = self.codes_walk(argv, 3)
+        self.assertEqual(codes, [0] * len(codes))
+        self.assertEqual(len(docs), 17)  # 50 filtered rows, 3 per page
+        self.assertEqual([item["messageID"] for doc in docs
+                          for item in doc["codes"]], hits)
+        for out in outs:
+            self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        for doc in docs[:-1]:
+            self.assertEqual(len(doc["codes"]), 3)
+        self.assertNotIn("nextOffset", docs[-1])
+        # App paging is 100-row windows; the emitted nextOffset is always
+        # filtered-list-relative and never the App's raw offset.
+        app_offsets = {request["params"]["offset"]
+                       for request in self.agent.requests}
+        self.assertTrue(app_offsets <= {0, 100, 200})
+        self.assertFalse({doc["nextOffset"] for doc in docs[:-1]}
+                         & (app_offsets - {0}))
+        self.assertEqual({s[1] for s in seen}, {100, 200, None})
+        for request in self.agent.requests:
+            self.assertEqual(request["params"]["limit"], 100)
+            self.assertEqual(request["params"]["account"], FULL_ACCOUNT)
+        # An offset past the filtered end is an empty page, not an error.
+        code, out = self.invoke_full(argv + ["--offset", "500"])
+        doc = self.parse(out)
+        self.assertEqual((code, doc["codes"]), (0, []))
+        self.assertNotIn("nextOffset", doc)
+        # Exactly offset+limit matches emits no nextOffset; one more does.
+        code, out = self.invoke_full(argv + ["--offset", "30", "--limit", "20"])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 20))
+        self.assertNotIn("nextOffset", doc)
+        code, out = self.invoke_full(argv + ["--offset", "30", "--limit", "19"])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 19))
+        self.assertEqual(doc["nextOffset"], 49)
+        # Matches that live only on later App pages still assemble fully.
+        late = [make_code_row("p%03d" % i, "other@example.org",
+                              date=NOW - i * 1000) for i in range(100)]
+        late += [make_code_row("q%03d" % i, "target@example.org",
+                               date=NOW - 100_000 - i * 1000)
+                 for i in range(130)]
+        late += [make_code_row("r%03d" % i, "other@example.org",
+                               date=NOW - 300_000 - i * 1000)
+                 for i in range(20)]
+        self.table["codes"] = self.codes_server(late)
+        codes, docs, _ = self.codes_walk(argv, 20)
+        self.assertEqual(codes, [0] * len(codes))
+        self.assertEqual(len(docs), 7)  # 130 filtered rows, 20 per page
+        self.assertEqual([item["messageID"] for doc in docs
+                          for item in doc["codes"]],
+                         ["q%03d" % i for i in range(130)])
+        self.assertNotIn("nextOffset", docs[-1])
+        # With no filter every row matches: the same walk over all 250.
+        self.table["codes"] = self.codes_server(rows)
+        codes, docs, _ = self.codes_walk(["codes"], 20)
+        self.assertEqual(codes, [0] * len(codes))
+        self.assertEqual(len(docs), 13)  # ceil(250/20)
+        self.assertEqual([item["messageID"] for doc in docs
+                          for item in doc["codes"]],
+                         [row["messageID"] for row in rows])
+
+    def test_codes_fetch_cap_is_not_a_partial_success(self):
+        rows = [make_code_row("m%03d" % i, "other@example.org",
+                              date=NOW - i * 500) for i in range(600)]
+        self.table["codes"] = self.codes_server(rows)
+        code, out = self.invoke_full(
+            ["codes", "--from-email", "target@example.org"])
+        self.assertEqual(code, 5)
+        self.assertEqual(self.parse(out),
+                         {"contentTrust": "untrusted",
+                          "error": "page_limit_exceeded"})
+        self.assertNotIn("codes", self.parse(out))
+        self.assertEqual(len(self.agent.requests), 5)
+
+    def test_codes_bad_app_pagination_fails_closed(self):
+        filler = [make_code_row("m%03d" % i, "other@example.org",
+                                date=NOW - i * 1000) for i in range(100)]
+        unmatched = ["codes", "--from-email", "target@example.org"]
+        failure = {"contentTrust": "untrusted", "error": "invalid_response"}
+        bad_pages = {
+            # App nextOffset that does not equal offset+len(rows).
+            "mismatched": lambda params: codes_result(filler, next_offset=50),
+            "non_int": lambda params: codes_result(filler, next_offset="100"),
+            "over_max": lambda params: codes_result(filler,
+                                                    next_offset=2_000_000),
+            "empty_page": lambda params: codes_result([], next_offset=100),
+            # A messageID repeated on a later page fails the whole walk.
+            "duplicate": lambda params: (
+                codes_result(filler, next_offset=100)
+                if params["offset"] == 0
+                else codes_result([filler[0]])),
+            # Dates must never increase, inside a page or across pages.
+            "ascending": lambda params: codes_result(
+                [make_code_row("a", date=NOW - 2000),
+                 make_code_row("b", date=NOW - 1000)]),
+            "rising_page": lambda params: (
+                codes_result(filler, next_offset=100)
+                if params["offset"] == 0
+                else codes_result([make_code_row(
+                    "newer", "other@example.org", date=NOW - 500)])),
+            "stale_row": lambda params: codes_result(
+                [make_code_row("old", date=NOW - 700_000)]),
+            "not_a_list": lambda params: {
+                "codes": {"x": 1}, "contentTrust": "untrusted",
+                "capabilities": CODES_CAPS},
+        }
+        for label, responder in bad_pages.items():
+            with self.subTest(label=label):
+                self.table["codes"] = responder
+                code, out = self.invoke_full(unmatched)
+                self.assertEqual((code, self.parse(out)), (5, failure))
+
+    def test_codes_oversize_page_is_truncated_not_shortened(self):
+        """An oversized codes envelope is truncated, never shortened: exit 8
+        with no codes key; a limit that fits still pages with nextOffset."""
+        rows = [make_code_row("m%02d" % i, CODE_SENDER,
+                              fromName="N" * 4000 + "%02d" % i,
+                              date=NOW - i * 1000) for i in range(20)]
+        self.table["codes"] = self.codes_server(rows)
+        expected = pigi_oneshot.envelope(
+            "codes", {"codes": [{key: row[key]
+                                 for key in pigi_oneshot_full.CODES_FIELDS
+                                 if key in row}
+                                for row in rows]})
+        original = len(pigi_oneshot.serialize(expected))
+        self.assertEqual(len(expected["codes"]), 20)
+        self.assertGreater(original, pigi_oneshot.MAX_STDOUT)
+        code, out = self.invoke_full(["codes", "--limit", "20"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["command"], "codes")
+        self.assertNotIn("codes", doc)
+        self.assertNotIn("nextOffset", doc)
+        self.assertEqual(doc["originalBytes"], original)
+        # A limit whose page fits is still a normal paged result.
+        codes, docs, outs = self.codes_walk(["codes"], 5)
+        self.assertEqual(codes, [0] * 4)
+        self.assertEqual([len(doc["codes"]) for doc in docs], [5] * 4)
+        self.assertEqual([doc.get("nextOffset") for doc in docs],
+                         [5, 10, 15, None])
+        self.assertEqual([item["messageID"] for doc in docs
+                          for item in doc["codes"]],
+                         ["m%02d" % i for i in range(20)])
+        self.assertTrue(all(len(out) <= pigi_oneshot.MAX_STDOUT
+                            for out in outs))
+
+    def test_codes_next_offset_validated_even_when_result_is_complete(self):
+        """Every fetched page's nextOffset is revalidated before the walk may
+        stop: a malformed one fails closed even when the page already holds
+        offset+limit+1 matches."""
+        failure = {"contentTrust": "untrusted", "error": "invalid_response"}
+        page = [make_code_row("m%02d" % i, CODE_SENDER,
+                              date=NOW - i * 1000) for i in range(11)]
+        for bad in ("100", -1, True, 5, 2_000_000, 11.0, 0):
+            with self.subTest(nextOffset=bad):
+                self.table["codes"] = lambda params, bad=bad: codes_result(
+                    page, next_offset=bad)
+                code, out = self.invoke_full(["codes"])
+                self.assertEqual((code, self.parse(out)), (5, failure))
+        # The same page with a correct App nextOffset is fine.
+        rows = page + [make_code_row("x%03d" % i, CODE_SENDER2,
+                                     date=NOW - 20_000 - i * 1000)
+                       for i in range(109)]
+        self.table["codes"] = self.codes_server(rows)
+        code, out = self.invoke_full(
+            ["codes", "--from-email", CODE_SENDER])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 10))
+        self.assertEqual(doc["nextOffset"], 10)
+        # A bad nextOffset on a later page the walk actually needs fails too.
+        filler = [make_code_row("f%03d" % i, CODE_SENDER2,
+                                date=NOW - i * 500) for i in range(100)]
+        second = [make_code_row("s%02d" % i, CODE_SENDER,
+                                date=NOW - 50_000 - i * 1000)
+                  for i in range(11)]
+        for bad in ("100", True, 5):
+            with self.subTest(later=bad):
+                def respond(params, bad=bad):
+                    if params["offset"] == 0:
+                        return codes_result(filler, next_offset=100)
+                    return codes_result(second, next_offset=bad)
+                self.table["codes"] = respond
+                code, out = self.invoke_full(
+                    ["codes", "--from-email", CODE_SENDER])
+                self.assertEqual((code, self.parse(out)), (5, failure))
+        # An unfiltered 11-row page with no App nextOffset emits the
+        # filtered-list nextOffset, not the App's.
+        self.table["codes"] = self.codes_server(page)
+        code, out = self.invoke_full(["codes"])
+        doc = self.parse(out)
+        self.assertEqual((code, len(doc["codes"])), (0, 10))
+        self.assertEqual(doc["nextOffset"], 10)
+
+    def test_codes_single_oversize_row_exit_eight(self):
+        self.table["codes"] = lambda params: codes_result(
+            [make_code_row("huge", CODE_SENDER, fromName="N" * 100_000)])
+        code, out = self.invoke_full(["codes"])
+        self.assertEqual(code, 8)
+        self.assertLessEqual(len(out), pigi_oneshot.MAX_STDOUT)
+        doc = self.parse(out)
+        self.assertTrue(doc["truncated"])
+        self.assertEqual(doc["command"], "codes")
+        self.assertNotIn("codes", doc)
+
+    def test_codes_child_alone_gets_enable_codes(self):
+        commands = []
+        real_popen = subprocess.Popen
+
+        def spy(argv, *args, **kwargs):
+            commands.append(list(argv))
+            return real_popen(argv, *args, **kwargs)
+
+        self.table["codes"] = lambda params: codes_result(
+            [make_code_row("m1")])
+        self.table["list"] = lambda params: search_result([])
+        self.table["search"] = lambda params: search_result([])
+        self.table["accounts"] = lambda params: {
+            "accounts": [{"account": params["account"], "kind": "imap"}],
+            "contentTrust": "untrusted", "capabilities": CAPS}
+        self.table["get"] = lambda params: get_result(
+            make_message("m1", OTHER, account=FULL_ACCOUNT), "body")
+        with patch.object(subprocess, "Popen", spy):
+            for argv in (["codes"], ["list"], ["search", "--query", "ok"],
+                         ["accounts"], ["get", "m1"]):
+                code, _ = self.invoke_full(argv)
+                self.assertEqual(code, 0)
+        children = [argv for argv in commands
+                    if any(str(part).endswith("pigi_mcp.py")
+                           for part in argv)]
+        self.assertEqual(len(children), 5)
+        self.assertIn("--enable-codes", children[0])
+        for argv in children[1:]:
+            self.assertNotIn("--enable-codes", argv)
+        self.assertEqual([row[0] for row in self.audit_rows()],
+                         ["get_verification_code", "list_messages", "search",
+                          "list_accounts", "get_message"])
+
     def test_full_bounds_rejected_without_socket(self):
         rejected = [
             ["list", "--since-days", "31"], ["list", "--since-days", "0"],
@@ -1894,7 +2364,7 @@ class OneshotTests(unittest.TestCase):
             ["search", "--query", "ok", "--since-days", "31"],
             ["search", "--query", "\u202ehidden"],
             ["get-batch"] + ["m%d" % i for i in range(6)], ["get-batch"],
-            ["get_verification_code"], ["codes"], ["--account", ACCOUNT, "list"],
+            ["get_verification_code"], ["--account", ACCOUNT, "list"],
             ["--help"], [],
         ]
         for argv in rejected:
@@ -2112,6 +2582,41 @@ class OneshotTests(unittest.TestCase):
                 result["nextOffset"] = offset + limit
             return result
         return respond
+
+    def codes_server(self, rows, seen=None):
+        """Swift-like codes: account+since filter, (date DESC, id ASC) order,
+        offset/limit window, App-style nextOffset when more rows exist.
+        `seen` records (requested offset, emitted App nextOffset) pairs."""
+        def respond(params):
+            matched = [row for row in rows
+                       if row["account"] == params["account"]
+                       and row["date"] >= params["since"]]
+            matched.sort(key=lambda row: (-row["date"], row["messageID"]))
+            offset, limit = params.get("offset", 0), params.get("limit", 50)
+            page = matched[offset:offset + limit]
+            result = codes_result(page)
+            if offset + len(page) < len(matched):
+                result["nextOffset"] = offset + len(page)
+            if seen is not None:
+                seen.append((offset, result.get("nextOffset")))
+            return result
+        return respond
+
+    def codes_walk(self, argv, limit):
+        """Follow `codes` nextOffset pages to exhaustion; (codes, docs, outs)."""
+        codes, docs, outs, offset = [], [], [], 0
+        for _ in range(500):
+            code, out = self.invoke_full(
+                argv + ["--limit", str(limit), "--offset", str(offset)])
+            doc = self.parse(out)
+            codes.append(code)
+            docs.append(doc)
+            outs.append(out)
+            if "nextOffset" not in doc:
+                return codes, docs, outs
+            self.assertEqual(doc["nextOffset"], offset + len(doc["codes"]))
+            offset = doc["nextOffset"]
+        self.fail("codes walk did not terminate")
 
     def page_cursor_doc(self, **fields):
         doc = {"v": 1, "c": "list", "q": "", "s": NOW - 365 * 86_400_000,
@@ -2879,12 +3384,21 @@ class OneshotTests(unittest.TestCase):
                        "cursor_stale", "365"):
             self.assertIn(needle, doc)
 
-    def test_full_module_has_no_write_or_code_path(self):
+    def test_docs_describe_codes(self):
+        doc = DOCS.read_text()
+        for needle in ("codes", "--since-minutes", "--from-email",
+                       "--enable-codes", "page_limit_exceeded", "truncated"):
+            self.assertIn(needle, doc)
+
+    def test_full_module_has_no_write_path(self):
+        # get_verification_code is now the deliberate `codes` code path; the
+        # full module still carries no mail-write or credential path.
         source = FULL_SCRIPT.read_text()
-        for forbidden in ("get_verification_code", '"codes"', "mail.db",
-                          "Keychain", "SecItem", "urllib", "webbrowser", "smtplib"):
+        for forbidden in ("mail.db", "Keychain", "SecItem", "urllib",
+                          "webbrowser", "smtplib"):
             self.assertNotIn(forbidden, source)
         self.assertIn("list_messages", source)
+        self.assertIn("get_verification_code", source)
         billing = SCRIPT.read_text()
         for forbidden in ('"list"', '"codes"', "get_verification_code", "list_messages"):
             self.assertNotIn(forbidden, billing)
@@ -2902,6 +3416,58 @@ class OneshotTests(unittest.TestCase):
         self.assertEqual(result.stderr, b"")
         self.assertEqual(self.parse(result.stdout), USAGE_DOC)
         self.assertFalse(canaries["bash_env"].exists())
+
+    def test_launcher_forwards_codes_args(self):
+        home, listener = self.make_home(
+            "lc", {"account": ACCOUNT, "senders": [ALLOWED]}, agent=True)
+        self.write_profile_config(home, "oneshot-full.json",
+                                  {"account": FULL_ACCOUNT})
+        env, canaries = self.make_hooks()
+        launch_dir = self.root / "lc-sh"
+        launch_dir.mkdir()
+        runtime = self.root / "lc-runtime"
+        runtime.mkdir()
+        for name in ("pigi_oneshot.py", "pigi_oneshot_full.py", "pigi_mcp.py",
+                     "transport.py", "audit.py"):
+            shutil.copyfile(SCRIPT.parent / name, runtime / name)
+        script = runtime / "pigi_oneshot.py"
+        pinned = 'PINNED_HOME = "/Users/tr"'
+        text = script.read_text()
+        self.assertEqual(text.count(pinned), 1)
+        script.write_text(text.replace(
+            pinned, "PINNED_HOME = " + repr(str(home)), 1))
+        launcher = self.render_launcher(launch_dir, synthetic_python(),
+                                        script, home)
+        # Out-of-range args exit 2 before the pinned home is touched.
+        result = subprocess.run(
+            [str(launcher), "full", "codes", "--since-minutes", "0"],
+            capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(self.parse(result.stdout), USAGE_DOC)
+        self.assertFalse(canaries["bash_env"].exists())
+        # A real codes run end to end through the rendered launcher.
+        real_now = int(time.time() * 1000)
+        row = make_code_row("lc1", "launch-sender@example.org",
+                            date=real_now - 1000, code="000000")
+        self.table["codes"] = lambda params: codes_result([row])
+        result = subprocess.run(
+            [str(launcher), "full", "codes", "--since-minutes", "5",
+             "--from-email", "launch-sender@example.org"],
+            capture_output=True, timeout=20, env=env)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["command"], "codes")
+        self.assertEqual(doc["contentTrust"], "untrusted")
+        self.assertEqual([item["messageID"] for item in doc["codes"]],
+                         ["lc1"])
+        self.assertEqual(set(doc["codes"][0]),
+                         set(pigi_oneshot_full.CODES_FIELDS))
+        self.assertEqual(listener.requests[-1]["method"], "codes")
+        params = listener.requests[-1]["params"]
+        self.assertEqual(params["account"], FULL_ACCOUNT)
+        self.assertEqual(params["limit"], 100)
 
     def test_launcher_full_config_failures_exit_six(self):
         """Real .sh entry, not an in-process main() call.

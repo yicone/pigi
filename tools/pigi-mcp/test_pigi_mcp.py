@@ -238,6 +238,42 @@ class MCPTests(unittest.TestCase):
         self.assertEqual([r[:2] for r in self.rows()], [("get_verification_code", "ok")] * 2 +
                          [("get_verification_code", "invalid_arguments")] * 5 + [("get_verification_code", "unavailable")])
 
+    def test_enable_codes_opt_in_for_pinned_account(self):
+        """A pinned account hides get_verification_code unless enable_codes
+        opts in; opted in, the pinned account is injected like other tools."""
+        account = "a@example.invalid"
+        server = MCPServer(self.client, self.audit, account, enable_codes=True)
+        server.state = "ready"
+        tools = server.handle(request(2, "tools/list"))["result"]["tools"]
+        self.assertEqual({t["name"] for t in tools},
+                         {"list_accounts", "search", "list_messages",
+                          "get_message", "get_verification_code"})
+        self.client.call.return_value = {"codes": [],
+                                         "contentTrust": "untrusted"}
+        result = server.handle(call(3, "get_verification_code", {"since": 0}))
+        self.assertFalse(result["result"]["isError"])
+        self.client.call.assert_called_once_with(
+            "codes", {"since": 0, "account": account})
+        self.client.reset_mock()
+        response = server.handle(call(4, "get_verification_code",
+                                      {"account": "b@example.invalid"}))
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(
+            json.loads(response["result"]["content"][0]["text"]),
+            {"error": "permission_denied"})
+        self.client.call.assert_not_called()
+        # Same pinned scope without the flag keeps the tool hidden.
+        plain = MCPServer(self.client, self.audit, account)
+        plain.state = "ready"
+        tools = plain.handle(request(5, "tools/list"))["result"]["tools"]
+        self.assertEqual({t["name"] for t in tools},
+                         {"list_accounts", "search", "list_messages",
+                          "get_message"})
+        self.assertEqual(
+            plain.handle(call(6, "get_verification_code"))["error"]["code"],
+            -32602)
+        self.client.call.assert_not_called()
+
     def test_validation_and_unknown_tools_audited_without_socket(self):
         for args in ({"limit": True}, {"offset": -1}, {"account": None}, {"status": "deleted"},
                      {"since": -1}, {"since": 1.1}, {"extra": "PRIVATE_SENTINEL"},
@@ -473,6 +509,29 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(len(responses[2]["result"]["tools"]), 5)
         self.assertTrue(responses[3]["result"]["isError"])
         self.assertEqual(self.rows()[0][:2], ("list_messages", "unavailable"))
+
+    def test_subprocess_enable_codes_flag(self):
+        """--enable-codes is accepted and only matters with a pinned account."""
+        account = "a@example.invalid"
+        responses = subprocess_calls(
+            self.path / "missing", self.path / "audit.sqlite3",
+            handshake() + [request(2, "tools/list"),
+                           call(3, "get_verification_code")],
+            extra_args=("--account", account, "--enable-codes"))
+        self.assertIn("get_verification_code",
+                      {t["name"] for t in responses[2]["result"]["tools"]})
+        self.assertTrue(responses[3]["result"]["isError"])  # socket absent
+        self.assertEqual(
+            json.loads(responses[3]["result"]["content"][0]["text"]),
+            {"error": "unavailable"})
+        responses = subprocess_calls(
+            self.path / "missing", self.path / "audit.sqlite3",
+            handshake() + [request(2, "tools/list"),
+                           call(3, "get_verification_code")],
+            extra_args=("--account", account))
+        self.assertNotIn("get_verification_code",
+                         {t["name"] for t in responses[2]["result"]["tools"]})
+        self.assertEqual(responses[3]["error"]["code"], -32602)
 
 
 class EntryIsolationTests(unittest.TestCase):

@@ -344,6 +344,13 @@ private struct FeedbackOverlays: ViewModifier {
                         actions: [GlassDialog.Action(label: "标记已读") { state.markAllRead(ids: ids) },
                                   GlassDialog.Action(label: "取消", isCancel: true) {}],
                         dismiss: { state.markAllReadIDs = nil })
+                } else if let prompt = state.listTranslationPrompt {
+                    GlassDialog(
+                        title: "翻译当前可见的 \(prompt.sending) 封邮件？",
+                        message: prompt.message,
+                        actions: [GlassDialog.Action(label: "发送并翻译") { state.acceptListTranslation() },
+                                  GlassDialog.Action(label: "取消", isCancel: true) {}],
+                        dismiss: { state.finishListTranslationPrompt() })
                 }
             }
             .overlay {
@@ -355,5 +362,6 @@ private struct FeedbackOverlays: ViewModifier {
             .animation(.spring(response: 0.35, dampingFraction: 0.8), value: state.toast)
             .animation(.easeOut(duration: 0.18), value: state.unsubTarget?.id)
             .animation(.easeOut(duration: 0.18), value: state.markAllReadIDs != nil)
+            .animation(.easeOut(duration: 0.18), value: state.listTranslationPrompt != nil)
     }
 }

@@ -34,6 +34,14 @@ public struct CachedTranslation: Codable, Equatable, Sendable {
 public actor SQLiteTranslationCache: TranslationCache {
     public static let shared = SQLiteTranslationCache()
 
+    #if DEBUG
+    /// Test-only fault injected inside the batch transaction, so a throw rolls every row in that commit back.
+    public enum BatchFault: Sendable {
+        case errorAfterInserts(Int)
+        case cancelAfterInserts(Int)
+    }
+    #endif
+
     /// A request must obtain a ticket before starting work. Clear/purge invalidates outstanding tickets.
     public struct Ticket: Sendable {
         fileprivate let owner: UUID
@@ -48,6 +56,9 @@ public actor SQLiteTranslationCache: TranslationCache {
     private let owner = UUID()
     private var generation = UUID()
     private var accountGenerations: [String: UUID] = [:]
+    #if DEBUG
+    private var batchFault: BatchFault?
+    #endif
 
     /// nil uses Application Support/pigi/translations.db. Tests pass an isolated path.
     /// With no path, regression binaries and XCTest refuse the real user directory.
@@ -101,6 +112,49 @@ public actor SQLiteTranslationCache: TranslationCache {
             try s.run("DELETE FROM translations WHERE account=? AND mail_id=? AND body_hash!=?",
                 [.text(ticket.key.accountID.lowercased()), .text(ticket.key.mailID), .text(ticket.key.bodyHash)])
             try s.run("INSERT OR REPLACE INTO translations VALUES(?,?,?,?,?,?,?)", ticket.key.arguments + [.blob(data)])
+            try Task.checkCancellation()
+        }
+    }
+
+    #if DEBUG
+    public func testingInjectBatchFault(_ fault: BatchFault?) { batchFault = fault }
+    #endif
+
+    /// One transaction for the whole batch. A throw, including cancellation, rolls it back.
+    public func putAll(_ entries: [(value: CachedTranslation, ticket: Ticket)], validated: Bool) throws {
+        try Task.checkCancellation()
+        guard validated else { throw Failure.invalidResult }
+        guard !entries.isEmpty else { return }
+        for entry in entries {
+            guard entry.ticket.owner == owner, entry.ticket.generation == generation,
+                  entry.ticket.accountGeneration == accountGenerations[entry.ticket.key.accountID.lowercased()] else {
+                throw Failure.invalidated
+            }
+        }
+        let encoded = try entries.map { try JSONEncoder().encode($0.value) }
+        try Task.checkCancellation()
+        #if DEBUG
+        let fault = batchFault
+        #endif
+        let s = try db()
+        try s.transaction {
+            try Task.checkCancellation()
+            for (index, entry) in entries.enumerated() {
+                let key = entry.ticket.key
+                try s.run("DELETE FROM translations WHERE account=? AND mail_id=? AND body_hash!=?",
+                    [.text(key.accountID.lowercased()), .text(key.mailID), .text(key.bodyHash)])
+                try s.run("INSERT OR REPLACE INTO translations VALUES(?,?,?,?,?,?,?)", key.arguments + [.blob(encoded[index])])
+                #if DEBUG
+                switch fault {
+                case .errorAfterInserts(let count) where index + 1 == count:
+                    throw TranslationError.network("synthetic batch write failure")
+                case .cancelAfterInserts(let count) where index + 1 == count:
+                    throw CancellationError()
+                default:
+                    break
+                }
+                #endif
+            }
             try Task.checkCancellation()
         }
     }

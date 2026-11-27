@@ -5,6 +5,9 @@ import PigiCore
 
 struct MailListView: View {
     @Environment(AppState.self) private var state
+    /// One layout pass reports row frames and the viewport height together.
+    @State private var layout = ListLayoutSample()
+    private static let listSpace = "mailList"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -37,6 +40,7 @@ struct MailListView: View {
                                 MailRow(mail: mail, showsAccount: state.scope == .all,
                                         isSelected: state.selectedMailID == mail.id) { state.open(mail) }
                                     .id(mail.id)
+                                    .background { listRowFrame(mail.id) }
                             }
                         }
                     }
@@ -44,11 +48,28 @@ struct MailListView: View {
                     .padding(.bottom, 8)
                 }
                 .scrollIndicators(.never)
+                .coordinateSpace(name: Self.listSpace)
+                .background { listViewportHeight }
                 .onChange(of: state.selectedMailID) {
                     if let id = state.selectedMailID { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id) } }
                 }
+                #if PIGI_REGRESSION
+                .onChange(of: state.listScrollTarget) {
+                    if let id = state.listScrollTarget { proxy.scrollTo(id, anchor: .center) }
+                }
+                #endif
                 }
             }
+        }
+        .onAppear { state.refreshListTranslationAvailability() }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            state.refreshListTranslationAvailability()
+        }
+        .onPreferenceChange(ListLayoutKey.self) { sample in
+            layout = sample
+            #if PIGI_REGRESSION
+            state.listViewportObserver?(sample.frames, sample.height)
+            #endif
         }
         .background {
             Group {
@@ -105,11 +126,54 @@ struct MailListView: View {
                 } label: { Text(state.protonLabelTitle(email)) }
                 .help("当前：" + (state.selectedProtonLabel ?? "收件箱"))
             }
+            if state.listTranslationAvailable {
+                Button(state.listTranslationBusy ? "取消" : "翻译可见") {
+                    if state.listTranslationBusy {
+                        state.cancelListTranslation()
+                    } else {
+                        state.translateVisibleList(frames: layout.frames, viewportHeight: layout.height)
+                    }
+                }
+                .font(.system(size: 12))
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .accessibilityIdentifier(state.listTranslationBusy ? "mail.list.translation.cancel" : "mail.list.translation")
+                .help(state.listTranslationBusy ? "取消这次列表翻译" : "翻译当前可见邮件的主题和摘要")
+            }
             MailRefreshButton()
         }
         .padding(.horizontal, 14)
         .padding(.top, 5)
         .frame(height: 55)
+    }
+
+    /// Records where the row sits. Updating this while scrolling does not start a translation.
+    private func listRowFrame(_ id: String) -> some View {
+        GeometryReader { proxy in
+            let frame = proxy.frame(in: .named(Self.listSpace))
+            Color.clear.preference(key: ListLayoutKey.self, value: ListLayoutSample(
+                frames: [ListRowFrame(id: id, minY: frame.minY, maxY: frame.maxY)], height: 0))
+        }
+    }
+
+    private var listViewportHeight: some View {
+        GeometryReader { proxy in
+            Color.clear.preference(key: ListLayoutKey.self, value: ListLayoutSample(frames: [], height: proxy.size.height))
+        }
+    }
+}
+
+struct ListLayoutSample: Equatable {
+    var frames: [ListRowFrame] = []
+    var height: CGFloat = 0
+}
+
+private struct ListLayoutKey: PreferenceKey {
+    static var defaultValue = ListLayoutSample()
+    static func reduce(value: inout ListLayoutSample, nextValue: () -> ListLayoutSample) {
+        let next = nextValue()
+        value.frames.append(contentsOf: next.frames)
+        if next.height > 0 { value.height = next.height }
     }
 }
 
@@ -154,13 +218,20 @@ struct MailRow: View {
                             .opacity(hovering && hasActions ? 0 : 1)
                     }
                     HStack(spacing: 6) {
-                        Text(mail.subject)
+                        Text(listLine.subject)
                             .font(.system(size: 13, weight: mail.isUnread ? .medium : .regular))
-                        Text(mail.snippet)
+                        Text(listLine.snippet)
                             .foregroundStyle(.secondary)
                     }
                     .font(.system(size: 13))
                     .lineLimit(1)
+                    if listLine.translated {
+                        Text(mail.subject + " " + mail.snippet)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .accessibilityIdentifier("mail.list.translation.original")
+                    }
                     if showsAccount {
                         Text(shortAccount ? (mail.accountID.split(separator: "@").first.map(String.init) ?? mail.accountID) : mail.accountID)
                             .font(.system(size: 11))
@@ -210,6 +281,10 @@ struct MailRow: View {
     }
 
     private var hasActions: Bool { mail.code != nil || mail.unsubKind != nil }
+
+    private var listLine: (subject: String, snippet: String, translated: Bool) {
+        ListTranslationDisplay.text(subject: mail.subject, snippet: mail.snippet, translation: state.listTranslations[mail.id])
+    }
 }
 
 /// The small text link beside the first date heading.

@@ -5,6 +5,17 @@ import Observation
 import PigiCore
 #endif
 
+struct ListTranslationPrompt: Equatable {
+    let sending: Int
+    let skipped: Int
+
+    var message: String {
+        var text = "只会把这 \(sending) 封可见邮件尚未缓存的主题或摘要发给已配置的翻译服务，不含收件人地址。译文只用于列表显示和本机翻译缓存，原信不会被替换。"
+        if skipped > 0 { text += "未开启翻译的 \(skipped) 封已整行跳过。" }
+        return text
+    }
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -14,7 +25,10 @@ final class AppState {
     private(set) var imapAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "imapAccounts") ?? []).map(AppState.imapAccount)
     private(set) var protonAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "protonAccounts") ?? []).map(AppState.protonAccount)
     private(set) var protonLabels: [String: [ProtonLabel]] = [:]
-    var selectedProtonLabel: String? = nil
+    /// Changing the Proton folder or label cancels the in-flight list translation.
+    var selectedProtonLabel: String? = nil {
+        didSet { if oldValue != selectedProtonLabel { cancelListTranslation() } }
+    }
     /// Mailboxes switched off in 邮箱管理: still pulled and kept by the engine, just not shown in the window or the panel.
     var hiddenAccounts: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenAccounts") ?? []) {
         didSet { UserDefaults.standard.set(Array(hiddenAccounts).sorted(), forKey: "hiddenAccounts") }
@@ -38,8 +52,15 @@ final class AppState {
         (UserDefaults.standard.dictionary(forKey: "gmailAvatars") as? [String: String] ?? [:])
             .compactMapValues { URL(string: $0) }
 
-    var scope: Scope = .all
-    var readFilter: ReadFilter = .all { didSet { stayVisible = [] } }
+    var scope: Scope = .all {
+        didSet { if oldValue != scope { cancelListTranslation() } }
+    }
+    var readFilter: ReadFilter = .all {
+        didSet {
+            stayVisible = []
+            if oldValue != readFilter { cancelListTranslation() }
+        }
+    }
     /// Mails read while the list shows only unread stay put until the list context changes.
     private(set) var stayVisible: Set<String> = []
     var selectedMailID: String?
@@ -58,7 +79,12 @@ final class AppState {
     }
 
     var isSearching = false
-    var searchText = "" { didSet { stayVisible = [] } }
+    var searchText = "" {
+        didSet {
+            stayVisible = []
+            if oldValue != searchText { cancelListTranslation() }
+        }
+    }
     /// Ids returned by the server's full-text search for the current query.
     private var searchHits: Set<String> = []
     private var searchTask: Task<Void, Never>?
@@ -709,10 +735,153 @@ final class AppState {
     /// The mail whose unsubscribe the user is being asked to confirm.
     var unsubTarget: Mail?
     var markAllReadIDs: Set<String>?
+    /// Display-only list translations. Never written back onto `mails`.
+    var listTranslations: [String: ListRowTranslation] = [:]
+    var listTranslationPrompt: ListTranslationPrompt?
+    var listTranslationBusy = false
+    /// Follows the translation master switch. Off hides the list action.
+    var listTranslationAvailable = false
+    #if PIGI_REGRESSION
+    /// Installed before launch by the synthetic window harness. Nil uses the real keychain and translator.
+    var listTranslationSession: ListTranslationSession?
+    var listViewportObserver: (([ListRowFrame], CGFloat) -> Void)?
+    var listScrollTarget: String?
+    #endif
+    @ObservationIgnored private var listTranslationTask: Task<Void, Never>?
+    @ObservationIgnored private var listTranslationGeneration = UUID()
+    @ObservationIgnored private var listTranslationContinuation: CheckedContinuation<Bool, Never>?
+    @ObservationIgnored private var listTranslationAccepted = false
 
     func confirmMarkAllRead(_ list: [Mail]) {
         let ids = Set(list.filter { $0.isUnread && !isReadOnly($0.accountID) }.map(\.id))
         markAllReadIDs = ids.isEmpty ? nil : ids
+    }
+
+    func refreshListTranslationAvailability() {
+        let enabled = TranslationConfigStore().load().enabled
+        if listTranslationAvailable != enabled { listTranslationAvailable = enabled }
+    }
+
+    /// Starts from the list button only. Opening the list or scrolling does not call this.
+    func translateVisibleList(frames: [ListRowFrame], viewportHeight: CGFloat) {
+        stopListTranslation(clearBusy: false)
+        let generation = UUID()
+        listTranslationGeneration = generation
+        let ids = ListViewport.visibleIDs(frames, viewportMinY: 0, viewportMaxY: Double(viewportHeight))
+        let rows = ListViewport.rows(ids: ids, candidates: visibleMails.map {
+            ListTranslationRow(id: $0.id, accountID: $0.accountID, subject: $0.subject, snippet: $0.snippet)
+        })
+        guard !rows.isEmpty else {
+            listTranslationBusy = false
+            showToast("当前没有可见邮件")
+            return
+        }
+        let snapshot = rows
+        listTranslationBusy = true
+        listTranslationTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.listTranslationGeneration == generation { self.listTranslationBusy = false }
+            }
+            let configuration = TranslationConfigStore().load()
+            #if PIGI_REGRESSION
+            let session = self.listTranslationSession ?? ListTranslationSession.production()
+            #else
+            let session = ListTranslationSession.production()
+            #endif
+            let hasKey = session.credentialConfigured()
+            let policy = StoredTranslationPolicy(
+                accounts: self.allAccounts.map { ($0.id, $0.kind == .proton) },
+                globalEnabled: configuration.enabled,
+                configured: configuration.isConfigured(hasKey: hasKey),
+                endpoint: configuration.baseURL)
+            let outcome = await ListBatchTranslator().run(
+                rows: snapshot,
+                policy: policy,
+                configuration: configuration,
+                cache: session.cache,
+                translator: session.makeTranslator(configuration),
+                confirm: { sending, skipped in
+                    await self.askListTranslation(sending: sending, skipped: skipped)
+                },
+                isCurrent: { self.listTranslationGeneration == generation })
+            guard !Task.isCancelled, self.listTranslationGeneration == generation else { return }
+            self.applyListTranslation(outcome)
+        }
+    }
+
+    func cancelListTranslation() {
+        stopListTranslation(clearBusy: true)
+    }
+
+    func acceptListTranslation() {
+        listTranslationAccepted = true
+    }
+
+    func finishListTranslationPrompt() {
+        let continuation = listTranslationContinuation
+        listTranslationContinuation = nil
+        listTranslationPrompt = nil
+        let accepted = listTranslationAccepted
+        listTranslationAccepted = false
+        continuation?.resume(returning: accepted)
+    }
+
+    private func stopListTranslation(clearBusy: Bool) {
+        listTranslationGeneration = UUID()
+        listTranslationAccepted = false
+        finishListTranslationPrompt()
+        listTranslationTask?.cancel()
+        if clearBusy { listTranslationBusy = false }
+    }
+
+    private func askListTranslation(sending: Int, skipped: Int) async -> Bool {
+        if Task.isCancelled { return false }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                listTranslationContinuation = continuation
+                listTranslationAccepted = false
+                listTranslationPrompt = ListTranslationPrompt(sending: sending, skipped: skipped)
+            }
+        } onCancel: {
+            Task { @MainActor in
+                self.listTranslationAccepted = false
+                self.finishListTranslationPrompt()
+            }
+        }
+    }
+
+    /// Copies translations into the display map. `mails` is left alone, so search, notifications and agent.sock stay on the original.
+    private func applyListTranslation(_ outcome: ListBatchOutcome) {
+        switch outcome.status {
+        case .completed:
+            for (id, value) in outcome.translations { listTranslations[id] = value }
+        case .failed:
+            showToast("没有译成，列表仍显示原文")
+        case .cancelled:
+            break
+        case .empty:
+            showToast(Self.listTranslationEmptyMessage(outcome))
+        }
+    }
+
+    private static func listTranslationEmptyMessage(_ outcome: ListBatchOutcome) -> String {
+        let permissions = outcome.skipped.map(\.permission)
+        let blocked = permissions.allSatisfy { $0 == .notConfigured || $0 == .disabled }
+        if permissions.contains(.notConfigured), blocked {
+            return "翻译还没打开，没有外发"
+        }
+        if permissions.contains(.needsServiceConsent) || permissions.contains(.needsAccountConsent) {
+            return "这些邮箱还没允许把邮件发给翻译服务，已整行跳过"
+        }
+        if !outcome.skipped.isEmpty {
+            return "未开启翻译的账号已整行跳过，没有外发"
+        }
+        return "这些可见邮件没有需要翻译的主题或摘要"
     }
 
     func showToast(_ text: String) {

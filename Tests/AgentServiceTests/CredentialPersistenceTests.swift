@@ -8,20 +8,25 @@ final class CredentialPersistenceTests: XCTestCase {
         let suite = "pigi.credential-tests." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = AccountConfiguration(path: directory.appendingPathComponent("mail.db").path)
         let fixture = CredentialFixture()
         fixture.rejectWrites = true
         defaults.set(["existing@example.test"], forKey: "gmailAccounts")
+        try config.migrateLegacy(defaults: defaults)
         for address in [email, "existing@example.test"] {
-            XCTAssertThrowsError(try GmailStore.add(address, refreshToken: "synthetic-new", defaults: defaults, credentials: fixture.store)) {
+            XCTAssertThrowsError(try config.addGmail(address, refreshToken: "synthetic-new", credentials: fixture.store)) {
                 XCTAssertEqual($0 as? CredentialPersistenceError, .writeFailed)
             }
-            XCTAssertEqual(defaults.stringArray(forKey: "gmailAccounts"), ["existing@example.test"])
+            XCTAssertEqual(try config.emails(kind: "gmail"), ["existing@example.test"])
         }
         XCTAssertTrue(fixture.values.isEmpty)
         fixture.rejectWrites = false
-        try GmailStore.add(email, refreshToken: "synthetic-new", defaults: defaults, credentials: fixture.store)
-        try GmailStore.add(email, refreshToken: "synthetic-replaced", defaults: defaults, credentials: fixture.store)
-        XCTAssertEqual(defaults.stringArray(forKey: "gmailAccounts"), ["existing@example.test", email])
+        try config.addGmail(email, refreshToken: "synthetic-new", credentials: fixture.store)
+        try config.addGmail(email, refreshToken: "synthetic-replaced", credentials: fixture.store)
+        XCTAssertEqual(try config.emails(kind: "gmail"), ["existing@example.test", email])
         XCTAssertEqual(fixture.values[GmailStore.keychainKey(email)], "synthetic-replaced")
     }
 
@@ -111,7 +116,7 @@ final class CredentialPersistenceTests: XCTestCase {
     }
 
     func testCredentialErrorsAreExplicitAndRedacted() {
-        for error in [CredentialPersistenceError.writeFailed, .recoveryFailed] {
+        for error in [CredentialPersistenceError.writeFailed, .recoveryFailed, .deleteFailed] {
             XCTAssertTrue(error.localizedDescription.contains("失败"))
             XCTAssertTrue(error.localizedDescription.contains("钥匙串"))
             XCTAssertFalse(error.localizedDescription.contains(email))

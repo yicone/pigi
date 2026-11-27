@@ -37,7 +37,7 @@ actor GmailSession {
 
     private func token(force: Bool = false) async throws -> String {
         if !force, let access, expires > Date() { return access }
-        let refresh = try credentials.readRequired(GmailStore.keychainKey(email))
+        let refresh = try AccountConfiguration.shared.refreshToken(for: email, credentials: credentials)
         do {
             let fresh = try await refreshToken(refresh)
             access = fresh.accessToken

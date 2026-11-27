@@ -14,4 +14,6 @@ isolate_support_swiftc -swift-version 5 -D DEBUG -D PIGI_REGRESSION -parse-as-li
     "${SOURCES[@]}" -lsqlite3 -lz "$ROOT/Tests/EngineSyncRegression.swift" -o "$TEST_BUILD/engine-sync-regression"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
     -keyout "$TEST_BUILD/key.pem" -out "$TEST_BUILD/cert.pem" 2>/dev/null
-python3 "$ROOT/Tests/engine_sync_regression.py" "$TEST_BUILD"
+# The Python launcher and its Swift child must share a fresh home even when CI
+# has no HOME override. GmailStore exercises the production configuration path.
+isolate_support_env "$TEST_BUILD/home" -- python3 "$ROOT/Tests/engine_sync_regression.py" "$TEST_BUILD"

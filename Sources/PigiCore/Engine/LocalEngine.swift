@@ -39,6 +39,8 @@ public actor LocalEngine {
     // MARK: database
 
     static let schema = [
+        "CREATE TABLE IF NOT EXISTS gmail_credential_aliases(account TEXT NOT NULL,identifier TEXT NOT NULL,priority INTEGER NOT NULL,PRIMARY KEY(account,identifier))",
+        "CREATE TABLE IF NOT EXISTS gmail_legacy_state(account TEXT NOT NULL,identifier TEXT NOT NULL,metadata BLOB NOT NULL,PRIMARY KEY(account,identifier))",
         "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER)",
         "CREATE TABLE IF NOT EXISTS agent_permissions(account TEXT PRIMARY KEY, read INTEGER NOT NULL, draft INTEGER NOT NULL, organize INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_audit_key(id INTEGER PRIMARY KEY CHECK(id=1), key BLOB NOT NULL)",
@@ -105,7 +107,8 @@ public actor LocalEngine {
     static func legacyErrorKind(_ message: String) -> AccountErrorKind {
         let keychain = [CredentialPersistenceError.writeFailed.localizedDescription,
                         CredentialPersistenceError.recoveryFailed.localizedDescription,
-                        CredentialPersistenceError.readFailed.localizedDescription]
+                        CredentialPersistenceError.readFailed.localizedDescription,
+                        CredentialPersistenceError.deleteFailed.localizedDescription]
         if keychain.contains(message) { return .keychain }
         if ["无法连接 Proton", "请求超时", "请求过于频繁", "代理需要认证", "将重试"].contains(where: message.contains) { return .network }
         if ["会话失效", "账号、密码或验证码", "请重新登录"].contains(where: message.contains) { return .auth }
@@ -150,15 +153,9 @@ public actor LocalEngine {
         guard loop == nil else { return }
         // One keychain read before per-account sync, so startup does not prompt once per mailbox.
         try Keychain.warm()
-        try? ensureGmailAccounts()
+        // Registrations already live in accounts, including the app migration.
+        _ = try db()
         loop = Task { await runLoop() }
-    }
-
-    func ensureGmailAccounts() throws {
-        let s = try db()
-        for email in GmailStore.emails {
-            try s.run("INSERT OR IGNORE INTO accounts(email, added_at, kind) VALUES(?,?,'gmail')", [.text(email.lowercased()), .int(now())])
-        }
     }
 
     func now() -> Int { Int(Date().timeIntervalSince1970) }

@@ -44,6 +44,7 @@ struct PanelLayoutRegression {
         }
 
         let scope = CommandLine.arguments[2]
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain([
             "panelScope": scope == "account" ? "fixture@example.com" : "all",
             "gmailAccounts": ["fixture@example.com"],
@@ -53,6 +54,9 @@ struct PanelLayoutRegression {
             "accountAliases": [String: String](),
             "archiveURL": "",
         ], forName: UserDefaults.argumentDomain)
+
+        do { try AccountConfiguration.shared.migrateLegacy(defaults: UserDefaults.standard) }
+        catch { fputs("FAIL: configuration migration failed\n", stderr); exit(1) }
 
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)

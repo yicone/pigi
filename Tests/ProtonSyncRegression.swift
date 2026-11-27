@@ -103,6 +103,7 @@ extension LocalEngine {
         DispatchQueue.global().asyncAfter(deadline: .now() + 40) { fputs("FAIL: Proton sync timeout\n", stderr); _exit(124) }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain([
             "gmailAccounts": [String](), "imapAccounts": [String](), "protonAccounts": ["fixture@example.test"],
             "hiddenAccounts": [String](), "sidebarGroups": Data(), "protonProxyMode": "direct",
@@ -650,6 +651,12 @@ extension LocalEngine {
             fatalError("credential error was not rethrown to the settings sheet")
         } catch CredentialPersistenceError.recoveryFailed {}
         precondition(state.displayedCredentialError == CredentialPersistenceError.recoveryFailed.localizedDescription)
+        precondition(state.sidebarError == state.displayedCredentialError)
+        do {
+            try await state.reportCredentialFailure { throw CredentialPersistenceError.deleteFailed }
+            fatalError("credential deletion failure was not rethrown to the settings sheet")
+        } catch CredentialPersistenceError.deleteFailed {}
+        precondition(state.displayedCredentialError == CredentialPersistenceError.deleteFailed.localizedDescription)
         precondition(state.sidebarError == state.displayedCredentialError)
         try await state.reportCredentialFailure {}
         precondition(state.displayedCredentialError == nil && state.sidebarError == nil, "successful recovery kept a stale error")

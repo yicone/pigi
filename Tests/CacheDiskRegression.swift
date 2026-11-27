@@ -51,6 +51,7 @@ extension ProtonSyncRegression {
         try await engine.fixture(other, remote: second)
         try await engine.pullProton(email, remote: remote)
         try await engine.pullProton(other, remote: second)
+        CorePreferences.defaults = UserDefaults.standard
         UserDefaults.standard.setVolatileDomain([
             "gmailAccounts": [String](), "imapAccounts": [String](),
             "protonAccounts": [email, other], "hiddenAccounts": [String]()

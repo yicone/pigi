@@ -183,7 +183,7 @@ final class ProtonSession: ProtonSyncRemote, @unchecked Sendable {
 extension ProtonHelperError {
     /// Network, timeout and proxy copy follow the proxy mode. Every other code
     /// keeps the fixed text below so classification and stored wording stay paired.
-    func protonSyncMessage(defaults: UserDefaults = .standard) -> String {
+    func protonSyncMessage(defaults: UserDefaults = CorePreferences.defaults) -> String {
         switch self {
         case .network, .timeout, .proxy:
             let selection = ProtonNetworkSettings.current(defaults: defaults)

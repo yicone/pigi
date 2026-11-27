@@ -28,7 +28,7 @@ public final class TranslationPrivacySettings {
     private let defaults: UserDefaults
     private static let storageKey = "translation.privacy.v1"
 
-    public init(defaults: UserDefaults = .standard) {
+    public init(defaults: UserDefaults = CorePreferences.defaults) {
         self.defaults = defaults
         choices = defaults.data(forKey: Self.storageKey)
             .flatMap { try? JSONDecoder().decode(Choices.self, from: $0) } ?? Choices()

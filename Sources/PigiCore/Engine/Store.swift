@@ -98,8 +98,8 @@ final class Store {
         return rows
     }
 
-    func transaction(_ body: () throws -> Void) throws {
-        try run("BEGIN")
+    func transaction(immediate: Bool = false, _ body: () throws -> Void) throws {
+        try run(immediate ? "BEGIN IMMEDIATE" : "BEGIN")
         do {
             try body()
             try run("COMMIT")

@@ -106,6 +106,8 @@ extension LocalEngine {
     // MARK: accounts
 
     func addGmail(_ email: String) throws {
+        // Existing legacy IDs must keep their exact credential lookup key.
+        if try account(email) != nil { trigger(email); return }
         try db().run("INSERT OR IGNORE INTO accounts(email, added_at, kind) VALUES(?,?,'gmail')", [.text(email.lowercased()), .int(now())])
         trigger(email.lowercased())
     }
@@ -150,15 +152,30 @@ extension LocalEngine {
         trigger(email)
     }
 
-    func deleteAccount(_ email: String) async throws {
+    func deleteAccount(_ email: String, privacy: TranslationPrivacySettings? = nil) async throws {
         // Fail before deleting the mailbox if its plaintext translation cache cannot be cleared.
         // Purge also invalidates outstanding request tickets, preventing late writes.
-        try await purgeTranslationData(accountID: email)
-        let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
-        proton?.deactivate()
-        _ = Keychain.set(ProtonSession.key(email), "")
+        try await purgeTranslationData(accountID: email, privacy: privacy)
         let s = try db()
-        try s.transaction {
+        try s.transaction(immediate: true) {
+            let kind = try account(email)?["kind"]?.text
+            let keys: [String]
+            switch kind {
+            case "gmail": keys = try AccountConfiguration.credentialKeys(email, store: s)
+            case "imap": keys = ["imap-\(email)"]
+            case "proton":
+                // Stop in-flight Proton work before removing its credential.
+                (protonSessions[email] as? ProtonSession)?.deactivate()
+                keys = [ProtonSession.key(email)]
+            default: keys = []
+            }
+            // Keep all account/alias/cache rows until every credential deletion
+            // succeeds. Partial cleanup is safe to retry with the same persisted
+            // identities after either a failure or a process restart. Never
+            // restore a secret already removed at the user's request.
+            for key in keys { try credentials.remove(key) }
+            try s.run("DELETE FROM gmail_credential_aliases WHERE account=?", [.text(email)])
+            try s.run("DELETE FROM gmail_legacy_state WHERE account=?", [.text(email)])
             try s.run("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM messages WHERE account=?)", [.text(email)])
             try s.run("DELETE FROM attachments WHERE account=?", [.text(email)])
             try s.run("DELETE FROM inline_images WHERE account=?", [.text(email)])
@@ -169,7 +186,8 @@ extension LocalEngine {
             try s.run("DELETE FROM agent_permissions WHERE account=?", [.text(email)])
             try s.run("DELETE FROM accounts WHERE email=?", [.text(email)])
         }
-        _ = Keychain.set("imap-\(email)", "")
+        let proton = protonSessions.removeValue(forKey: email) as? ProtonSession
+        proton?.deactivate()
         sessions[email] = nil
         due[email] = nil
         announce()

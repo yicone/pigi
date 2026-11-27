@@ -22,7 +22,7 @@ final class AppState {
 
     private(set) var gmailAccounts: [Account] = GmailStore.emails.map(AppState.gmailAccount)
     /// Mailboxes the engine pulls over IMAP; the engine is the source of truth, this is the last list it gave.
-    private(set) var imapAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "imapAccounts") ?? []).map(AppState.imapAccount)
+    private(set) var imapAccounts: [Account] = ((try? AccountConfiguration.shared.emails(kind: "imap")) ?? []).map(AppState.imapAccount)
     private(set) var protonAccounts: [Account] = (UserDefaults.standard.stringArray(forKey: "protonAccounts") ?? []).map(AppState.protonAccount)
     private(set) var protonLabels: [String: [ProtonLabel]] = [:]
     /// Changing the Proton folder or label cancels the in-flight list translation.
@@ -346,7 +346,6 @@ final class AppState {
         let emails = list.filter { $0.kind == "imap" }.map(\.email)
         if emails != imapAccounts.map(\.id) {
             imapAccounts = emails.map(Self.imapAccount)
-            UserDefaults.standard.set(emails, forKey: "imapAccounts")
         }
         let protonEmails = list.filter { $0.kind == "proton" }.map(\.email)
         protonAccounts = protonEmails.map(Self.protonAccount)
@@ -359,7 +358,8 @@ final class AppState {
         // credential-store texts still identify them.
         let keychainMessages = [CredentialPersistenceError.writeFailed.localizedDescription,
                                 CredentialPersistenceError.recoveryFailed.localizedDescription,
-                                CredentialPersistenceError.readFailed.localizedDescription]
+                                CredentialPersistenceError.readFailed.localizedDescription,
+                                CredentialPersistenceError.deleteFailed.localizedDescription]
         serverCredentialError = accounts.first {
             $0.lastErrorKind == AccountErrorKind.keychain.rawValue
                 || ($0.lastErrorKind == nil && keychainMessages.contains($0.lastError ?? ""))
@@ -394,8 +394,8 @@ final class AppState {
     /// Deletes a mailbox from the engine and from this Mac.
     func removeAccount(_ id: String) async throws {
         guard let account = allAccounts.first(where: { $0.id == id }) else { return }
+        try await reportCredentialFailure { try await ArchiveClient().deleteAccount(id) }
         inlineImagesByMailID = inlineImagesByMailID.filter { !$0.key.hasPrefix(id + "#") }
-        try await ArchiveClient().deleteAccount(id)
         if account.kind == .gmail {
             removeGmailAccount(id)
         } else {
@@ -403,7 +403,6 @@ final class AppState {
             protonLabels[id] = nil
             UserDefaults.standard.set(protonAccounts.map(\.id), forKey: "protonAccounts")
             imapAccounts.removeAll { $0.id == id }
-            UserDefaults.standard.set(imapAccounts.map(\.id), forKey: "imapAccounts")
             mails.removeAll { $0.accountID == id }
             if scope == .account(id) { select(.all) }
         }
@@ -488,7 +487,7 @@ final class AppState {
     }
 
     func removeGmailAccount(_ email: String) {
-        GmailStore.remove(email)
+        // The engine has already checked credential cleanup before committing deletion.
         gmailClients[email] = nil
         gmailAccounts.removeAll { $0.id == email }
         avatarURLs[email] = nil

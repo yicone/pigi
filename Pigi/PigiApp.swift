@@ -29,6 +29,9 @@ struct PigiApp: App {
     @AppStorage("appearanceMode") private var appearance: AppAppearance = .system
 
     init() {
+        // Helper self-test also reads Core proxy settings, but must not migrate
+        // accounts. Inject before either startup path can access Core settings.
+        AppPreferences.configure()
         // Offline packaging smoke test: launch the embedded helper through the
         // same Swift client used by the account integration. No mail or login.
         if CommandLine.arguments.contains("--proton-helper-selftest") {
@@ -46,8 +49,7 @@ struct PigiApp: App {
             }
             dispatchMain()
         }
-        CorePreferences.defaults = UserDefaults.standard
-        do { try AccountConfiguration.shared.migrateLegacy(defaults: UserDefaults.standard) }
+        do { try AppPreferences.prepare() }
         catch {
             // Do not start sync or touch credentials after a failed migration.
             _state = State(initialValue: AppState())
